@@ -15,9 +15,12 @@ _move_and_click 点击前还固定悬停 0.5 秒，而界面通常不到 1 秒�
    请求组内第一个图标时整组并行算完并缓存，后续直接取结果；每个图标的计算与原来完全相同。
 5. 路线页识别前原本固定等 1 秒让图标入场动画放完：改为至少等 0.4 秒、且连续两次识别到的图标位置一致就继续，
    最长仍是 1 秒；没识别到任何图标（Boss 节点）时等满 1 秒。
-6. 牌库翻页原本每次滚 3 格只移动半行，改为连发两次滚动（约一整行），滚完后的等待不变。
-7. （独立开关）整库扫描确认本局牌库已没有“移除卡牌列表”里的卡后，本局再遇到删卡只看最底页（仍会删咒术卡）
-   后照原逻辑跳过，事件里含“移除”的任务优先级排到最后；换一局或重新开启任务后重新检查。
+6. 删卡/复制卡翻牌库：滚动步长仍是原来的半行；每次滚动后不再固定等 0.5 秒，卡牌区域一停止移动就识别，
+   没检测到移动时仍等满 0.5 秒。最下面一行卡的描述在区域外读不到，原规则会整行丢弃（实测只保留 3%），
+   删卡/复制卡只需要卡名，所以这两种流程里图标匹配度 >0.9 且读到卡名即保留（沿用原本给咒术卡的规则）。
+7. 要求移除多张但目标卡不够时：原逻辑会点“跳过”，连已选中的目标卡也不删；现在只要选中了至少 1 张，
+   就不点“跳过”，交给原有的“移除”按钮处理确认删除已选中的卡（不拿其他卡凑数）。一张没选中仍照原逻辑跳过；
+   若保留部分选择后“移除”按钮没点成，下一次照原逻辑跳过，避免反复。
 只作用于卡厄思模式，关闭任务配置里的“加速模式”即完全使用原逻辑。
 
 注意：本文件不能定义顶层类，框架会把 ok_tasks 下含类的 .py 当作任务加载。
@@ -27,6 +30,9 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import cv2
+import numpy as np
+
 import config_io
 import utils
 import utils_chaos
@@ -34,7 +40,6 @@ import utils_chaos
 ENABLE_KEY = "加速模式"
 HOVER_KEY = "点击前悬停等待(秒)"
 INTERVAL_KEY = "非战斗检测间隔(秒)"
-REMOVAL_KEY = "目标卡删完后不再整库翻找"
 
 _GRID = 10              # 文字中心按 10x10 网格量化后比较页面
 _SAME_PAGE = 0.6        # 与点击前文字布局相似度 >= 0.6 视为页面还没响应
@@ -63,9 +68,15 @@ _match_pool = None
 _ROUTE_TOLERANCE = 3        # 路线图标两次识别位置相差不超过 3 像素视为已停止入场动画
 _ROUTE_MIN_SETTLE = 0.4     # 至少等 0.4 秒，防止图标依次出现时把“已出现的一部分”当成全部
 _ROUTE_POLL = 0.05
-_DECK_SCROLLS = 2           # 牌库每次翻页发送的滚动次数（原来 1 次 = 3 格 ≈ 半行）
-_JUMP_SCROLLS = 10          # 已确认没有目标卡时，一次滚到最底页
-_SKIP_WORDS = ("跳过", "取消")  # 删卡流程没找到卡时点的按钮
+_DECK_REGION = (0.274, 0.108, 0.929, 0.874)   # 与 recognize_cards_in_deck 的识别区域一致
+_DECK_SIZE = (96, 112)      # 比较卡牌区域是否在动时用的缩略图尺寸
+_DECK_MOVED = 0.03          # 与滚动前相比变化像素 >3%：列表已开始滚动
+_DECK_STILL = 0.01          # 相邻两次截帧变化像素 <1%：列表已停
+_DECK_POLL = 0.03
+_NAME_ONLY_PAGES = ("select_card-移除", "select_card-复制")  # 只需要卡名的选卡流程
+_NAME_ONLY_THRESHOLD = 0.90  # 与原本咒术卡的“只凭卡名保留”阈值一致
+_SKIP_WORDS = ("跳过", "取消")  # 删卡流程找不够卡时原逻辑点的按钮
+_PARTIAL_RETRY_SECONDS = 10     # 保留部分选择后这段时间内再次进入选卡，视为“移除”没点成
 
 
 def install(task):
@@ -75,20 +86,16 @@ def install(task):
     task.default_config[ENABLE_KEY] = False
     task.default_config[HOVER_KEY] = 0.1
     task.default_config[INTERVAL_KEY] = 0.3
-    task.default_config[REMOVAL_KEY] = True
     task.config_description[ENABLE_KEY] = "实验性：点击后页面一响应就继续，不再固定等待；关闭时完全使用原逻辑"
     task.config_description[HOVER_KEY] = "仅在开启加速模式时生效：鼠标移到目标后等待多久再点击，原逻辑固定 0.5 秒"
     task.config_description[INTERVAL_KEY] = "仅在开启加速模式时生效：非战斗时两次识别的最短间隔，原逻辑 1 秒；战斗中保持 1 秒"
-    task.config_description[REMOVAL_KEY] = (
-        "需开启加速模式，且关闭“优先移除基础牌”和“刷空档”：整库确认本局已没有“移除卡牌列表”里的卡后，"
-        "本局再删卡只看最底页（仍删咒术卡）就跳过，事件里含“移除”的任务优先级排到最后"
-    )
     # 加速选项只影响本机，不写进导出的配置码和上传的统计
-    config_io.UI_ONLY_CONFIG_KEYS.update({ENABLE_KEY, HOVER_KEY, INTERVAL_KEY, REMOVAL_KEY})
+    config_io.UI_ONLY_CONFIG_KEYS.update({ENABLE_KEY, HOVER_KEY, INTERVAL_KEY})
 
     orig = {
         name: getattr(task, name)
-        for name in ("sleep", "click", "move", "scroll", "mouse_down", "mouse_up", "send_key", "run", "find_feature")
+        for name in ("sleep", "click", "click_box", "move", "scroll", "mouse_down", "mouse_up", "send_key", "run",
+                     "find_feature")
     }
     st = {
         "orig_sleep": orig["sleep"], "active": False, "gate_ok": _run_is_compatible(task),
@@ -97,10 +104,9 @@ def install(task):
         "action_sig": None, "action_box": None, "action_time": 0.0,
         "gate": None, "prev_sig": None, "hit": None, "battle": False,
         "planned": 0.0, "actual": 0.0, "count": 0, "saved_total": 0.0,
-        "match_cache": None,
-        # 删卡：removal_exhausted 保存确认“没有目标卡”时那一局的 member_status 对象
-        "removal_exhausted": None, "collect_cards": False, "seen_cards": [], "skip_clicked": False,
-        "jump_scroll": False,
+        "match_cache": None, "deck_scroll": False, "deck_before": None,
+        # 删卡目标不够时保留已选中的卡：kept_pending 为拦下“跳过”时已选中的张数，partial_at 为保留的时刻
+        "removal_flow": False, "kept_pending": None, "allow_skip": False, "partial_at": 0.0,
     }
     task._speedup = st
     if not st["gate_ok"]:
@@ -136,14 +142,26 @@ def install(task):
                 else:
                     if name == "mouse_up":
                         st["held"] = False
-                    if (name == "click" and st["collect_cards"]
-                            and any(word in str(kwargs.get("name") or "") for word in _SKIP_WORDS)):
-                        st["skip_clicked"] = True
+                    if name == "scroll" and st["deck_scroll"]:
+                        # 牌库翻页：在欠的等待补完、真正滚动前截一帧，作为判断列表是否已滚动的参照
+                        st["deck_before"] = _deck_capture(task)
                     _note_action(task, st, point_of(task, args, kwargs))
                 return orig[name](*args, **kwargs)
             finally:
                 st["in_action"] = False
         return wrapped
+
+    def click_box(*args, **kwargs):
+        if st["removal_flow"] and not st["allow_skip"]:
+            box = args[0] if args else kwargs.get("box")
+            name = getattr(box, "name", None)
+            pending = getattr(task, "_pending_removed_card_count", 0)
+            if pending > 0 and isinstance(name, str) and any(word in name for word in _SKIP_WORDS):
+                # 删卡目标不够：已选中的目标卡照删，不点“跳过”，下一轮由原有的“移除”按钮处理确认
+                st["kept_pending"] = pending
+                task.log_info(f"加速：已选中{pending}张要移除的卡牌，不点「{name.strip()}」，改为确认移除已选中的卡牌")
+                return True
+        return orig["click_box"](*args, **kwargs)
 
     def move(*args, **kwargs):
         if st["active"]:
@@ -201,6 +219,7 @@ def install(task):
 
     task.sleep = sleep
     task.click = action("click", _click_point)
+    task.click_box = click_box
     task.scroll = action("scroll", _no_point)
     task.mouse_down = action("mouse_down", _no_point)
     task.mouse_up = action("mouse_up", _no_point)
@@ -209,7 +228,8 @@ def install(task):
     task.find_feature = find_feature
     task.run = run
     _keep_stuck_detection_at_one_second()
-    _patch_card_helpers()
+    _patch_deck_scan()
+    _patch_partial_removal()
 
 
 def _run_is_compatible(task):
@@ -405,89 +425,115 @@ def _active_state(task):
     return st if st is not None and st["active"] else None
 
 
-def _removal_shortcut_enabled(task):
-    """只有删卡流程本来就只删目标卡时才启用：开着“优先移除基础牌”或“刷空档”时删卡会删别的卡。"""
-    try:
-        config = task.config
-        return (bool(config.get(REMOVAL_KEY, True))
-                and config.get("优先移除基础牌", True) is False
-                and config.get("刷空档", False) is not True)
-    except Exception:
-        return False
+def _deck_capture(task):
+    """截一帧并取卡牌区域的灰度缩略图；截不到帧时返回 None。"""
+    capture = getattr(task.executor, "_speedup_original_next_frame", None)
+    frame = capture() if capture is not None else None
+    if frame is None:
+        return None
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = _DECK_REGION
+    area = frame[int(y1 * height):int(y2 * height), int(x1 * width):int(x2 * width)]
+    return cv2.cvtColor(cv2.resize(area, _DECK_SIZE, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
 
 
-def _removal_exhausted(task, st):
-    marker = st["removal_exhausted"]
-    if marker is not None and marker is not getattr(task, "member_status", None):
-        st["removal_exhausted"] = marker = None  # 新的一局或重新开启任务：重新检查
-    return marker is not None
+def _deck_changed(a, b):
+    return np.count_nonzero(cv2.absdiff(a, b) > 12) / a.size
 
 
-def _patch_card_helpers():
-    """包装 utils 里的翻页滚动、选卡、牌库识别和列表配置读取；只在加速模式运行中生效。"""
+def _settle_deck(task, st, before):
+    """滚动后原本固定等 0.5 秒：卡牌区域开始移动后，连续两次截帧几乎不变即视为停稳，提前结束等待；
+    一直没检测到移动（例如已经到底）或截不到帧时，照原逻辑等满。"""
+    deadline = st["owed_until"]
+    if before is None or deadline <= time.time():
+        return
+    moved, previous, still = False, None, 0
+    while time.time() < deadline:
+        current = _deck_capture(task)
+        if current is None:
+            return
+        if not moved:
+            moved = _deck_changed(current, before) > _DECK_MOVED
+        elif _deck_changed(current, previous) < _DECK_STILL:
+            still += 1
+            if still >= 2:
+                st["saved_total"] += max(0.0, deadline - time.time())
+                st["owed_until"] = 0.0
+                return
+        else:
+            still = 0
+        previous = current
+        st["orig_sleep"](min(_DECK_POLL, max(0.0, deadline - time.time())))
+
+
+def _patch_deck_scan():
+    """包装 utils 里的牌库翻页滚动和卡牌识别；只在加速模式运行中、选卡流程里生效。"""
     if getattr(utils._scroll_card_page, "_speedup_wrapped", False):
         return
     orig_scroll = utils._scroll_card_page
-    orig_select = utils.select_card
-    orig_recognize = utils.recognize_cards_in_deck
-    orig_card_list = utils._get_card_list
+    orig_recognize = utils._recognize_cards_by_features
 
     def _scroll_card_page(task, x, y, amount, page, *args, **kwargs):
         st = _active_state(task)
-        if st is not None and str(page).startswith("select_card") and not task.is_adb():
-            # 原逻辑每次只发 1 次 3 格滚动（约半行）；先补发几次，再交给原逻辑发最后一次并等待
-            extra = (_JUMP_SCROLLS if st["jump_scroll"] and amount < 0 else _DECK_SCROLLS) - 1
-            task.move_relative(x, y)
-            task.sleep(0.05)
-            for _ in range(extra):
-                task.scroll_relative(x, y, amount)
-        return orig_scroll(task, x, y, amount, page, *args, **kwargs)
-
-    def select_card(task, card_names, count=1, action="", *args, **kwargs):
-        st = _active_state(task)
-        if st is None or action != "移除" or not _removal_shortcut_enabled(task):
-            return orig_select(task, card_names, count, action, *args, **kwargs)
-        if _removal_exhausted(task, st):
-            task.log_info("加速：本局已确认牌库里没有要移除的目标卡，直接看最底页（咒术卡）")
-            st["jump_scroll"] = True
-            try:
-                return orig_select(task, [], count, action, *args, **kwargs)
-            finally:
-                st["jump_scroll"] = False
-        st.update(collect_cards=True, seen_cards=[], skip_clicked=False)
+        if st is None or not str(page).startswith("select_card") or task.is_adb():
+            return orig_scroll(task, x, y, amount, page, *args, **kwargs)
+        st.update(deck_scroll=True, deck_before=None)
         try:
-            result = orig_select(task, card_names, count, action, *args, **kwargs)
+            result = orig_scroll(task, x, y, amount, page, *args, **kwargs)
         finally:
-            st["collect_cards"] = False
-        targets = [t.strip() for t in card_names if isinstance(t, str) and t.strip()]
-        names = [n.strip() for n in st["seen_cards"] if n and n.strip()]
-        # 与 select_card 的命中规则一致：目标名包含卡名或卡名包含目标名
-        if st["skip_clicked"] and targets and names and not any(t in n or n in t for t in targets for n in names):
-            st["removal_exhausted"] = getattr(task, "member_status", None)
-            task.log_info("加速：整库扫描没有要移除的目标卡，本局后续删卡只看最底页")
+            st["deck_scroll"] = False
+        before, st["deck_before"] = st["deck_before"], None
+        _settle_deck(task, st, before)
         return result
 
-    def recognize_cards_in_deck(task, *args, **kwargs):
-        cards = orig_recognize(task, *args, **kwargs)
-        st = getattr(task, "_speedup", None)
-        if st is not None and st["collect_cards"]:
-            st["seen_cards"].extend(str(card.get("name", "")) for card in cards or [])
-        return cards
+    def _recognize_cards_by_features(*args, **kwargs):
+        task = kwargs["task"] if "task" in kwargs else args[0]
+        page = str(kwargs.get("page", ""))
+        if _active_state(task) is not None and page.startswith(_NAME_ONLY_PAGES):
+            # 删卡/复制卡只需要卡名：图标匹配度够高就不再要求类型和描述（最下面一行的描述在区域外）
+            thresholds = dict(kwargs.get("name_only_feature_thresholds") or {})
+            for feature_name in kwargs.get("feature_types") or {}:
+                thresholds.setdefault(feature_name, _NAME_ONLY_THRESHOLD)
+            kwargs["name_only_feature_thresholds"] = thresholds
+        return orig_recognize(*args, **kwargs)
 
-    def _get_card_list(task, key, *args, **kwargs):
-        value = orig_card_list(task, key, *args, **kwargs)
-        st = _active_state(task)
-        if (key == "任务优先级" and st is not None and _removal_shortcut_enabled(task)
-                and _removal_exhausted(task, st)):
-            value = [v for v in value if "移除" not in str(v)] + [v for v in value if "移除" in str(v)]
-        return value
-
-    for wrapper in (_scroll_card_page, select_card, recognize_cards_in_deck, _get_card_list):
+    for wrapper in (_scroll_card_page, _recognize_cards_by_features):
         wrapper._speedup_wrapped = True
     utils._scroll_card_page = _scroll_card_page
+    utils._recognize_cards_by_features = _recognize_cards_by_features
+
+
+def _patch_partial_removal():
+    """包装 utils.select_card：要求移除多张但目标卡不够时，保留已选中的卡，交给原有的“移除”按钮处理确认删除。
+    原逻辑翻到底仍不够就点“跳过”并把待移除计数清零；这里在删卡流程中拦下这一下点击（见 install 里的 click_box），
+    结束后把计数恢复成已选中的张数，“移除”按钮处理据此记录删了几张。"""
+    if getattr(utils.select_card, "_speedup_wrapped", False):
+        return
+    orig_select = utils.select_card
+
+    def select_card(task, *args, **kwargs):
+        st = _active_state(task)
+        action = kwargs.get("action", args[2] if len(args) > 2 else "")
+        if st is None or action != "移除":
+            return orig_select(task, *args, **kwargs)
+        # 上次保留了部分选择，计数却没被“移除”按钮处理清零：说明没能确认，这次照原逻辑跳过，避免反复选卡
+        retry = (getattr(task, "_pending_removed_card_count", 0) > 0
+                 and time.time() - st["partial_at"] < _PARTIAL_RETRY_SECONDS)
+        if retry:
+            task.log_info("加速：上次保留的已选卡牌没有移除成功，本次照原逻辑处理")
+        st.update(removal_flow=True, allow_skip=retry, kept_pending=None, partial_at=0.0)
+        try:
+            result = orig_select(task, *args, **kwargs)
+        finally:
+            st["removal_flow"] = False
+        kept, st["kept_pending"] = st["kept_pending"], None
+        if kept is not None:
+            task._pending_removed_card_count = kept
+            st["partial_at"] = time.time()
+        return result
+
+    select_card._speedup_wrapped = True
     utils.select_card = select_card
-    utils.recognize_cards_in_deck = recognize_cards_in_deck
-    utils._get_card_list = _get_card_list
 
 
 def _signature(task, texts):

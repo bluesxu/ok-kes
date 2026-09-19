@@ -1,4 +1,4 @@
-# 卡厄思模式加速模式（ok_tasks/speedup.py）：时序、并行匹配、路线页等待、牌库翻页与删卡快捷路径测试
+# 卡厄思模式加速模式（ok_tasks/speedup.py）：时序、并行匹配、路线页等待、牌库翻页与删卡测试
 import os
 import sys
 import threading
@@ -20,7 +20,9 @@ from utils import _simplify_texts  # noqa: E402
 
 OCR_TIME = 0.13
 WIDTH, HEIGHT = 2560, 1440
-CARD_HELPERS = ("_scroll_card_page", "select_card", "recognize_cards_in_deck", "_get_card_list")
+# 测试中会被加速模式包装或被替身替换的 utils 函数，每个用例结束后还原
+PATCHED_UTILS = ("_scroll_card_page", "_recognize_cards_by_features", "select_card", "recognize_cards_in_deck",
+                 "_get_card_list", "region_white_ratio", "_get_game_text", "is_button_active")
 
 # 合成画面：把每个并行匹配组里的图标埋在已知位置，供真实 cv2.matchTemplate 匹配
 _rng = np.random.default_rng(7)
@@ -39,14 +41,16 @@ class Box:
     def __init__(self, name, x, y, width=160, height=48):
         self.name, self.x, self.y, self.width, self.height = name, x, y, width, height
 
+    def area(self):
+        return self.width * self.height
+
 
 class TaskDisabled(Exception):
     pass
 
 
-class Frame(list):
-    """一帧画面：list 部分是 OCR 文字框，image 是模板匹配用的像素。"""
-    image = SCENE
+class Frame(np.ndarray):
+    """一帧画面：与 ok 框架一样本身是像素数组；boxes 是这帧上的 OCR 文字框。"""
 
 
 PAGES = {
@@ -73,6 +77,8 @@ class Game:
     def __init__(self, page, rules=None):
         self.page, self.rules, self.transition, self.clicks = page, rules or {}, None, []
         self.deck, self.deck_offset, self.scrolls, self.deck_views = [], 0, [], 0
+        self.deck_anim, self.scroll_times, self.recognize_log, self.seen = None, [], [], []
+        self.selected_cards = set()  # 已选中（金色边框）的牌库序号
         self.image_fn = None
 
     def boxes_at(self, now):
@@ -94,22 +100,37 @@ class Game:
             delay, duration, target, fading = rule
             self.transition = (now + delay, now + delay + duration, target, fading)
 
-    # 牌库：每行 4 张，一屏 2 行；一次 3 格滚动移动半行（与实测一致）
+    # 牌库：每行 4 张，一次 3 格滚动移动半行（与实测一致）。视野里有 4 个半行位置：0~2 能正常识别；
+    # 3 是最下面一行，描述在识别区域外，只有允许“只凭卡名保留”时才识别得到（与日志实测一致）
     def _rows(self):
         return [self.deck[i:i + 4] for i in range(0, len(self.deck), 4)]
 
-    def visible_deck(self):
+    def _max_offset(self):
+        return max(0, 2 * len(self._rows()) - 4)
+
+    def visible_deck(self, include_bottom=False):
+        """返回视野里的 (牌库序号, 卡名)。"""
         self.deck_views += 1
-        top = self.deck_offset // 2
-        return [card for row in self._rows()[top:top + 2] for card in row]
+        seen, visible = [], []
+        for index, row in enumerate(self._rows()):
+            slot = 2 * index - self.deck_offset
+            if 0 <= slot <= 2 or (slot == 3 and include_bottom):
+                seen += [(index, card) for card in row]
+                visible += [(index * 4 + i, card) for i, card in enumerate(row)]
+        self.seen.append(seen)
+        return visible
 
     def deck_at_bottom(self):
-        return self.deck_offset // 2 + 2 >= len(self._rows())
+        return self.deck_offset >= self._max_offset()
 
     def on_scroll(self, count):
         self.scrolls.append(count)
+        self.scroll_times.append(time.time())
         if count < 0:
-            self.deck_offset = min(self.deck_offset + 1, max(0, 2 * (len(self._rows()) - 2)))
+            target = min(self.deck_offset + 1, self._max_offset())
+            if target != self.deck_offset:
+                self.deck_anim = (time.time(), self.deck_offset, target)
+            self.deck_offset = target
 
 
 class FakeExecutor:
@@ -130,8 +151,8 @@ class FakeExecutor:
     def next_frame(self, time_out=6):
         self.reset_scene()
         now = time.time()
-        self._frame = Frame(self.game.boxes_at(now))
-        self._frame.image = self.game.image_at(now)
+        self._frame = np.asarray(self.game.image_at(now)).view(Frame)
+        self._frame.boxes = list(self.game.boxes_at(now))
         return self._frame
 
     @property
@@ -158,9 +179,7 @@ class FakeChaosTask:
         self._executor = FakeExecutor(game)
         self.default_config, self.config_description = {}, {}
         self.config = {speedup.ENABLE_KEY: enabled, speedup.HOVER_KEY: 0.1, speedup.INTERVAL_KEY: 0.3,
-                       speedup.REMOVAL_KEY: True, "优先移除基础牌": False, "刷空档": False,
-                       "移除卡牌列表": ["粉丝福利", "拍照时间"],
-                       "任务优先级": ["复制", "移除", "闪光1次", "信用点增加"]}
+                       "优先移除基础牌": False, "刷空档": False, "移除卡牌列表": ["粉丝福利", "拍照时间"]}
         self.member_status = {"deck": {}}
         self.trigger_interval = 1
         self.all_texts, self.logs, self.marks, self.match_log = [], [], {}, []
@@ -231,14 +250,14 @@ class FakeChaosTask:
     def ocr(self):
         frame = self.executor.frame
         time.sleep(OCR_TIME)
-        return [Box(b.name, b.x, b.y, b.width, b.height) for b in frame]
+        return [Box(b.name, b.x, b.y, b.width, b.height) for b in frame.boxes]
 
     def find_feature(self, feature_name=None, horizontal_variance=0, vertical_variance=0, threshold=0,
                      box=None, frame=None, limit=0):
         # 与 ok 框架相同：没传 frame 就取 executor.frame；匹配用真实 cv2.matchTemplate
         image = frame if frame is not None else self.executor.frame
         self.match_log.append((feature_name, threading.current_thread().name, id(image), time.time()))
-        area = image.image
+        area = image
         if box is not None:
             area = area[box.y:box.y + box.height, box.x:box.x + box.width]
         result = cv2.matchTemplate(area, TEMPLATES[feature_name], cv2.TM_CCOEFF_NORMED)
@@ -415,21 +434,50 @@ def fake_scroll_card_page(task, x, y, amount, page, distance=0.25):
     task.sleep(0.5)
 
 
-def fake_recognize_cards_in_deck(task, region=(0.274, 0.108, 0.929, 0.874), page=""):
+def fake_recognize_cards_by_features(task, region, page, feature_types, min_feature_distance, name_offsets,
+                                     type_offsets, description_offsets, name_only_feature_thresholds=None,
+                                     allow_empty_type_threshold=None):
+    """最下面一行只有非咒术图标也允许“只凭卡名保留”时才识别得到；已选中的卡带金色边框。"""
     _ = task.frame
-    return [{"name": name} for name in task.executor.game.visible_deck()]
+    game = task.executor.game
+    name_only = sorted(name_only_feature_thresholds or {})
+    game.recognize_log.append((page, name_only, time.time()))
+    include_bottom = all(n in name_only for n in ("attack_in_deck", "skill_in_deck", "enhance_in_deck"))
+    return [{"name": name, "index": index, "selected": index in game.selected_cards}
+            for index, name in game.visible_deck(include_bottom)]
+
+
+def fake_recognize_cards_in_deck(task, region=(0.274, 0.108, 0.929, 0.874), page=""):
+    """与真实实现的调用方式相同：原本只给咒术图标设了“只凭卡名保留”的阈值。"""
+    return utils._recognize_cards_by_features(
+        task=task, region=region, page=page,
+        feature_types={"attack_in_deck": "攻击/基础攻击", "skill_in_deck": "技能/基础技能", "enhance_in_deck": "强化",
+                       "hex_in_deck": "咒术", "hex_in_deck_tw": "诅咒"},
+        min_feature_distance=0.138, name_offsets=(0, 0, 0, 0), type_offsets=(0, 0, 0, 0),
+        description_offsets=(0, 0, 0, 0),
+        name_only_feature_thresholds={"hex_in_deck": 0.90, "hex_in_deck_tw": 0.90},
+        allow_empty_type_threshold=0.90,
+    )
 
 
 def fake_select_card(task, card_names, count=1, action=""):
-    """逐页找目标 → 到底后删最底页咒术卡 → 仍不够就点“跳过”。"""
+    """逐页找目标（跳过已选中的卡）→ 到底后删最底页咒术卡 → 仍不够就点“跳过”。"""
     page = f"select_card-{action}"
     selected = 0
+
+    def pick(card):
+        nonlocal selected
+        task.click(0.5, 0.5)
+        task.executor.game.selected_cards.add(card["index"])
+        card["selected"] = True
+        selected += 1
+
     cards = utils.recognize_cards_in_deck(task, page=page)
     while True:
         for card in cards:
-            if selected < count and any(t in card["name"] or card["name"] in t for t in card_names):
-                task.click(0.5, 0.5)
-                selected += 1
+            if (selected < count and not card["selected"]
+                    and any(t in card["name"] or card["name"] in t for t in card_names)):
+                pick(card)
         if selected >= count:
             return True
         if task.executor.game.deck_at_bottom():
@@ -438,9 +486,8 @@ def fake_select_card(task, card_names, count=1, action=""):
         cards = utils.recognize_cards_in_deck(task, page=page)
     if action == "移除":
         for card in cards:
-            if selected < count and card["name"].startswith("咒术"):
-                task.click(0.5, 0.5)
-                selected += 1
+            if selected < count and not card["selected"] and card["name"].startswith("咒术"):
+                pick(card)
         if selected >= count:
             return True
     task.click_box(SkipButton())
@@ -452,7 +499,7 @@ def fake_get_card_list(task, key):
     return list(value) if isinstance(value, (list, tuple)) else []
 
 
-def handle_remove(task):
+def handle_remove_page(task):
     """仿 handle_select_card：每次进入删卡页，牌库从顶部开始显示。"""
     if not find(task, "请选择1张要移除的卡牌"):
         return False
@@ -463,27 +510,112 @@ def handle_remove(task):
     return True
 
 
-class ScrollRecorder:
-    """真实 utils._scroll_card_page 会调用的任务接口。"""
+DECK_ANIM = 0.2
+DECK_TEXTURE = _rng.integers(0, 255, (3000, 2200, 3), dtype=np.uint8)
 
-    def __init__(self, active, jump=False):
-        self._speedup = {"active": active, "jump_scroll": jump}
-        self.scrolls = 0
+
+def deck_image_fn(game):
+    """卡牌区域画面随滚动移动：每次滚动后有 0.2 秒动画，然后静止。"""
+    y1, y2, x1, x2 = int(0.108 * 1300), int(0.874 * 1300), int(0.274 * 2200), int(0.929 * 2200)
+
+    def image_at(now):
+        visual = game.deck_offset
+        if game.deck_anim:
+            start, before, after = game.deck_anim
+            visual = before + (after - before) * min(1.0, (now - start) / DECK_ANIM)
+        image = SCENE.copy()
+        shift = int(visual * 150)
+        image[y1:y2, x1:x2] = DECK_TEXTURE[shift:shift + (y2 - y1), x1:x2]
+        return image
+    return image_at
+
+
+def views_per_row(game):
+    return [sum(1 for page in game.seen if any(row == index for row, _ in page)) for index in range(4)]
+
+
+def waits_after_scroll(game):
+    """每次滚动到下一次识别卡牌的间隔。"""
+    times = [t for _, _, t in game.recognize_log]
+    return [next(t - s for t in times if t > s) for s in game.scroll_times if any(t > s for t in times)]
+
+
+# ---------------- 删卡目标不够：直接调用真实的 handle_select_card / select_card / handle_remove ----------------
+BLACK = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+
+
+def screen_box(name, rx, ry, width=200, height=40):
+    """中心在相对坐标 (rx, ry) 的文字框。"""
+    return Box(name, int(rx * WIDTH - width / 2), int(ry * HEIGHT - height / 2), width, height)
+
+
+def deck_cards(targets):
+    """一页牌库：目标卡在前，后面跟两张非目标卡。"""
+    return [{"name": name, "type": "技能", "description": "", "x": 0.35 + 0.15 * i, "y": 0.3,
+             "selected": False, "feature_name": "skill_in_deck"}
+            for i, name in enumerate(targets + ["声音测试", "安可"])]
+
+
+class SelectCardPageTask:
+    """真实删卡流程用到的任务接口；卡牌识别、滚动条、按钮颜色这类读屏幕的函数由 use_real_removal_flow 替换。"""
+    name = "测试"  # 不走“滚到目标主战员”那一步
+
+    def __init__(self, enabled, title, targets):
+        self.default_config, self.config_description = {}, {}
+        self.config = {speedup.ENABLE_KEY: enabled, "优先移除基础牌": False, "刷空档": False,
+                       "移除卡牌列表": ["拍照时间", "粉丝福利"], "复制卡牌列表": ["拍照时间", "粉丝福利"]}
+        self.width, self.height, self.trigger_interval = WIDTH, HEIGHT, 1
+        self.executor = SimpleNamespace(paused=False, current_task=None, reset_scene=lambda check_enabled=True: None)
+        self.node_status, self.picked, self.clicked, self.logs = {}, set(), [], []
+        self.deck = deck_cards(targets)
+        self.show_title(title)
+
+    def show_title(self, title):
+        self.all_texts = [screen_box(title, 0.198, 0.039)]
+
+    @property
+    def frame(self):
+        return BLACK
+
+    def sleep(self, timeout):
+        return True
+
+    def click(self, x=-1, y=-1, name=None, **kwargs):
+        self.clicked.append(name or "卡牌")
+        self.picked.update(c["name"] for c in self.deck if name is None and (c["x"], c["y"]) == (x, y))
+        return True
+
+    def click_box(self, box=None, relative_x=0.5, relative_y=0.5, **kwargs):
+        return self.click(box.x + box.width / 2, box.y + box.height / 2, name=box.name)
+
+    def move(self, *args, **kwargs):
+        pass
+
+    def move_relative(self, x, y):
+        self.move(x, y)
+
+    scroll = mouse_down = mouse_up = send_key = move
+
+    def run(self):
+        pass
+
+    def find_feature(self, **kwargs):
+        return []
+
+    def feature_exists(self, name):
+        return False
 
     def is_adb(self):
         return False
 
     def log_info(self, message):
-        pass
+        self.logs.append(message)
 
-    def move_relative(self, x, y):
-        pass
+    def ocr(self):
+        return [screen_box("跳过", 0.80, 0.94), screen_box("移除", 0.945, 0.918, 120)]
 
-    def sleep(self, timeout):
-        pass
-
-    def scroll_relative(self, x, y, count):
-        self.scrolls += 1
+    def box_of_screen(self, x, y, to_x=1.0, to_y=1.0, **kwargs):
+        return screen_box("", (x + to_x) / 2, (y + to_y) / 2, int((to_x - x) * WIDTH), int((to_y - y) * HEIGHT))
 
 
 class TestSpeedup(unittest.TestCase):
@@ -492,14 +624,14 @@ class TestSpeedup(unittest.TestCase):
         self._handlers = list(utils_chaos.PAGE_HANDLERS)
         self._is_frame_stuck = utils.is_frame_stuck
         self._ui_only_keys = set(config_io.UI_ONLY_CONFIG_KEYS)
-        self._card_helpers = {name: getattr(utils, name) for name in CARD_HELPERS}
+        self._utils = {name: getattr(utils, name) for name in PATCHED_UTILS}
 
     def tearDown(self):
         utils_chaos.PAGE_HANDLERS[:] = self._handlers
         utils.is_frame_stuck = self._is_frame_stuck
         config_io.UI_ONLY_CONFIG_KEYS.clear()
         config_io.UI_ONLY_CONFIG_KEYS.update(self._ui_only_keys)
-        for name, function in self._card_helpers.items():
+        for name, function in self._utils.items():
             setattr(utils, name, function)
 
     def make(self, page, rules, handlers, enabled=True):
@@ -511,10 +643,31 @@ class TestSpeedup(unittest.TestCase):
 
     def use_fake_card_helpers(self):
         utils._scroll_card_page = fake_scroll_card_page
+        utils._recognize_cards_by_features = fake_recognize_cards_by_features
         utils.select_card = fake_select_card
         utils.recognize_cards_in_deck = fake_recognize_cards_in_deck
         utils._get_card_list = fake_get_card_list
-        speedup._patch_card_helpers()
+        speedup._patch_deck_scan()
+        speedup._patch_partial_removal()
+
+    def use_real_removal_flow(self):
+        """删卡流程用真实代码，只替换读屏幕的函数：一页牌库、选中的卡带金色边框、至少选中 1 张时“移除”可点。"""
+        utils.recognize_cards_in_deck = lambda task, region=None, page="": [
+            dict(card, selected=card["name"] in task.picked) for card in task.deck]
+        utils.region_white_ratio = lambda task, region: 0.0
+        utils._get_game_text = lambda task, text: text
+        utils.is_button_active = lambda task, box: bool(task.picked)
+
+    def select_page(self, title, targets, enabled=True):
+        task = SelectCardPageTask(enabled, title, targets)
+        speedup.install(task)
+        task._speedup["active"] = enabled  # 模拟处于运行中
+        return task
+
+    def confirm_removal(self, task):
+        """下一轮：右下角“移除”按钮交给真实的 handle_remove。"""
+        task.all_texts = [screen_box("移除", 0.945, 0.918, 120)]
+        return utils.handle_remove(task)
 
     # ---------------- 点击后等待 ----------------
     def transition_latency(self, enabled):
@@ -599,7 +752,7 @@ class TestSpeedup(unittest.TestCase):
 
     def test_speed_options_excluded_from_exported_config(self):
         self.make("EMPTY", {}, [])
-        for key in (speedup.ENABLE_KEY, speedup.HOVER_KEY, speedup.INTERVAL_KEY, speedup.REMOVAL_KEY):
+        for key in (speedup.ENABLE_KEY, speedup.HOVER_KEY, speedup.INTERVAL_KEY):
             self.assertIn(key, config_io.UI_ONLY_CONFIG_KEYS)
 
     # ---------------- 并行模板匹配 ----------------
@@ -648,61 +801,120 @@ class TestSpeedup(unittest.TestCase):
         self.assertTrue(at_final_position)
 
     # ---------------- 牌库翻页 ----------------
-    def test_deck_scroll_sends_two_messages_only_on_deck_pages(self):
-        speedup._patch_card_helpers()
-        cases = (
-            (ScrollRecorder(True), "select_card-移除", 2),
-            (ScrollRecorder(True), "移除卡牌目标主战员查找", 1),
-            (ScrollRecorder(False), "select_card-移除", 1),
-            (ScrollRecorder(True, jump=True), "select_card-移除", speedup._JUMP_SCROLLS),
-        )
-        for recorder, page, expected in cases:
-            utils._scroll_card_page(recorder, 0.251, 0.735, -3, page)
-            self.assertEqual(expected, recorder.scrolls, page)
-
-    # ---------------- 删卡快捷路径 ----------------
-    def removal_flows(self, deck, flows, enabled=True, **config):
+    def removal_scan(self, enabled, deck=DECK):
+        """需删 1 张的删卡页走一遍：逐页找“移除卡牌列表”里的卡，找不到就翻到底。"""
         self.use_fake_card_helpers()
-        game, task = self.make("REMOVE", {}, [handle_remove], enabled)
-        task.config.update(config)
+        game, task = self.make("REMOVE", {}, [handle_remove_page], enabled)
         game.deck = list(deck)
-        run_executor(task, 20, stop=lambda: len(task.marks.get("flows", [])) >= flows)
+        game.image_fn = deck_image_fn(game)
+        run_executor(task, 20, stop=lambda: len(task.marks.get("flows", [])) >= 1)
         return game, task
 
-    def test_full_scan_without_targets_marks_round_and_later_scans_are_short(self):
-        _, original = self.removal_flows(DECK, 1, enabled=False)
-        self.assertEqual((5, 4), original.marks["flows"][0])  # 原逻辑：每次半行，识别 5 页
-        game, task = self.removal_flows(DECK, 3)
-        (views1, scrolls1), (views2, _), (views3, _) = task.marks["flows"][:3]
-        self.assertEqual((3, 4), (views1, scrolls1))  # 每次一整行：识别 3 页，滚动总量不变
-        self.assertIs(task.member_status, task._speedup["removal_exhausted"])
-        self.assertEqual((2, 2), (views2, views3))  # 本局之后只看首页和最底页
+    def test_deck_paging_keeps_steps_reads_bottom_row_and_waits_until_still(self):
+        original_game, original = self.removal_scan(False)
+        game, task = self.removal_scan(True)
+        self.assertEqual((5, 4), original.marks["flows"][0])  # 每次半行：识别 5 页，滚动 4 次
+        self.assertEqual(original.marks["flows"], task.marks["flows"])
+        self.assertEqual(original_game.scrolls, game.scrolls)
+        original_views, views = views_per_row(original_game), views_per_row(game)
+        self.assertEqual([1, 3, 3, 1], original_views)
+        self.assertTrue(all(v >= o for o, v in zip(original_views, views)), views)
+        self.assertGreater(sum(views), sum(original_views))  # 最下面一行也识别到了
+        self.assertGreaterEqual(min(waits_after_scroll(original_game)), 0.5)
+        self.assertLess(max(waits_after_scroll(game)), 0.45)  # 列表停稳就识别
 
-    def test_task_priority_moves_removal_last_until_new_round(self):
-        game, task = self.removal_flows(DECK, 1)
+    def test_deck_scroll_without_movement_waits_full_half_second(self):
+        self.use_fake_card_helpers()
+        game, task = self.make("REMOVE", {}, [], True)
+        game.deck = list(DECK)  # 画面不变：检测不到滚动（例如已经到底）
         task._speedup["active"] = True  # 模拟处于运行中
-        self.assertEqual(["复制", "闪光1次", "信用点增加", "移除"], utils._get_card_list(task, "任务优先级"))
-        task.member_status = {"deck": {}}  # 新的一局
-        self.assertEqual(["复制", "移除", "闪光1次", "信用点增加"], utils._get_card_list(task, "任务优先级"))
-        self.assertIsNone(task._speedup["removal_exhausted"])
+        task.executor.current_task = task
+        speedup._wrap_executor_next_frame(task.executor)
+        start = time.time()
+        utils._scroll_card_page(task, 0.251, 0.735, -3, "select_card-移除")
+        _ = task.frame
+        self.assertGreaterEqual(time.time() - start, 0.5)
 
-    def test_deck_with_target_is_removed_and_not_marked(self):
-        game, task = self.removal_flows(DECK[:12] + ["粉丝福利"] + DECK[13:], 1)
-        self.assertTrue(any(page == "REMOVE" for _, page in game.clicks))
-        self.assertIsNone(task._speedup["removal_exhausted"])
+    def test_name_only_recognition_only_on_remove_and_copy_pages(self):
+        self.use_fake_card_helpers()
+        game, task = self.make("REMOVE", {}, [], True)
+        game.deck = list(DECK)
 
-    def test_shortcut_still_removes_bottom_curse(self):
-        game, task = self.removal_flows(DECK, 1)
-        game.deck = DECK[:15] + ["咒术：诅咒"]  # 本局后来染上咒术卡，排在最底
-        clicks_before = len(game.clicks)
-        run_executor(task, 20, stop=lambda: len(task.marks["flows"]) >= 2)
-        self.assertEqual(2, task.marks["flows"][1][0])
-        self.assertEqual(1, len(game.clicks) - clicks_before)  # 点了咒术卡，没有点“跳过”
+        def name_only(page, active=True):
+            task._speedup["active"] = active
+            utils.recognize_cards_in_deck(task, page=page)
+            return game.recognize_log[-1][1]
 
-    def test_shortcut_disabled_when_removing_base_cards(self):
-        game, task = self.removal_flows(DECK, 2, **{"优先移除基础牌": True})
-        self.assertIsNone(task._speedup["removal_exhausted"])
-        self.assertEqual(3, task.marks["flows"][1][0])
+        hex_only = ["hex_in_deck", "hex_in_deck_tw"]
+        self.assertIn("attack_in_deck", name_only("select_card-移除"))
+        self.assertIn("attack_in_deck", name_only("select_card-复制"))
+        self.assertEqual(hex_only, name_only("select_card-闪光"))
+        self.assertEqual(hex_only, name_only("select_card-移除", active=False))
+
+    def test_target_in_any_row_is_found(self):
+        for row in range(4):
+            deck = list(DECK)
+            deck[row * 4 + 2] = "拍照时间"
+            game, _ = self.removal_scan(True, deck)
+            self.assertIn(row * 4 + 2, game.selected_cards, f"第 {row + 1} 行")
+
+    # ---------------- 要求移除多张但目标卡不够（真实删卡流程） ----------------
+    def test_partial_targets_removed_instead_of_skipped(self):
+        self.use_real_removal_flow()
+        task = self.select_page("请选择2张要移除的卡牌", ["拍照时间"])
+        self.assertTrue(utils.handle_select_card(task))
+        self.assertEqual(["卡牌"], task.clicked)  # 选中目标卡，没有点“跳过”
+        self.assertEqual(1, task._pending_removed_card_count)
+        self.assertTrue(self.confirm_removal(task))
+        self.assertEqual(["卡牌", "移除"], task.clicked)
+        self.assertEqual(1, task.node_status["removed_card_count"])
+
+    def test_removed_count_matches_selected_targets(self):
+        self.use_real_removal_flow()
+        task = self.select_page("请选择3张要移除的卡牌", ["拍照时间", "粉丝福利"])
+        utils.handle_select_card(task)
+        self.assertNotIn("跳过", task.clicked)
+        self.assertTrue(self.confirm_removal(task))
+        self.assertEqual(2, task.node_status["removed_card_count"])
+
+    def test_no_target_or_disabled_skips_as_before(self):
+        self.use_real_removal_flow()
+        task = self.select_page("请选择2张要移除的卡牌", [])
+        utils.handle_select_card(task)
+        self.assertEqual(["跳过"], task.clicked)
+        disabled = self.select_page("请选择2张要移除的卡牌", ["拍照时间"], enabled=False)
+        utils.handle_select_card(disabled)
+        self.assertEqual(["卡牌", "跳过"], disabled.clicked)
+        self.assertEqual(0, disabled._pending_removed_card_count)
+
+    def test_copy_flow_unchanged(self):
+        self.use_real_removal_flow()
+        task = self.select_page("请选择2张要复制的卡牌", ["拍照时间"])
+        utils.handle_select_card(task)
+        self.assertEqual(["卡牌", "跳过"], task.clicked)
+
+    def test_skip_on_second_try_when_remove_button_stays_inactive(self):
+        self.use_real_removal_flow()
+        utils.is_button_active = lambda task, box: False  # 游戏要求选够张数才能确认
+        task = self.select_page("请选择2张要移除的卡牌", ["拍照时间"])
+        utils.handle_select_card(task)
+        self.assertFalse(self.confirm_removal(task))
+        task.show_title("请选择2张要移除的卡牌")  # 仍停在选卡页
+        utils.handle_select_card(task)
+        self.assertEqual(["卡牌", "跳过"], task.clicked)  # 只多进一次选卡
+        self.assertEqual(0, task._pending_removed_card_count)
+
+    def test_next_removal_after_confirm_keeps_partial_selection_again(self):
+        self.use_real_removal_flow()
+        task = self.select_page("请选择2张要移除的卡牌", ["拍照时间"])
+        utils.handle_select_card(task)
+        self.assertTrue(self.confirm_removal(task))
+        task.deck, task.picked = deck_cards(["粉丝福利"]), set()  # 紧接着又一次删卡
+        task.show_title("请选择2张要移除的卡牌")
+        utils.handle_select_card(task)
+        self.assertNotIn("跳过", task.clicked)
+        self.assertTrue(self.confirm_removal(task))
+        self.assertEqual(2, task.node_status["removed_card_count"])
 
     # ---------------- 与真实 ChaosMode 的兼容性 ----------------
     def test_real_chaos_mode_run_matches_gated_run(self):

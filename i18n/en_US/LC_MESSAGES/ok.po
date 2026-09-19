@@ -277,6 +277,3 @@ msgstr "Only applies when 加速模式 is on: how long to hover over the target 
 
 msgid "仅在开启加速模式时生效：非战斗时两次识别的最短间隔，原逻辑 1 秒；战斗中保持 1 秒"
 msgstr "Only applies when 加速模式 is on: minimum interval between recognitions outside battle (originally 1 s; stays 1 s in battle)."
-
-msgid "需开启加速模式，且关闭“优先移除基础牌”和“刷空档”：整库确认本局已没有“移除卡牌列表”里的卡后，本局再删卡只看最底页（仍删咒术卡）就跳过，事件里含“移除”的任务优先级排到最后"
-msgstr "Requires 加速模式, with 优先移除基础牌 and 刷空档 off: once a full deck scan finds no card from 移除卡牌列表 left in this run, later removals in the run only check the last page (curse cards are still removed) before skipping, and 移除 entries move to the end of 任务优先级."
