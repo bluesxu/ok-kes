@@ -13,7 +13,7 @@
 
 - 启动游戏并以**窗口模式运行**；在选择窗口区选择游戏窗口；交互方式选择 **PostMessage**，然后点击**开始**。
 - **导出日志**可以导出工具运行日志。如果遇到 Bug，请将日志导出后在 QQ 交流群中 @群主。
-- 工具左下角**设置**内可以选择 OCR 后端。默认选择“自动”：内存大于等于 12 GB 时使用 OpenVINO，小于 12 GB 时使用 ONNX Runtime。OpenVINO 会占用更多内存，约 6～8 GB；ONNX Runtime 内存占用较小，约 1～2 GB，但 CPU 占用更高。
+- 工具左下角**设置**内可以选择 OCR 后端。默认选择“自动”：内存大于等于 12 GB 时使用 OpenVINO，小于 12 GB 时使用 ONNX Runtime。OpenVINO 会占用更多内存，约 6～8 GB；ONNX Runtime 内存占用较小，约 1～2 GB，但 CPU 占用更高。使用 OpenVINO 时统一以 f32 精度推理，识别结果与 ONNX Runtime 一致。
 
 ## 功能界面介绍
 
