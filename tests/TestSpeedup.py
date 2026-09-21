@@ -16,6 +16,7 @@ import config_io  # noqa: E402
 import speedup  # noqa: E402
 import utils  # noqa: E402
 import utils_chaos  # noqa: E402
+import utils_sortie  # noqa: E402
 from utils import _simplify_texts  # noqa: E402
 
 OCR_TIME = 0.13
@@ -80,8 +81,28 @@ class Game:
         self.deck_anim, self.scroll_times, self.recognize_log, self.seen = None, [], [], []
         self.selected_cards = set()  # 已选中（金色边框）的牌库序号
         self.image_fn = None
+        # 战斗出牌：按数字键后 CARD_RAISE 秒卡牌上滑到位，回车后 CARD_PLAY 秒手牌数减少（或弹出选择页面）
+        self.hand, self.keys, self.raise_at, self.play_at = 0, [], None, None
+        self.play_fails, self.popup_on_enter, self.popup_at = False, False, None
+
+    def on_key(self, key):
+        now = time.time()
+        self.keys.append((now, key))
+        if key.isdigit():
+            self.raise_at = now + CARD_RAISE
+        elif key == "enter" and self.hand and self.popup_on_enter:
+            self.popup_at = self.popup_at or now + CARD_PLAY
+        elif key == "enter" and self.hand and not self.play_fails:
+            self.play_at = now + CARD_PLAY
 
     def boxes_at(self, now):
+        if self.page == "BATTLE_PLAY":
+            if self.popup_at and now >= self.popup_at:
+                return [Box("请选择功能", 1150, 180)]  # 弹窗盖住了手牌数
+            if self.play_at and now >= self.play_at:
+                self.hand -= 1
+                self.play_at, self.raise_at = None, None
+            return [Box(f"{self.hand}/10", int(0.515 * WIDTH) - 60, int(0.972 * HEIGHT) - 24, 120, 48)]
         if self.transition:
             start, end, target, fading = self.transition
             if now >= end:
@@ -245,12 +266,19 @@ class FakeChaosTask:
         self.marks["up"] = time.time()
 
     def send_key(self, key, down_time=0.02, interval=-1, after_sleep=0):
+        self.executor.game.on_key(str(key))
         self.executor.reset_scene()
 
-    def ocr(self):
-        frame = self.executor.frame
-        time.sleep(OCR_TIME)
-        return [Box(b.name, b.x, b.y, b.width, b.height) for b in frame.boxes]
+    def ocr(self, x=0, y=0, to_x=1, to_y=1, match=None, frame=None, **kwargs):
+        """与 ok 框架相同：可以只识别一块区域，也可以指定帧；区域越小越快。"""
+        image = frame if frame is not None else self.executor.frame
+        whole = (x, y, to_x, to_y) == (0, 0, 1, 1)
+        time.sleep(OCR_TIME if whole else OCR_TIME / 4)
+        boxes = [Box(b.name, b.x, b.y, b.width, b.height) for b in image.boxes]
+        if whole:
+            return boxes
+        return [b for b in boxes if x <= (b.x + b.width / 2) / self.width <= to_x
+                and y <= (b.y + b.height / 2) / self.height <= to_y]
 
     def find_feature(self, feature_name=None, horizontal_variance=0, vertical_variance=0, threshold=0,
                      box=None, frame=None, limit=0):
@@ -618,6 +646,76 @@ class SelectCardPageTask:
         return screen_box("", (x + to_x) / 2, (y + to_y) / 2, int((to_x - x) * WIDTH), int((to_y - y) * HEIGHT))
 
 
+# ---------------- 出击模式：run() 用 utils_sortie 的处理函数列表；战斗出牌替身 ----------------
+CARD_RAISE = 0.10  # 按数字键后卡牌上滑到位所需时间（实测 0.01~0.04 秒）
+CARD_PLAY = 0.25   # 回车后手牌数减少所需时间（实测 0.2~0.3 秒）
+PAGES["BATTLE_PLAY"] = []  # 内容由 Game.boxes_at 按手牌数生成
+
+
+class FakeSortieTask(FakeChaosTask):
+    """出击模式：run() 结构与卡厄思相同，但用的是 utils_sortie 的处理函数列表。"""
+    name = "自动出击模式"
+
+    def run(self):
+        self.all_texts = _simplify_texts(self.ocr())
+        for handle_page in utils_sortie.PAGE_HANDLERS:
+            if handle_page(self):
+                return
+        self._check_upload_if_needed()
+
+
+class OtherRunTask(FakeChaosTask):
+    """run() 结构与预期不符的任务（例如作者改版后）。"""
+    name = "其他任务"
+
+    def run(self):
+        self.all_texts = _simplify_texts(self.ocr())
+        handle_center_confirm(self)
+
+
+def battle_image_fn(game):
+    """卡牌上滑到位后手牌区域变样，其余时间不动。"""
+    y1, y2, x1, x2 = int(0.660 * 1300), int(0.950 * 1300), int(0.159 * 2200), int(0.836 * 2200)
+
+    def image_at(now):
+        if not (game.raise_at and now >= game.raise_at):
+            return SCENE
+        image = SCENE.copy()
+        image[y1:y2, x1:x2] = DECK_TEXTURE[:y2 - y1, x1:x2]
+        return image
+    return image_at
+
+
+def handle_battle_page(task):
+    """替身：与 utils_sortie.handle_battle_page 相同的出牌时序（按数字键 → 等 1 秒 → 回车 → 等 2 秒）。"""
+    if not any("/10" in b.name for b in task.all_texts):
+        return False
+    task.marks.setdefault("plays", []).append(time.time())
+    task.send_key("4")
+    task.sleep(1)
+    task.send_key("enter")
+    task.sleep(2)
+    return True
+
+
+def fake_try_all_card_keys(task, count):
+    """替身：与 utils_sortie._try_all_card_keys 相同，从手牌数倒着按一遍，每张牌 0.5 + 1 秒。"""
+    for index in range(min(count, 9), 0, -1):
+        task.send_key(str(index))
+        task.sleep(0.5)
+        task.send_key("enter")
+        task.sleep(1)
+
+
+def handle_battle_fallback(task):
+    """仿 handle_battle_page 未命中出牌优先级时：经 utils_sortie 调用兜底出牌（与真实代码一样走模块属性）。"""
+    if not any("/10" in b.name for b in task.all_texts):
+        return False
+    task.marks.setdefault("plays", []).append(time.time())
+    utils_sortie._try_all_card_keys(task, 5)
+    return True
+
+
 class TestSpeedup(unittest.TestCase):
 
     def setUp(self):
@@ -625,9 +723,14 @@ class TestSpeedup(unittest.TestCase):
         self._is_frame_stuck = utils.is_frame_stuck
         self._ui_only_keys = set(config_io.UI_ONLY_CONFIG_KEYS)
         self._utils = {name: getattr(utils, name) for name in PATCHED_UTILS}
+        self._sortie_handlers = list(utils_sortie.PAGE_HANDLERS)
+        self._sortie = {name: getattr(utils_sortie, name) for name in ("handle_battle_page", "_try_all_card_keys")}
 
     def tearDown(self):
         utils_chaos.PAGE_HANDLERS[:] = self._handlers
+        utils_sortie.PAGE_HANDLERS[:] = self._sortie_handlers
+        for name, function in self._sortie.items():
+            setattr(utils_sortie, name, function)
         utils.is_frame_stuck = self._is_frame_stuck
         config_io.UI_ONLY_CONFIG_KEYS.clear()
         config_io.UI_ONLY_CONFIG_KEYS.update(self._ui_only_keys)
@@ -915,6 +1018,93 @@ class TestSpeedup(unittest.TestCase):
         self.assertNotIn("跳过", task.clicked)
         self.assertTrue(self.confirm_removal(task))
         self.assertEqual(2, task.node_status["removed_card_count"])
+
+    # ---------------- 出击模式 ----------------
+    def make_sortie(self, page, rules, handlers, enabled=True):
+        """与真实情况一致：出击模式的处理函数列表先建好（存的是原函数对象），再装加速模式。"""
+        game = Game(page, rules)
+        task = FakeSortieTask(game, enabled)
+        utils_chaos.PAGE_HANDLERS[:] = []  # 卡厄思的列表留空：出击模式必须用自己的
+        utils_sortie.PAGE_HANDLERS[:] = handlers
+        speedup.install(task)
+        return game, task
+
+    def play_card(self, enabled, raise_card=True, play_works=True, popup=False, handler=None):
+        # 出牌函数换成时序相同、尚未包装的替身，装加速模式时会被包装并替换进处理函数列表
+        utils_sortie.handle_battle_page = handle_battle_page
+        utils_sortie._try_all_card_keys = fake_try_all_card_keys
+        game, task = self.make_sortie("BATTLE_PLAY", {}, [handler or handle_battle_page], enabled)
+        game.hand, game.play_fails, game.popup_on_enter = 5, not play_works, popup
+        game.image_fn = battle_image_fn(game) if raise_card else (lambda now: SCENE)
+        run_executor(task, 12, stop=lambda: len(task.marks.get("plays", [])) >= 1)
+        return time.time() - game.keys[0][0], game, task
+
+    def test_sortie_uses_its_own_page_handlers(self):
+        game, task = self.make_sortie("A", {"A": (0.1, 0.5, "B", FADING)}, [handle_center_confirm, handle_page_b])
+        run_executor(task, 4, stop=lambda: "reached_b" in task.marks)
+        self.assertIs(utils_sortie, task._speedup["handlers"])
+        self.assertLess(task.marks["reached_b"] - game.clicks[0][0], 1.3)
+        self.assertEqual(1, sum(1 for _, page in game.clicks if page == "A"))
+
+    def test_incompatible_run_disables_gate_only(self):
+        game = Game("A", {"A": (0.1, 0.5, "B", FADING)})
+        task = OtherRunTask(game, True)
+        speedup.install(task)
+        run_executor(task, 3.5)
+        self.assertFalse(task._speedup["gate_ok"])
+        self.assertEqual(1, len(game.clicks))
+        self.assertEqual(0.3, task.trigger_interval)  # 检测间隔优化照常
+
+    def test_page_handler_list_entry_is_replaced(self):
+        utils_sortie.handle_battle_page = handle_battle_page
+        self.make_sortie("BATTLE_PLAY", {}, [handle_battle_page])
+        entry = utils_sortie.PAGE_HANDLERS[0]
+        self.assertIsNot(handle_battle_page, entry)  # 列表里存的原函数也换成了包装后的
+        self.assertTrue(getattr(entry, "_speedup_wrapped", False))
+        self.assertEqual("handle_battle_page", entry.__name__)
+
+    def test_card_play_waits_for_raise_and_hand_count(self):
+        original, _, _ = self.play_card(False)
+        fast, game, task = self.play_card(True)
+        digit = next(t for t, key in game.keys if key.isdigit())
+        enter = next(t for t, key in game.keys if key == "enter")
+        self.assertGreaterEqual(original, 2.9)
+        self.assertLess(fast, 1.2)
+        self.assertGreaterEqual(enter - digit, CARD_RAISE)  # 卡牌上滑到位后才回车
+        self.assertEqual(4, game.hand)
+        self.assertEqual(1.0, task.trigger_interval)  # 仍在战斗中：检测间隔保持 1 秒
+
+    def test_card_play_without_response_waits_original_time(self):
+        elapsed, game, _ = self.play_card(True, raise_card=False, play_works=False)
+        self.assertGreaterEqual(elapsed, 2.9)
+        self.assertEqual(5, game.hand)
+
+    def test_popup_after_card_play_is_handled_soon(self):
+        elapsed, game, task = self.play_card(True, popup=True)
+        self.assertLess(elapsed, 1.2)
+        self.assertEqual(["4", "enter"], [key for _, key in game.keys])
+        self.assertEqual(0.3, task.trigger_interval)  # 下一轮按非战斗间隔尽快来处理弹窗
+
+    def test_fallback_card_keys_speed_up_and_stop_on_popup(self):
+        original, _, _ = self.play_card(False, handler=handle_battle_fallback)
+        fast, game, _ = self.play_card(True, handler=handle_battle_fallback)
+        self.assertLess(fast, original / 2)
+        self.assertEqual(0, game.hand)
+        elapsed, game, _ = self.play_card(True, popup=True, handler=handle_battle_fallback)
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(["5", "enter"], [key for _, key in game.keys])  # 弹窗后不再按 4、3、2、1
+
+    def test_real_sortie_mode_run_matches_gated_run(self):
+        import SortieMode
+        from src.config import config
+
+        task = SortieMode.SortieMode(executor=SimpleNamespace(scene=None, config=config), app=None)
+        self.assertTrue(task._speedup["gate_ok"], "SortieMode.run() 已改动，请同步 speedup._gated_run")
+        self.assertIs(utils_sortie, task._speedup["handlers"])
+        self.assertFalse(task.default_config[speedup.ENABLE_KEY])
+        entry = next(h for h in utils_sortie.PAGE_HANDLERS if h.__name__ == "handle_battle_page")
+        self.assertTrue(getattr(entry, "_speedup_wrapped", False))
+        self.assertIn("handle_battle_page", speedup._BATTLE_HANDLERS)
 
     # ---------------- 与真实 ChaosMode 的兼容性 ----------------
     def test_real_chaos_mode_run_matches_gated_run(self):

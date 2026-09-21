@@ -1,5 +1,5 @@
 """
-卡厄思模式加速模式（实验性，默认关闭）。
+卡厄思模式、出击模式的加速模式（实验性，默认关闭）。
 
 原逻辑每次点击后按固定时长等待（click_box 自带 1 秒，处理函数再 sleep 0.5~2 秒），
 _move_and_click 点击前还固定悬停 0.5 秒，而界面通常不到 1 秒就切换完成。
@@ -21,12 +21,22 @@ _move_and_click 点击前还固定悬停 0.5 秒，而界面通常不到 1 秒�
 7. 要求移除多张但目标卡不够时：原逻辑会点“跳过”，连已选中的目标卡也不删；现在只要选中了至少 1 张，
    就不点“跳过”，交给原有的“移除”按钮处理确认删除已选中的卡（不拿其他卡凑数）。一张没选中仍照原逻辑跳过；
    若保留部分选择后“移除”按钮没点成，下一次照原逻辑跳过，避免反复。
-只作用于卡厄思模式，关闭任务配置里的“加速模式”即完全使用原逻辑。
+8. 出击模式战斗出牌：原逻辑按数字键选中卡牌后固定等 0.5~1 秒才回车，回车后再固定等 1~2 秒。
+   实测按键后 0.01~0.04 秒卡牌就上滑到位，回车后约 0.2~0.3 秒手牌数就减少了。
+   改为按数字键后等手牌区出现明显变化（卡牌上滑）就回车，回车后等手牌数减少就继续；
+   两段都以原时长封顶，判断不出结果（例如这张牌没打出去）时照原逻辑等满。
+   有的牌打出后会弹出选择页面（如“请选择功能”），盖住手牌数：回车后连续几次读不到手牌数就结束等待，
+   这次出牌流程剩下的按键也不再发送（兜底出牌会把手牌数到 1 的按键都按一遍），由下一轮马上处理弹窗。
+
+只作用于卡厄思模式和出击模式，关闭任务配置里的“加速模式”即完全使用原逻辑。
 
 注意：本文件不能定义顶层类，框架会把 ok_tasks 下含类的 .py 当作任务加载。
 """
+import functools
 import inspect
 import os
+import re
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -35,7 +45,6 @@ import numpy as np
 
 import config_io
 import utils
-import utils_chaos
 
 ENABLE_KEY = "加速模式"
 HOVER_KEY = "点击前悬停等待(秒)"
@@ -50,9 +59,17 @@ _BATTLE_INTERVAL = 1.0  # 战斗中保持原逻辑的 1 秒，避免多占 CPU
 _STATS_EVERY = 30
 _EXPECTED_RUN_SOURCE = (
     "self.all_texts = _simplify_texts(self.ocr())",
-    "utils_chaos.PAGE_HANDLERS",
     "self._check_upload_if_needed()",
 )
+# run() 里用的页面处理函数列表（卡厄思是 utils_chaos，出击是 utils_sortie）
+_HANDLERS_PATTERN = re.compile(r"for handle_page in (\w+)\.PAGE_HANDLERS:")
+# 战斗中的页面处理函数：检测间隔保持原逻辑的 1 秒，避免战斗时多占 CPU
+_BATTLE_HANDLERS = frozenset((
+    "handle_battle_auto_check",                                    # 卡厄思：等自动战斗
+    "handle_battle_page", "handle_battle_hand_select", "handle_discard_hand_card",  # 出击：出牌
+    "handle_curiosity_activate", "handle_extra_card_use", "handle_card_function_select",
+    "handle_return_to_draw_pile",
+))
 # 处理函数会在同一帧、同一区域、同一阈值下依次匹配的图标组
 _PARALLEL_GROUPS = (
     ("safezone", "enemy", "elite", "event", "settlement", "shop", "kalei", "seal", "hard"),  # 路线页节点与标记
@@ -76,6 +93,17 @@ _DECK_POLL = 0.03
 _NAME_ONLY_PAGES = ("select_card-移除", "select_card-复制")  # 只需要卡名的选卡流程
 _NAME_ONLY_THRESHOLD = 0.90  # 与原本咒术卡的“只凭卡名保留”阈值一致
 _SKIP_WORDS = ("跳过", "取消")  # 删卡流程找不够卡时原逻辑点的按钮
+# 出击模式战斗出牌：按数字键选中卡牌（卡牌上滑），回车打出
+_HAND_REGION = (0.159, 0.660, 0.836, 0.950)   # 手牌区域
+_HAND_SIZE = (192, 96)
+_HAND_MOVED = 0.15      # 手牌区相对按键前变化超过 15%：卡牌已上滑到位（实测 0.01~0.04 秒）
+_HAND_POLL = 0.02
+_RAISE_SETTLE = 0.05    # 上滑到位后再稍等一下才回车
+_COUNT_REGION = (0.470, 0.950, 0.560, 0.995)  # 手牌数「N/10」
+_COUNT_PATTERN = re.compile(r"(\d+)\s*/\s*10")
+_PLAY_POLL = 0.04
+_PLAY_SETTLE = 0.10     # 手牌数减少后再稍等一下，让出牌动画开始
+_LEFT_BATTLE_POLLS = 3  # 回车后连续几次读不到手牌数：多半弹出了选择页面（如“请选择功能”），交给下一轮处理
 _PARTIAL_RETRY_SECONDS = 10     # 保留部分选择后这段时间内再次进入选卡，视为“移除”没点成
 
 
@@ -97,8 +125,9 @@ def install(task):
         for name in ("sleep", "click", "click_box", "move", "scroll", "mouse_down", "mouse_up", "send_key", "run",
                      "find_feature")
     }
+    handlers = _handlers_module(task)
     st = {
-        "orig_sleep": orig["sleep"], "active": False, "gate_ok": _run_is_compatible(task),
+        "orig_sleep": orig["sleep"], "active": False, "handlers": handlers, "gate_ok": handlers is not None,
         "in_run": False, "in_action": False, "owed_until": 0.0, "actions": 0,
         "moved": False, "held": False,
         "action_sig": None, "action_box": None, "action_time": 0.0,
@@ -107,14 +136,19 @@ def install(task):
         "match_cache": None, "deck_scroll": False, "deck_before": None,
         # 删卡目标不够时保留已选中的卡：kept_pending 为拦下“跳过”时已选中的张数，partial_at 为保留的时刻
         "removal_flow": False, "kept_pending": None, "allow_skip": False, "partial_at": 0.0,
+        # 出击模式出牌：pay_hook 决定下一次补等待时怎么等（等卡牌上滑 / 等手牌数减少）
+        "battle_play": False, "hand_before": None, "hand_count": None, "pay_hook": None,
+        "battle_left": False,  # 出牌途中已离开战斗页面（弹出了选择页面）
     }
     task._speedup = st
     if not st["gate_ok"]:
-        task.log_info("加速模式：ChaosMode.run() 结构与 speedup.py 预期不一致，文字闸门已停用，其余优化照常")
+        task.log_info(f"加速模式：{task.name} 的 run() 结构与 speedup.py 预期不一致，文字闸门已停用，其余优化照常")
 
     def sleep(timeout):
         if not st["active"] or timeout is None or timeout <= 0:
             return orig["sleep"](timeout)
+        if st["battle_play"] and st["battle_left"]:
+            return True  # 出牌途中已弹出选择页面：这次出牌流程剩下的等待不再需要
         if st["held"] or task.executor.paused:
             _pay_owed(st)
             return orig["sleep"](timeout)
@@ -135,7 +169,9 @@ def install(task):
                 return orig[name](*args, **kwargs)
             st["in_action"] = True
             try:
-                _pay_owed(st)
+                _pay_owed(st)  # 出牌时这里会判断上一张牌是否已打出、是否弹出了选择页面
+                if name == "send_key" and st["battle_play"] and st["battle_left"]:
+                    return True  # 出牌途中已弹出选择页面：剩下的出牌按键不再发送，交给下一轮处理弹窗
                 if name == "mouse_down":
                     st["held"] = True
                     st["moved"] = False
@@ -145,6 +181,9 @@ def install(task):
                     if name == "scroll" and st["deck_scroll"]:
                         # 牌库翻页：在欠的等待补完、真正滚动前截一帧，作为判断列表是否已滚动的参照
                         st["deck_before"] = _deck_capture(task)
+                    if name == "send_key" and st["battle_play"]:
+                        # 出牌：记下按键前的手牌区和手牌数，决定这次按键之后怎么等
+                        _before_battle_key(task, st, args[0] if args else kwargs.get("key"))
                     _note_action(task, st, point_of(task, args, kwargs))
                 return orig[name](*args, **kwargs)
             finally:
@@ -197,7 +236,8 @@ def install(task):
         _wrap_executor_next_frame(task.executor)
         enabled = _enabled(task)
         st.update(active=enabled, in_run=enabled, in_action=False, owed_until=0.0, actions=0,
-                  moved=False, held=False, hit=None, action_sig=None, action_box=None, match_cache=None)
+                  moved=False, held=False, hit=None, action_sig=None, action_box=None, match_cache=None,
+                  pay_hook=None, battle_play=False, battle_left=False)
         if not enabled:
             st.update(gate=None, prev_sig=None, battle=False)
             task.trigger_interval = 1
@@ -230,25 +270,31 @@ def install(task):
     _keep_stuck_detection_at_one_second()
     _patch_deck_scan()
     _patch_partial_removal()
+    _patch_battle_play()
 
 
-def _run_is_compatible(task):
-    """加速模式会接管 run()，只在其源码仍是“OCR -> 依次尝试页面处理函数 -> 上传检查”时启用闸门；
-    修改 ChaosMode.run() 后需同步 _gated_run。"""
+def _handlers_module(task):
+    """加速模式会接管 run()，只在其源码仍是“OCR -> 依次尝试页面处理函数 -> 上传检查”时启用闸门（修改 run() 后需同步 _gated_run）。
+    页面处理函数列表取自 run() 里用的那个模块（卡厄思是 utils_chaos，出击是 utils_sortie）；对不上就返回 None。"""
     try:
         source = inspect.getsource(type(task).run)
     except (OSError, TypeError):
-        return False
-    return all(snippet in source for snippet in _EXPECTED_RUN_SOURCE)
+        return None
+    match = _HANDLERS_PATTERN.search(source)
+    if match is None or not all(snippet in source for snippet in _EXPECTED_RUN_SOURCE):
+        return None
+    module = sys.modules.get(type(task).__module__)
+    handlers = getattr(module, match.group(1), None)
+    return handlers if hasattr(handlers, "PAGE_HANDLERS") else None
 
 
 def _gated_run(task, st):
-    """与 ChaosMode.run() 相同，只在交给页面处理函数前多一道文字闸门。"""
+    """与任务自己的 run() 相同，只在交给页面处理函数前多一道文字闸门。"""
     texts = utils._simplify_texts(task.ocr())
     if _gate_blocks(task, st, texts):
         return
     task.all_texts = texts
-    for handle_page in utils_chaos.PAGE_HANDLERS:
+    for handle_page in st["handlers"].PAGE_HANDLERS:
         if handle_page(task):
             st["hit"] = handle_page.__name__
             return
@@ -259,6 +305,7 @@ def _finish_run(task, st):
     now = time.time()
     if st["owed_until"] > now:
         if st["gate_ok"] and st["actions"] == 1 and st["action_sig"] is not None:
+            st["pay_hook"] = None  # 交给文字闸门，不再用出牌那套判断
             st["gate"] = {
                 "sig": st["action_sig"], "box": st["action_box"],
                 "start": st["action_time"], "until": st["owed_until"], "changed": False,
@@ -266,8 +313,8 @@ def _finish_run(task, st):
             st["owed_until"] = 0.0
         else:
             _pay_owed(st)  # 多步操作或没有点击：保持原逻辑的等待时长
-    if st["hit"] == "handle_battle_auto_check":
-        st["battle"] = True
+    if st["hit"] in _BATTLE_HANDLERS and not st["battle_left"]:
+        st["battle"] = True  # 出牌后弹出了选择页面时不算战斗，下一轮按非战斗间隔尽快来处理
     elif st["hit"] is not None:
         st["battle"] = False
     if st["gate"] is not None:
@@ -347,9 +394,14 @@ def _note_action(task, st, point):
 
 def _pay_owed(st):
     remaining = st["owed_until"] - time.time()
+    hook, st["pay_hook"] = st["pay_hook"], None
     st["owed_until"] = 0.0
-    if remaining > 0:
-        st["orig_sleep"](remaining)
+    if remaining <= 0:
+        return
+    # 出牌时按“游戏是否已响应”来等，最长仍是原来的时长；等不出结果就照原逻辑等满
+    if hook is not None and hook(time.time() + remaining):
+        return
+    st["orig_sleep"](remaining)
 
 
 def _wrap_executor_next_frame(executor):
@@ -425,16 +477,23 @@ def _active_state(task):
     return st if st is not None and st["active"] else None
 
 
+def _capture(task):
+    """截一帧；截不到时返回 None。"""
+    capture = getattr(task.executor, "_speedup_original_next_frame", None)
+    return capture() if capture is not None else None
+
+
+def _thumbnail(frame, region, size):
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = region
+    area = frame[int(y1 * height):int(y2 * height), int(x1 * width):int(x2 * width)]
+    return cv2.cvtColor(cv2.resize(area, size, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+
+
 def _deck_capture(task):
     """截一帧并取卡牌区域的灰度缩略图；截不到帧时返回 None。"""
-    capture = getattr(task.executor, "_speedup_original_next_frame", None)
-    frame = capture() if capture is not None else None
-    if frame is None:
-        return None
-    height, width = frame.shape[:2]
-    x1, y1, x2, y2 = _DECK_REGION
-    area = frame[int(y1 * height):int(y2 * height), int(x1 * width):int(x2 * width)]
-    return cv2.cvtColor(cv2.resize(area, _DECK_SIZE, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+    frame = _capture(task)
+    return None if frame is None else _thumbnail(frame, _DECK_REGION, _DECK_SIZE)
 
 
 def _deck_changed(a, b):
@@ -534,6 +593,112 @@ def _patch_partial_removal():
 
     select_card._speedup_wrapped = True
     utils.select_card = select_card
+
+
+def _patch_battle_play():
+    """出击模式战斗出牌：原逻辑按数字键后固定等 0.5~1 秒才回车，回车后再固定等 1~2 秒。
+    实测卡牌按下后 0.01~0.04 秒就上滑到位，回车后约 0.2~0.3 秒手牌数就减少了。
+    这里把两段等待都改成“游戏一响应就继续”，最长仍是原来的时长；判断不出结果时照原逻辑等满。"""
+    try:
+        import utils_sortie
+    except ImportError:
+        return
+    handlers = getattr(utils_sortie, "PAGE_HANDLERS", None)
+    for name in ("handle_battle_page", "_try_all_card_keys"):
+        current = getattr(utils_sortie, name, None)
+        if current is None:
+            continue
+        if not getattr(current, "_speedup_wrapped", False):
+            current = _battle_play_wrapper(current)
+            setattr(utils_sortie, name, current)
+        # 页面处理函数列表里存的是函数对象本身，只换模块属性不会生效，列表里的也要换成包装后的
+        if isinstance(handlers, list):
+            handlers[:] = [current if h is current.__wrapped__ else h for h in handlers]
+
+
+def _battle_play_wrapper(original):
+    @functools.wraps(original)  # 保留原函数名：检测间隔按处理函数名判断是否在战斗中
+    def wrapped(task, *args, **kwargs):
+        st = _active_state(task)
+        if st is None:
+            return original(task, *args, **kwargs)
+        previous = st["battle_play"]
+        st.update(battle_play=True, battle_left=False)
+        try:
+            return original(task, *args, **kwargs)
+        finally:
+            # battle_left 保留到本轮结束：_finish_run 据此让下一轮尽快来处理弹窗；下一轮开始时复位
+            st.update(battle_play=previous, hand_before=None, hand_count=None)
+
+    wrapped._speedup_wrapped = True
+    return wrapped
+
+
+def _before_battle_key(task, st, key):
+    """按键前记下参照，并决定这次按键之后怎么补等待。"""
+    key = str(key or "").lower()
+    st["pay_hook"] = None
+    if key.isdigit():
+        frame = _capture(task)
+        if frame is None:
+            return
+        hand = _thumbnail(frame, _HAND_REGION, _HAND_SIZE)
+        st["hand_count"] = _hand_count(task, frame)
+        st["pay_hook"] = lambda deadline: _wait_card_raised(task, st, hand, deadline)
+    elif key == "enter" and st["hand_count"]:
+        before = st["hand_count"]
+        st["pay_hook"] = lambda deadline: _wait_card_played(task, st, before, deadline)
+
+
+def _hand_count(task, frame):
+    """读手牌数「N/10」；读不到返回 None。"""
+    try:
+        for box in task.ocr(*_COUNT_REGION, frame=frame):
+            match = _COUNT_PATTERN.search(box.name)
+            if match:
+                return int(match.group(1))
+    except Exception:
+        return None
+    return None
+
+
+def _wait_card_raised(task, st, reference, deadline):
+    """按数字键后等卡牌上滑到位，到位就可以回车。"""
+    while time.time() < deadline:
+        frame = _capture(task)
+        if frame is None:
+            return False
+        if _deck_changed(_thumbnail(frame, _HAND_REGION, _HAND_SIZE), reference) > _HAND_MOVED:
+            st["orig_sleep"](min(_RAISE_SETTLE, max(0.0, deadline - time.time())))
+            st["saved_total"] += max(0.0, deadline - time.time())
+            return True
+        st["orig_sleep"](min(_HAND_POLL, max(0.0, deadline - time.time())))
+    return True  # 没检测到上滑：已经等满原时长
+
+
+def _wait_card_played(task, st, before, deadline):
+    """回车后等手牌数减少，说明卡牌已经打出去了。
+    手牌数连续几次都读不到时，多半是这张牌弹出了选择页面（如“请选择功能”）盖住了手牌区：
+    结束等待并标记，这次出牌流程剩下的按键不再发送，由下一轮去处理弹窗。"""
+    missing = 0
+    while time.time() < deadline:
+        frame = _capture(task)
+        if frame is None:
+            return False
+        count = _hand_count(task, frame)
+        if count is not None and count < before:
+            st["hand_count"] = count
+            st["orig_sleep"](min(_PLAY_SETTLE, max(0.0, deadline - time.time())))
+            st["saved_total"] += max(0.0, deadline - time.time())
+            return True
+        missing = missing + 1 if count is None else 0
+        if missing >= _LEFT_BATTLE_POLLS:
+            st["battle_left"] = True
+            st["saved_total"] += max(0.0, deadline - time.time())
+            task.log_info("加速：出牌后读不到手牌数，多半弹出了选择页面，停止这次出牌流程，先处理页面")
+            return True
+        st["orig_sleep"](min(_PLAY_POLL, max(0.0, deadline - time.time())))
+    return True  # 手牌数没减少（例如这张牌没打出去）：已经等满原时长
 
 
 def _signature(task, texts):
