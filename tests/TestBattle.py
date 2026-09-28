@@ -50,6 +50,13 @@ TRUTH = {
         "cards": {"1": ("鞭打", 2, "攻击"), "2": ("上斩", 2, "攻击"), "3": ("秃鹰发射", 4, "攻击"),
                   "4": ("斩击", 1, "攻击"), "5": ("破碎", 3, "攻击")},
     },
+    # 角色崩溃：手里有两张崩溃牌「冲动」（费用位置显示 1/5）；场上另有 4 个「无法攻击」的捕兽夹，不算敌人
+    "collapse_traps": {
+        "hand": 6, "remaining": 3, "hp": (1389, 1560), "shield": 40, "red": False,
+        "enemies": [(2622, 4)],
+        "cards": {"1": ("扭曲：光荣的抵抗", 2, "强化"), "2": ("冲动", None, "崩溃"), "3": ("冲动", None, "崩溃"),
+                  "4": ("斩击", 1, "攻击"), "5": ("斗志", 2, "技能"), "6": ("破碎", 3, "攻击")},
+    },
 }
 
 _engine = None
@@ -113,7 +120,7 @@ class TestBattlePerception(unittest.TestCase):
                         self.assertTrue(set(card["name"]) & set(true_name), f"{card['key']}: {card['name']} ≠ {true_name}")
                     if card["type"] is not None:
                         self.assertEqual(true_type, card["type"], f"按键 {card['key']} 的类型")
-                    if cost is not None:
+                    if cost is not None and true_cost is not None:  # 崩溃牌的费用位置是进度，出牌时按 0 费处理
                         costs_read += 1
                         self.assertEqual(true_cost, cost, f"按键 {card['key']}「{true_name}」的费用")
         self.assertGreaterEqual(costs_read, 8)  # 读不到的由「AP不足」兜底，但大部分应该能读到
@@ -173,6 +180,13 @@ class TestChoosePlay(unittest.TestCase):
         cards[0]["slot"] = "1/1"
         self.assertIsNone(battle.choose_play(cards, 1, [], [], False, {"1/1"})[0])  # 这个位置提示过 AP不足
         self.assertIsNotNone(battle.choose_play([card("孢子", 0)], 0, [], [], False, set())[0])  # 0 费照出
+
+    def test_collapse_card_first_even_without_ap(self):
+        cards = [card("破碎", 3, "攻击"), card("冲动", 0, "崩溃", key="2")]
+        cards[1]["progress"] = (1, 5)
+        chosen, reason = battle.choose_play(cards, 0, ["破碎"], [], True, set())
+        self.assertEqual("冲动", chosen["name"])
+        self.assertIn("1/5", reason)
 
     def test_remaining_unknown_plays_anything(self):
         self.assertEqual("破碎", battle.choose_play([card("破碎", 3, "攻击")], None, [], [], False, set())[0]["name"])
@@ -240,9 +254,16 @@ class TestPlayTurn(unittest.TestCase):
         self.assertEqual(["drag"], self.keys)
 
     def test_card_that_never_leaves_hand_is_skipped(self):
-        for _ in range(battle._STUCK_LIMIT + 1):
-            battle.play_turn(self.task, 1, True)  # 手牌数一直是 1：没打出去
+        battle.play_turn(self.task, 1, True)
+        battle.play_turn(self.task, 1, True)  # 手牌数和 AP 都没减少：按键出的牌失败一次就不再出
         self.assertIn("斗志", self.task._battle["unplayable"])
+
+    def test_ap_drop_counts_as_played(self):
+        # 抽牌的牌打出后手牌数不变，但 AP 减少了：算打出去了，不能记成出不起
+        battle.play_turn(self.task, 1, True)
+        with mock.patch.object(battle, "read_remaining_cost", lambda task, frame: 2):
+            battle.play_turn(self.task, 1, True)
+        self.assertNotIn("斗志", self.task._battle["unplayable"])
 
     def test_new_turn_when_cost_refills(self):
         battle.play_turn(self.task, 1, True)

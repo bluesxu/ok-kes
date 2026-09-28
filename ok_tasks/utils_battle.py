@@ -42,7 +42,7 @@ _HP_BAR_ROWS = (0.034, 0.038, 0.042)               # 我方血条取样的行
 _HP_BAR_LEFT = 0.022                               # 我方血条左端
 _ENEMY_AREA = (0.30, 0.0, 1.0, 0.62)               # 敌人血条可能出现的范围
 _CARD_COST_BOX = (-0.030, -0.016, 0.004, 0.050)    # 费用数字相对牌名左上角的范围
-_CARD_TYPE_BOX = (-0.012, 0.004, 0.075, 0.055)     # 类型标签相对牌名左上角的范围
+_CARD_TYPE_BOX = (-0.012, 0.004, 0.05, 0.055)     # 类型标签相对牌名左上角的范围；右边界太宽会拿到相邻牌的标签
 _PANEL_REGION = (0.02, 0.02, 0.46, 0.46)           # 怪物信息面板
 _PANEL_CLOSE = (0.502, 0.092)                      # 关闭怪物信息面板（与 handle_weakness_info 相同）
 
@@ -218,6 +218,7 @@ def read_hand(task, count):
     x1, y1, x2, y2 = _HAND_AREA
     names = [[] for _ in slots]
     types = [[] for _ in slots]
+    progress = [None for _ in slots]
     for box in task.all_texts:
         left, top = box.x / task.width, box.y / task.height
         cy = (box.y + box.height / 2) / task.height
@@ -227,7 +228,15 @@ def read_hand(task, count):
         if abs(slots[index] - left) > 0.45 * spacing + 0.012:
             continue
         text = box.name.strip()
-        card_type = _type_of(text) if len(text) <= 5 else None
+        # 崩溃牌在费用位置显示「已打张数/所需张数」，已打张数常被漏读（只读到「/5」），读不到记为 None
+        # 「1/5」常被读成「17/5」「175」：只有干净的「数字/数字」才采信已打张数，所需张数取「崩」字前那一位
+        clean = re.match(r"^(\d)\s*/\s*(\d)(?!\d)", text)
+        total = re.search(r"(\d)\s*崩", text)
+        if clean:
+            progress[index] = (int(clean.group(1)), int(clean.group(2)))
+        elif total:
+            progress[index] = (None, int(total.group(1)))
+        card_type = _type_of(text) if len(text) <= 8 else None
         if card_type:
             types[index].append(card_type)
             continue
@@ -246,6 +255,7 @@ def read_hand(task, count):
             "y": best[2] if best else None,
             "type": types[i][0] if types[i] else None,
             "cost_hint": best[3] if best else None,
+            "progress": progress[i],
         })
     return cards
 
@@ -267,6 +277,8 @@ def _card_type(task, card):
 
 def _type_of(text):
     """类型标签文字 → 卡牌类型。要求完整的词：「破碎（极强）」里的「强」不是「强化」。「攻」单独成立是因为「攻击」常被读成「攻雪」「攻撃」。"""
+    if "崩" in text:  # 「崩潰」常被读成「崩清」「崩潢」，只认「崩」字
+        return "崩溃"
     if "攻" in text:
         return "攻击"
     for word, card_type in (("技能", "技能"), ("强化", "强化"), ("咒术", "咒术"), ("状态", "状态异常"), ("异常", "状态异常")):
@@ -329,7 +341,10 @@ def _numbers_near(task, x1, y1, x2, y2):
 def read_enemies(task, frame):
     """每个敌人：血量、护盾、行动倒计时（∞ 或读不到为 None）、意图、拖牌落点、意图图标的位置。"""
     enemies = []
+    blocked = [_rel(task, b) for b in task.all_texts if "无法攻击" in b.name]
     for left, bar_y, bar_w in enemy_bars(frame):
+        if any(left - 0.02 <= bx <= left + bar_w + 0.02 and bar_y - 0.05 <= by <= bar_y + 0.01 for bx, by in blocked):
+            continue  # 「无法攻击」的单位（如地上的捕兽夹）不能当目标
         near = _numbers_near(task, left - 0.005, bar_y - 0.05, left + 0.17, bar_y + 0.005)
         if not near:
             # 全屏 OCR 偶尔漏掉血量数字（如 Boss 的 7441）：单独裁出血条上方再读一次
@@ -453,7 +468,9 @@ def collect_intent(task, enemy):
         lines.append((_normalize_text(box.name), (box.y + box.height / 2) / task.height))
     lines.sort(key=lambda item: item[1])
     result = classify_intent_panel(lines)
-    if result is None:
+    if result is None and any("已行动" in text or "行动完成" in text for text, _ in lines):
+        task.log_info("意图采集：该怪物本回合已行动，面板上没有意图，跳过")
+    elif result is None:
         battle_log.anomaly(task, "意图采集失败", f"点开敌人后没读到意图：{[t for t, _ in lines]}")
     else:
         category, move, count, damage = result
@@ -507,6 +524,13 @@ def choose_play(cards, remaining, priority, defense, lethal, unplayable):
             reserve = 1  # 防御牌费用读不到：至少留 1 费
     # 预计会被打死时，非防御牌只能用预留之外的费用；防御牌照常可以用全部剩余费用
     budget = None if remaining is None else remaining - reserve
+
+    # 崩溃牌不花 AP、不计入敌人的行动次数：手里有就最先出，打够张数才能觉醒
+    for card in cards:
+        if card["type"] == "崩溃" and not _blocked(card, unplayable) and card.get("key") is not None:
+            done = card.get("progress")
+            shown = f"，进度 {'?' if done[0] is None else done[0]}/{done[1]}" if done else ""
+            return card, f"崩溃牌（不花 AP，打够张数觉醒）{shown}"
 
     candidates = [(c, d) for c, d in zip(cards, is_defense) if affordable(c, remaining if d else budget)]
     if not candidates:
@@ -590,13 +614,15 @@ def _mark_unplayable(state, last):
         state["unplayable"].add(last["name"])
 
 
-def _check_last_play(task, state, hand_count):
-    """上一张牌打出去了吗：手牌数减少就算打出去了。同名牌可能有好几张，所以不看牌名还在不在。"""
+def _check_last_play(task, state, hand_count, remaining):
+    """上一张牌打出去了吗：手牌数减少、或剩余 AP 减少就算打出去了（抽牌的牌打出后手牌数可能不变，但 AP 会减少）。
+    同名牌可能有好几张，所以不看牌名还在不在。"""
     last = state.get("last")
     if not last or hand_count is None:
         return
     state["last"] = None
-    played = hand_count < last["hand"]
+    played = hand_count < last["hand"] or (
+        remaining is not None and last.get("remaining") is not None and remaining < last["remaining"])
     fails = state["attempts"]
     fails[last["slot"]] = 0 if played else fails.get(last["slot"], 0) + 1
     if last["method"] == "拖动":
@@ -614,9 +640,12 @@ def _check_last_play(task, state, hand_count):
                 fails[last["slot"]] = 0
                 battle_log.anomaly(task, "拖动出牌无效",
                                    f"拖动出牌连续 {session['drag_fail']} 次都没打出去，本次运行改用按键打默认目标")
-    if not played and fails[last["slot"]] >= _STUCK_LIMIT:
+    # 按键出的牌没打出去多半是 AP 不够（「AP不足」提示一闪而过常常读不到）：失败一次本回合就不再出它，
+    # 不再每张试 3 次（实跑中回合末尾每张牌白按 3 遍，每场战斗浪费 20~30 秒）
+    limit = 1 if last["method"] == "按键" else _STUCK_LIMIT
+    if not played and fails[last["slot"]] >= limit:
         _mark_unplayable(state, last)
-        battle_log.anomaly(task, "出不掉牌", f"「{last['name']}」连续 {_STUCK_LIMIT} 次没打出去，本回合不再出它")
+        battle_log.anomaly(task, "出不掉牌", f"「{last['name']}」{last['method']}出牌 {limit} 次没打出去，本回合不再出它")
 
 
 def _use_drag(task, state, card):
@@ -659,7 +688,6 @@ def play_turn(task, hand_count, finish_turn_visible):
             state["last"] = None  # 提示会停留几帧，只记一次
             battle_log.anomaly(task, "AP不足", f"「{last['name']}」费用不够，本回合不再出它")
         return True
-    _check_last_play(task, state, hand_count)
     if not finish_turn_visible:
         return True  # 不是我方可操作的时候
 
@@ -680,7 +708,11 @@ def play_turn(task, hand_count, finish_turn_visible):
     if remaining is not None and state["last_remaining"] is not None and remaining > state["last_remaining"]:
         _new_turn(state)  # 费用回满：新回合（也可能是某张牌加了费用，同样应该重新判断）
     state["last_remaining"] = remaining
+    _check_last_play(task, state, hand_count, remaining)
     _read_costs(task, state, frame, cards, pending)
+    for card in cards:
+        if card["type"] == "崩溃":
+            card["cost"] = 0  # 费用位置显示的是崩溃进度，不是费用
     enemies = enemies_job.result()
 
     unnamed = [c["key"] for c in cards if c["name"].startswith("未识别")]
@@ -733,7 +765,8 @@ def play_turn(task, hand_count, finish_turn_visible):
                       target_reason=target_reason, method=method, **observed)
     task.log_info(f"出牌「{card['name']}」（{reason}）"
                   + (f" → 拖到敌人 hp={target['hp']}（{target_reason}）" if use_drag else f" → 按键 {card['key']}"))
-    state["last"] = {"name": card["name"], "slot": card["slot"], "hand": hand_count, "method": method}
+    state["last"] = {"name": card["name"], "slot": card["slot"], "hand": hand_count, "method": method,
+                     "remaining": remaining}
     if use_drag:
         _drag_card(task, card, target)
         state["sticky"] = (target["x"], target["y"])
