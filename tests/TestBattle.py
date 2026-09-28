@@ -170,7 +170,8 @@ class TestChoosePlay(unittest.TestCase):
         cards = [card("未识别1", None)]
         self.assertIsNotNone(battle.choose_play(cards, 1, [], [], False, set())[0])
         self.assertIsNone(battle.choose_play(cards, 0, [], [], False, set())[0])
-        self.assertIsNone(battle.choose_play(cards, 1, [], [], False, {"未识别1"})[0])  # 提示过 AP不足
+        cards[0]["slot"] = "1/1"
+        self.assertIsNone(battle.choose_play(cards, 1, [], [], False, {"1/1"})[0])  # 这个位置提示过 AP不足
         self.assertIsNotNone(battle.choose_play([card("孢子", 0)], 0, [], [], False, set())[0])  # 0 费照出
 
     def test_remaining_unknown_plays_anything(self):
@@ -251,6 +252,38 @@ class TestPlayTurn(unittest.TestCase):
         with mock.patch.object(battle, "read_remaining_cost", lambda task, frame: 4):
             battle.play_turn(self.task, 1, True)
         self.assertNotIn("斗志", self.task._battle["unplayable"])
+
+
+class TestPlayTurnRecovery(TestPlayTurn):
+    """实跑中发现的问题：后台拖动没被游戏当成出牌、牌名前后多读出杂字、意图采集读不出时反复点开怪物。"""
+
+    def test_drag_disabled_after_repeated_failures(self):
+        self.task.default_config["出牌优先级"] = ["破碎"]
+        # 手牌数一直是 2：拖动没打出去。上一张牌打没打出去要到下一次调用才检查，所以第 3 次才发现拖了两次都失败
+        for _ in range(battle._DRAG_FAIL_LIMIT + 1):
+            battle.play_turn(self.task, 2, True)
+        self.assertTrue(self.task._battle_session["drag_disabled"])
+        self.assertEqual(["drag", "drag", "2", "enter"], self.keys)  # 改用按键打默认目标
+
+    def test_blocked_name_ignores_ocr_noise(self):
+        self.assertTrue(battle._blocked({"name": "日黑暗斩击", "slot": "1/5"}, {"黑暗斩击"}))
+        self.assertTrue(battle._blocked({"name": "未识别3", "slot": "3/5"}, {"3/5"}))
+        self.assertFalse(battle._blocked({"name": "未识别3", "slot": "3/4"}, {"3/5", "未识别3"}))
+
+    def test_intent_collected_once_per_enemy_per_turn(self):
+        self.task.default_config[battle.COLLECT_KEY] = True
+        calls = []
+        unknown = [dict(enemy(500, 3, None), drop=(0.6, 0.5))]
+        with mock.patch.object(battle, "collect_intent", lambda task, e: calls.append(e["hp"])),                 mock.patch.object(battle, "read_enemies", lambda task, frame: unknown):
+            for _ in range(3):
+                battle.play_turn(self.task, 1, True)
+        self.assertEqual([500], calls)  # 读不出意图也只点开一次，之后照常出牌
+        self.assertIn("1", self.keys)
+
+    def test_turn_end_trigger_is_an_intent(self):
+        lines = [("光秃铁壳虫1", 0.06), ("弱点", 0.1), ("翻滚", 0.17), ("回合结束时触发", 0.21),
+                 ("获得50%(35)护盾、士气2", 0.25)]
+        self.assertEqual((battle.INTENT_DEFENSE, "翻滚", None, None), battle.classify_intent_panel(lines))
 
 
 class TestBattleLogCleanup(unittest.TestCase):

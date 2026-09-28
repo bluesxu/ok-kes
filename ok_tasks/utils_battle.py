@@ -16,6 +16,7 @@ import glob
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -54,6 +55,7 @@ _STUCK_LIMIT = 3            # 同一张牌连续这么多次还在手里（又�
 _DRAG_FAIL_LIMIT = 2        # 拖动连续这么多次没打出去，改用按键 + 回车打默认目标
 _RED_SAMPLES = 4            # 读预计扣血时连续取样的帧数（红色段是闪烁的）
 _RED_INTERVAL = 0.25
+_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="出牌识别")  # 几块区域的 OCR 并行跑
 
 
 def install(task):
@@ -388,12 +390,14 @@ def save_intent_icon(crop, category, move_name):
 
 
 def classify_intent_panel(lines):
-    """从怪物信息面板的文字里找出意图：「行动次数N次后触发」所在的那一块。
-    lines 为 [(文字, 相对 y)]，文字已转简体。返回 (类别, 招式名, 触发次数, 伤害)；找不到意图返回 None。"""
-    trigger = next(((t, y) for t, y in lines if re.search(r"行动次数\s*\d+\s*次后触发", t)), None)
+    """从怪物信息面板的文字里找出意图：写着触发条件（「行动次数N次后触发」「回合结束时触发」等）的那一块。
+    lines 为 [(文字, 相对 y)]，文字已转简体。返回 (类别, 招式名, 触发次数, 伤害)，不按次数触发时触发次数为 None；
+    找不到意图返回 None。"""
+    trigger = next(((t, y) for t, y in lines if "触发" in t), None)
     if trigger is None:
         return None
-    count = int(re.search(r"行动次数\s*(\d+)", trigger[0]).group(1))
+    times = re.search(r"行动次数\s*(\d+)", trigger[0])
+    count = int(times.group(1)) if times else None
     above = [(t, y) for t, y in lines if trigger[1] - 0.06 <= y < trigger[1] - 0.005]
     move = above[-1][0] if above else ""
     block = " ".join(t for t, y in lines if trigger[1] - 0.005 <= y <= trigger[1] + 0.07)
@@ -426,7 +430,8 @@ def collect_intent(task, enemy):
         category, move, count, damage = result
         path = save_intent_icon(crop, category, move)
         enemy["intent"] = category
-        task.log_info(f"意图采集：「{move}」{category}，行动次数{count}次后触发，伤害={damage}，图标存到 {path}")
+        trigger = f"行动次数{count}次后触发" if count is not None else "非行动次数触发"
+        task.log_info(f"意图采集：「{move}」{category}，{trigger}，伤害={damage}，图标存到 {path}")
         battle_log.record(task, "意图采集", move=move, category=category, trigger=count, damage=damage, icon=path)
     _move_and_click(task, *_PANEL_CLOSE)
     task.sleep(0.5)
@@ -440,11 +445,21 @@ def _matches(name, candidates):
     return any(c and (c in name or name in c) for c in candidates)
 
 
+def _blocked(card, unplayable):
+    """这张牌是否已被记为本回合出不起。按牌名比对时允许一方包含另一方：
+    OCR 会在牌名前后多读出杂字（「黑暗斩击」「日黑暗斩击」「B黑暗斩击」是同一张牌）。
+    牌名没读到的牌按「按键/手牌数」这个位置比对。"""
+    if card.get("slot") in unplayable:
+        return True
+    name = card["name"]
+    return not name.startswith("未识别") and _matches(name, [u for u in unplayable if len(u) >= 2 and "/" not in u])
+
+
 def choose_play(cards, remaining, priority, defense, lethal, unplayable):
     """挑这一次要出的牌。cards 为 [{name, key, type, cost}]，cost 读不到为 None；remaining 读不到为 None。
-    返回 (牌, 理由)；没有能出的牌时返回 (None, 理由)。"""
+    unplayable 里是本回合出不起的牌名或位置（「按键/手牌数」）。返回 (牌, 理由)；没有能出的牌时返回 (None, 理由)。"""
     def affordable(card, budget):
-        if card["name"] in unplayable or card.get("key") is None:
+        if _blocked(card, unplayable) or card.get("key") is None:
             return False
         if budget is None:
             return True
@@ -456,10 +471,10 @@ def choose_play(cards, remaining, priority, defense, lethal, unplayable):
     reserve = 0
     if lethal and remaining is not None:
         costs = [c["cost"] for c, d in zip(cards, is_defense)
-                 if d and c["name"] not in unplayable and c["cost"] is not None and c["cost"] <= remaining]
+                 if d and not _blocked(c, unplayable) and c["cost"] is not None and c["cost"] <= remaining]
         if costs:
             reserve = min(costs)
-        elif any(d and c["name"] not in unplayable and c["cost"] is None for c, d in zip(cards, is_defense)):
+        elif any(d and not _blocked(c, unplayable) and c["cost"] is None for c, d in zip(cards, is_defense)):
             reserve = 1  # 防御牌费用读不到：至少留 1 费
     # 预计会被打死时，非防御牌只能用预留之外的费用；防御牌照常可以用全部剩余费用
     budget = None if remaining is None else remaining - reserve
@@ -513,7 +528,17 @@ def _state(task):
 
 
 def _new_turn(state):
-    state.update(unplayable=set(), attempts={}, costs={}, last=None)
+    # collected：本回合已经点开看过意图的敌人（意图每回合会变，所以每回合每个敌人最多采集一次）
+    state.update(unplayable=set(), attempts={}, costs={}, last=None, collected=set())
+
+
+def _session(task):
+    """跨战斗保留的状态：这台机器上拖动出牌是否有效。后台拖动（PostMessage）可能不被游戏当成出牌。"""
+    session = getattr(task, "_battle_session", None)
+    if session is None:
+        session = {"drag_ok": 0, "drag_fail": 0, "drag_disabled": False}
+        task._battle_session = session
+    return session
 
 
 def start_battle(task):
@@ -523,6 +548,70 @@ def start_battle(task):
     state.update(sticky=None, drag_fail={}, last_remaining=None, last_seen=time.time(), zero_frames=0)
     battle_log.new_battle(task)
     battle_log.record(task, "战斗开始")
+
+
+def _slot(card, hand_count):
+    """牌的位置标识「按键/手牌数」：手牌数不变时同一个位置就是同一张牌，不受牌名读法影响。"""
+    return f"{card['key']}/{hand_count}"
+
+
+def _mark_unplayable(state, last):
+    state["unplayable"].add(last["slot"])
+    if not last["name"].startswith("未识别"):
+        state["unplayable"].add(last["name"])
+
+
+def _check_last_play(task, state, hand_count):
+    """上一张牌打出去了吗：手牌数减少就算打出去了。同名牌可能有好几张，所以不看牌名还在不在。"""
+    last = state.get("last")
+    if not last or hand_count is None:
+        return
+    state["last"] = None
+    played = hand_count < last["hand"]
+    fails = state["attempts"]
+    fails[last["slot"]] = 0 if played else fails.get(last["slot"], 0) + 1
+    if last["method"] == "拖动":
+        session = _session(task)
+        if played:
+            session["drag_ok"] += 1
+        else:
+            session["drag_fail"] += 1
+            drag_fail = state["drag_fail"]
+            drag_fail[last["name"]] = drag_fail.get(last["name"], 0) + 1
+            if drag_fail[last["name"]] >= _DRAG_FAIL_LIMIT:
+                fails[last["slot"]] = 0  # 改用按键后重新计数，不让拖动的失败次数算到按键头上
+            if not session["drag_ok"] and session["drag_fail"] >= _DRAG_FAIL_LIMIT and not session["drag_disabled"]:
+                session["drag_disabled"] = True
+                fails[last["slot"]] = 0
+                battle_log.anomaly(task, "拖动出牌无效",
+                                   f"拖动出牌连续 {session['drag_fail']} 次都没打出去，本次运行改用按键打默认目标")
+    if not played and fails[last["slot"]] >= _STUCK_LIMIT:
+        _mark_unplayable(state, last)
+        battle_log.anomaly(task, "出不掉牌", f"「{last['name']}」连续 {_STUCK_LIMIT} 次没打出去，本回合不再出它")
+
+
+def _use_drag(task, state, card):
+    if card["type"] != "攻击" or _session(task)["drag_disabled"]:
+        return False
+    failed = [n for n, count in state["drag_fail"].items() if count >= _DRAG_FAIL_LIMIT]
+    return not (card["name"] in failed or (not card["name"].startswith("未识别") and _matches(card["name"], failed)))
+
+
+def _read_costs(task, state, frame, cards, pending):
+    """并行读还没读过费用的牌；牌名读到的按牌名缓存到本回合结束。"""
+    jobs = {}
+    for card in cards:
+        cached = not card["name"].startswith("未识别") and card["name"] in state["costs"]
+        if not cached:
+            jobs[id(card)] = pending.get(card["name"]) or _POOL.submit(_card_cost, task, frame, card)
+    for card in cards:
+        if id(card) in jobs:
+            card["cost"] = jobs[id(card)].result()
+            # 没读到牌名的牌不缓存：出掉一张后后面的牌会往前挪，同一个「未识别N」可能已经是另一张牌
+            if not card["name"].startswith("未识别"):
+                state["costs"][card["name"]] = card["cost"]
+        else:
+            card["cost"] = state["costs"][card["name"]]
 
 
 def play_turn(task, hand_count, finish_turn_visible):
@@ -537,32 +626,34 @@ def play_turn(task, hand_count, finish_turn_visible):
     if ap_insufficient(task):
         last = state.get("last")
         if last:
-            state["unplayable"].add(last)
+            _mark_unplayable(state, last)
             state["last"] = None  # 提示会停留几帧，只记一次
-            battle_log.anomaly(task, "AP不足", f"「{last}」费用不够，本回合不再出它")
+            battle_log.anomaly(task, "AP不足", f"「{last['name']}」费用不够，本回合不再出它")
         return True
-    # 上一张牌打出去了吗：手牌数没减少（也没提示 AP不足）就算没打出去。同名牌可能有好几张，所以不能只看牌名还在不在
-    last = state.get("last")
-    if last and hand_count is not None and state.get("last_hand") is not None:
-        fails = state["attempts"]
-        fails[last] = fails.get(last, 0) + 1 if hand_count >= state["last_hand"] else 0
-        if fails[last] >= _STUCK_LIMIT:
-            state["unplayable"].add(last)
-            battle_log.anomaly(task, "出不掉牌", f"「{last}」连续 {_STUCK_LIMIT} 次没打出去，本回合不再出它")
-        if fails[last] >= _DRAG_FAIL_LIMIT and state.get("last_method") == "拖动":
-            state["drag_fail"][last] = state["drag_fail"].get(last, 0) + 1  # 可能没拖中，之后改用按键
-        state["last"] = None
+    _check_last_play(task, state, hand_count)
     if not finish_turn_visible:
         return True  # 不是我方可操作的时候
-
-    remaining = read_remaining_cost(task, frame)
-    if remaining is not None and state["last_remaining"] is not None and remaining > state["last_remaining"]:
-        _new_turn(state)  # 费用回满：新回合（也可能是某张牌加了费用，同样应该重新判断）
-    state["last_remaining"] = remaining
 
     cards = read_hand(task, hand_count)
     if not cards:
         return _end_turn(task, "手牌数为 0")
+    for card in cards:
+        card["slot"] = _slot(card, hand_count)
+        if card["type"] is None and card["y"] is not None:
+            card["type"] = _card_type(task, card)
+
+    # 几块区域各自裁剪识别，互不相干，并行跑：剩余费用、敌人、没缓存的牌费用
+    remaining_job = _POOL.submit(read_remaining_cost, task, frame)
+    enemies_job = _POOL.submit(read_enemies, task, frame)
+    pending = {c["name"]: _POOL.submit(_card_cost, task, frame, c) for c in cards
+               if not c["name"].startswith("未识别") and c["name"] not in state["costs"]}
+    remaining = remaining_job.result()
+    if remaining is not None and state["last_remaining"] is not None and remaining > state["last_remaining"]:
+        _new_turn(state)  # 费用回满：新回合（也可能是某张牌加了费用，同样应该重新判断）
+    state["last_remaining"] = remaining
+    _read_costs(task, state, frame, cards, pending)
+    enemies = enemies_job.result()
+
     unnamed = [c["key"] for c in cards if c["name"].startswith("未识别")]
     if len(unnamed) == len(cards):
         state["zero_frames"] += 1
@@ -572,23 +663,14 @@ def play_turn(task, hand_count, finish_turn_visible):
         state["zero_frames"] = 0
         if unnamed:
             battle_log.anomaly(task, "牌名没读到", f"按键 {unnamed} 位置上的牌名没读到，仍按位置出牌")
-    for card in cards:
-        if card["type"] is None and card["y"] is not None:
-            card["type"] = _card_type(task, card)
-        # 费用每回合按牌名读一次：同一回合里费用基本不变，读错了由「AP不足」纠正。
-        # 没读到牌名的牌不缓存：出掉一张后后面的牌会往前挪，同一个「未识别N」可能已经是另一张牌
-        if card["name"].startswith("未识别"):
-            card["cost"] = _card_cost(task, frame, card)
-            continue
-        if card["name"] not in state["costs"]:
-            state["costs"][card["name"]] = _card_cost(task, frame, card)
-        card["cost"] = state["costs"][card["name"]]
 
-    enemies = read_enemies(task, frame)
     boss_battle = bool((getattr(task, "node_status", None) or {}).get("final_boss_battle"))
     if _get_config_value(task, COLLECT_KEY, False):
-        unknown = next((e for e in enemies if e["intent"] is None), None)
+        # 每回合每个敌人最多点开一次：读不出意图（比如没见过的写法）也不会反复点，卡在同一个画面
+        unknown = next((e for e in enemies if e["intent"] is None
+                        and (round(e["x"] * 20), round(e["y"] * 20)) not in state["collected"]), None)
         if unknown is not None:
+            state["collected"].add((round(unknown["x"] * 20), round(unknown["y"] * 20)))
             collect_intent(task, unknown)
             return True
 
@@ -612,16 +694,17 @@ def play_turn(task, hand_count, finish_turn_visible):
         return _end_turn(task, reason)
 
     target, target_reason = None, None
-    use_drag = card["type"] == "攻击" and state["drag_fail"].get(card["name"], 0) < _DRAG_FAIL_LIMIT
+    use_drag = _use_drag(task, state, card)
     if use_drag:
         target, target_reason = choose_target(enemies, boss_battle, state["sticky"])
         use_drag = target is not None
+    method = "拖动" if use_drag else "按键"
     battle_log.record(task, "出牌", card=card["name"], key=card["key"], cost=card["cost"], card_type=card["type"],
                       reason=reason, target=target and {k: target[k] for k in ("x", "y", "hp", "countdown", "intent")},
-                      target_reason=target_reason, method="拖动" if use_drag else "按键", **observed)
+                      target_reason=target_reason, method=method, **observed)
     task.log_info(f"出牌「{card['name']}」（{reason}）"
                   + (f" → 拖到敌人 hp={target['hp']}（{target_reason}）" if use_drag else f" → 按键 {card['key']}"))
-    state.update(last=card["name"], last_hand=hand_count, last_method="拖动" if use_drag else "按键")
+    state["last"] = {"name": card["name"], "slot": card["slot"], "hand": hand_count, "method": method}
     if use_drag:
         _drag_card(task, card, target)
         state["sticky"] = (target["x"], target["y"])
