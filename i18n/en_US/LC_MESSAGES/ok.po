@@ -280,3 +280,24 @@ msgstr "Minimum interval between recognitions outside battle when 加速模式 i
 
 msgid "关闭后商店不再点击「免费」刷新，没货就离开；开启后恢复原版刷新"
 msgstr "When off, the shop's free refresh is not used and the shop is left when nothing is worth buying. When on, the original refresh behavior is restored."
+
+msgid "给我方加护盾的牌；预计这回合会被打死时，先给这些牌留出费用"
+msgstr "Cards that give your team a shield; when this turn's incoming damage would be lethal, AP is reserved for them first."
+
+msgid "出牌前用击杀预览挑目标（当前版本尚未实现预览，行为与关闭相同）；关闭时集中打同一个敌人直到它死"
+msgstr "Pick targets using the kill preview before playing (preview is not implemented yet, so this currently behaves like off); when off, keep attacking the same enemy until it dies."
+
+msgid "前期收集数据用：遇到没见过的意图图标时点开怪物信息面板读出意图并记下图标，会变慢；图标收集够后关闭"
+msgstr "For early data collection: when an unknown intent icon is seen, open the enemy info panel to read the intent and save the icon. Slower; turn off once enough icons are collected."
+
+msgid "把每次出牌看到了什么、为什么这样出写进 battle_logs 目录，便于统计和排查"
+msgstr "Write what was seen and why each card was played to the battle_logs folder, for statistics and troubleshooting."
+
+msgid "出现异常（AP不足、出不掉牌、识别失败、战斗失败等）时截图，同一种异常每场战斗最多 1 张"
+msgstr "Take a screenshot on anomalies (insufficient AP, a card that cannot be played, recognition failures, lost battles, etc.), at most one per kind per battle."
+
+msgid "battle_logs 里的记录和截图保留多少天"
+msgstr "How many days to keep records and screenshots in battle_logs."
+
+msgid "battle_logs 总大小超过这个值时从最旧的文件删起"
+msgstr "When battle_logs grows beyond this size, the oldest files are deleted first."

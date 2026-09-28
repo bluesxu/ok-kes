@@ -32,6 +32,8 @@ import re
 import random
 import cv2
 
+import utils_battle
+
 
 # ------------------------- 出击模式独有工具 -------------------------
 
@@ -75,17 +77,8 @@ def _is_card_name(name):
 
 def _hand_card_names(task: TriggerTask):
     """读取手牌区域内的卡牌名，排除按键和类型标签文本。"""
-    x1, y1, x2, y2 = 0.159, 0.683, 0.836, 0.831
-
-    # 打印所有文本及其坐标，帮助判断手牌区域过滤问题
-    task.log_info(f"_hand_card_names 区域: cx=[{x1}, {x2}], cy=[{y1}, {y2}]")
-    for b in task.all_texts:
-        cx = (b.x + b.width / 2) / task.width
-        cy = (b.y + b.height / 2) / task.height
-        in_region = x1 <= cx <= x2 and y1 <= cy <= y2
-        has_key = _card_key(b.name)
-        name_len = len(b.name.strip())
-        task.log_info(f"  OCR: 「{b.name}」 cx={cx:.4f} cy={cy:.4f} in_region={in_region} has_key={has_key} len={name_len}")
+    # 下边界放到 0.90：手牌呈扇形排开，两侧和被压低的牌名会落到 0.83 以下（曾因此整手牌识别成 0 张）
+    x1, y1, x2, y2 = 0.159, 0.683, 0.836, 0.900
 
     boxes = [b for b in task.all_texts
              if x1 <= (b.x + b.width / 2) / task.width <= x2
@@ -134,9 +127,9 @@ def _hand_cards(task: TriggerTask):
         if candidates:
             best = min(candidates, key=lambda x: cx - x[0])
             used_keys.add(best[2])
-            cards.append({"name": name_box.name, "key": best[2], "x": cx, "left_x": left_x})
+            cards.append({"name": name_box.name, "key": best[2], "x": cx, "left_x": left_x, "y": cy})
         else:
-            cards.append({"name": name_box.name, "key": None, "x": cx, "left_x": left_x})
+            cards.append({"name": name_box.name, "key": None, "x": cx, "left_x": left_x, "y": cy})
 
     # 推断缺失的按键：用最小相邻间距作为 expected_spacing 进行插值
     # 以最近的前一张已有按键的卡牌为基准推算，避免累积误差
@@ -436,14 +429,14 @@ def handle_secret_enemy(task: TriggerTask):
 
 
 def handle_battle_page(task: TriggerTask):
-    """战斗页面: 优先按"出牌优先级"配置出牌；找不到优先级中的牌时按当前手牌数从大到小兜底尝试。"""
+    """战斗页面: EP 满时随机释放 Ego 技能；否则交给 utils_battle 按费用、出牌优先级、预计扣血出一张牌或结束回合。"""
 
     hand_count = _read_hand_count(task)
     if hand_count is None:
         return False
 
     # 如果已到达最终boss节点，标记boss战状态
-    if hasattr(task, 'node_status') and task.node_status.get('reach_final_boss', False):
+    if hasattr(task, 'node_status') and task.node_status.get('reach_final_boss', False)             and not task.node_status.get('final_boss_battle', False):
         task.node_status['final_boss_battle'] = True
         task.log_info("检测到最终boss战斗开始，final_boss_battle=True")
 
@@ -456,7 +449,6 @@ def handle_battle_page(task: TriggerTask):
             avg_bgr = cv2.mean(ep_region)[:3]
             # OpenCV 是 BGR 格式，用户描述的是 RGB(193,255,255) → BGR(255,255,193)
             avg_b, avg_g, avg_r = avg_bgr
-            task.log_info(f"EP能量条区域颜色: B={avg_b:.1f} G={avg_g:.1f} R={avg_r:.1f} (期望接近 B=255 G=255 R=193)")
             if abs(avg_b - 255) <= 15 and abs(avg_g - 255) <= 15 and abs(avg_r - 193) <= 15:
                 task.log_info("EP能量达到最大值，随机释放Ego技能")
                 task.send_key(random.choice(["F1", "F2", "F3"]))
@@ -466,68 +458,9 @@ def handle_battle_page(task: TriggerTask):
                 return True
 
     finishturn_box = task.box_of_screen(0.844, 0.782, 0.998, 0.990)
-    if not task.find_feature(feature_name="finishturn", box=finishturn_box):
-        task.log_info("未检测到finishturn特征，return True等待下一帧")
-        return True
-
-    card_names = _hand_card_names(task)
-    cards = _hand_cards(task)
-
-    if (cards or card_names):
-        # 出牌卡手检测：追踪上一次尝试打出的卡牌是否连续多轮仍留在手牌中
-        if not hasattr(task, '_play_stuck_count'):
-            task._play_stuck_count = 0
-        if not hasattr(task, '_last_attempted_card'):
-            task._last_attempted_card = None
-
-        # 检查"出牌优先级"配置
-        play_priority = _get_config_value(task, "出牌优先级", [])
-        if play_priority and cards:
-            for pri_name in play_priority:
-                matched = next((c for c in cards if pri_name and (pri_name in c["name"] or c["name"] in pri_name) and c["key"] is not None), None)
-                if matched:
-                    # 检测当前匹配到的卡牌是否与上次尝试打出的是同一张且仍在手牌中
-                    if task._last_attempted_card == matched["name"]:
-                        task._play_stuck_count += 1
-                        task.log_info(f"卡牌「{matched['name']}」连续{task._play_stuck_count + 1}次尝试未出掉")
-                        if task._play_stuck_count >= 3:
-                            task.log_info(f"卡牌「{matched['name']}」连续3次未出掉，执行兜底出牌")
-                            task._last_attempted_card = None
-                            task._play_stuck_count = 0
-                            _try_all_card_keys(task, hand_count)
-                            return True
-                    else:
-                        task._last_attempted_card = matched["name"]
-                        task._play_stuck_count = 0
-
-                    task.log_info(f"出牌优先级匹配: 卡牌「{matched['name']}」→ 按键 {matched['key']}")
-                    task.send_key(matched['key'])
-                    task.sleep(1)
-                    task.send_key("enter")
-                    task.sleep(2)
-                    if "极光" in matched["name"]:
-                        task.log_info(f"卡牌「{matched['name']}」包含极光，额外等待2秒")
-                        task.sleep(2)
-                    elif "万众英雄" in matched["name"]:
-                        task.log_info(f"卡牌「{matched['name']}」包含万众英雄，额外等待2秒")
-                        task.sleep(2)
-                    return True
-
-        # 未命中出牌优先级，重置卡手状态
-        task._last_attempted_card = None
-        task._play_stuck_count = 0
-        # 兜底从大到小出牌
-        task.log_info(f"未命中出牌优先级，按当前手牌数{hand_count}从大到小兜底出牌")
-        _try_all_card_keys(task, hand_count)
-        return True
-    else:
-        finishturn_box = task.box_of_screen(0.844, 0.782, 0.998, 0.990)
-        if task.find_feature(feature_name="finishturn", box=finishturn_box):
-            task.log_info("检测到finishturn特征，按E结束回合")
-            task.send_key("e")
-            task.sleep(1)
-        return True
-    return True
+    finish_turn_visible = bool(task.find_feature(feature_name="finishturn", box=finishturn_box))
+    # 出牌策略（按位置读手牌、读费用、预留防御、拖牌打目标、结束回合）见 utils_battle
+    return utils_battle.play_turn(task, hand_count, finish_turn_visible)
 
 
 def handle_get_card(task: TriggerTask):
@@ -770,6 +703,7 @@ def handle_battle_hand_select(task: TriggerTask):
             and b.name not in ["确认", "返回", "跳过"]
             and not any(kw in b.name for kw in _card_exclude_keywords)
             and not ("攻" in b.name and len(b.name) <= 3)
+            and not re.search(r"\d+\s*/\s*\d+", b.name)  # 手牌数、血量这类「数字/数字」是 OCR 串进来的，不是卡牌
         ]
         if not cards:
             task.log_info("手牌区域未找到卡牌，随机在手牌区域内点击一个位置")
@@ -789,6 +723,20 @@ def handle_battle_hand_select(task: TriggerTask):
         task.log_info(f"已完成选择，点击确认")
         _move_and_click(task, 0.934, 0.883)
         task.sleep(1)
+    return True
+
+
+def handle_card_info_popup(task: TriggerTask):
+    """确认卡牌资讯弹窗（带「使用卡牌 / 取消选择」按钮）: 点「取消选择」关掉。
+    这个弹窗盖住手牌区时手牌会识别成 0 张，没有它时曾经在同一个画面空转了近 10 小时。"""
+    if not any("使用卡牌" in b.name or "卡牌资讯" in b.name for b in task.all_texts):
+        return False
+    cancel = next((b for b in task.all_texts if "取消选择" in b.name), None)
+    if cancel is None:
+        return False
+    task.log_info("检测到确认卡牌资讯弹窗，点击取消选择")
+    task.click_box(cancel)
+    task.sleep(1)
     return True
 
 
@@ -1014,6 +962,7 @@ PAGE_HANDLERS = [
     handle_non_battle_page,
     handle_battle_crash,
     handle_discard_hand_card,
+    handle_card_info_popup, #确认卡牌资讯弹窗，盖住手牌区时先关掉
     handle_battle_hand_select,
     handle_curiosity_activate,
     handle_extra_card_use,

@@ -9,6 +9,8 @@ import os
 import numpy as np
 from opencc import OpenCC
 
+import battle_log
+
 _jp2t = OpenCC('jp2t')  # 日文新字体转繁体
 _t2s = OpenCC('t2s')  # 繁体转简体
 
@@ -4051,7 +4053,7 @@ def handle_expedition_result(task: TriggerTask):
         task.node_status['total_rounds'] += 1
     if complete_box and "完成" in complete_box.name:
         if hasattr(task, 'node_status'):
-            task.node_status['success_rounds'] += 1
+            _count_round_success(task)
             task.log_info("出击模式探险结果: 成功")
     elif complete_box and "失败" in complete_box.name:
         if not _get_config_value(task, '只打第一层', False):
@@ -4062,7 +4064,7 @@ def handle_expedition_result(task: TriggerTask):
         if _get_config_value(task, '只打第一层', False) and task.node_status.get('pass_final_boss_count', 0) >= 1: # 完成第一层任务
             task.log_info("卡厄思模式探险结果: 成功")
         elif not _get_config_value(task, '只打第一层', False) and not task.node_status.get('is_escaped', 0): # 完成了任务且没有逃脱
-            task.node_status['success_rounds'] += 1
+            _count_round_success(task)
             task.log_info("卡厄思模式探险结果: 成功")
         else:
             task.log_info("卡厄思模式探险结果: 失败")
@@ -4070,6 +4072,13 @@ def handle_expedition_result(task: TriggerTask):
         task.log_info("卡厄思模式探险结果: 失败")
     task.log_info(f"探险完成，成功次数/总次数={task.node_status['success_rounds']}/{task.node_status['total_rounds']}")
     if hasattr(task, 'node_status'):
+        success = task.node_status.get('round_success_counted', False)
+        battle_log.record(task, "一轮出击结束", success=success,
+                          reached_boss=task.node_status.get('reach_final_boss', False),
+                          passed_boss=task.node_status.get('pass_final_boss_count', 0),
+                          rounds=f"{task.node_status['success_rounds']}/{task.node_status['total_rounds']}")
+        if not success:
+            battle_log.anomaly(task, "一轮出击失败", "探险结果：失败")
         reset_mission_status(task)
     return False
 
@@ -4096,6 +4105,15 @@ def _initial_member_status():
     }
 
 
+def _count_round_success(task: TriggerTask):
+    """本轮记一次成功。结算页会被连续识别好几帧、探险结果页也会再判一次成功，
+    所以用 round_success_counted 保证每轮最多记一次（曾出现成功次数大于总次数，如 3/2）。"""
+    if task.node_status.get('round_success_counted', False):
+        return
+    task.node_status['round_success_counted'] = True
+    task.node_status['success_rounds'] += 1
+
+
 def _finish_only_first_layer(task: TriggerTask) -> bool:
     """检查并完成只打第一层的退出操作：如果 pass_final_boss_count >= 1 且配置'只打第一层'为 True，则成功次数+1、点击退出并返回 True。"""
     if not (
@@ -4108,14 +4126,14 @@ def _finish_only_first_layer(task: TriggerTask) -> bool:
         _get_config_value(task, "首层刷特定闪光", False) is True
         and task.node_status.get("get_specific_flash", False) is False
     ):
-        task.node_status['success_rounds'] += 1
+        _count_round_success(task)
         task.log_info("未刷到指定闪光且已通关第一层，退出重刷")
         _move_and_click(task, 0.959, 0.051)
         task.sleep(1)
         return True
 
     if _get_config_value(task, '只打第一层', False):
-        task.node_status['success_rounds'] += 1
+        _count_round_success(task)
         task.log_info(f"只打第一层任务已完成，success_rounds + 1 (当前: {task.node_status['success_rounds']}), 退出结算页面")
         _move_and_click(task, 0.959, 0.051)
         task.sleep(1)
@@ -4159,8 +4177,10 @@ def reset_layer_status(task: TriggerTask):
                 'target_mask_card_position': ns.get('target_mask_card_position', -1),
                 'get_specific_flash': ns.get('get_specific_flash', False),
                 'removed_card_count': ns.get('removed_card_count', 0),
-                'neutral_card_count': ns.get('neutral_card_count', 0)}
+                'neutral_card_count': ns.get('neutral_card_count', 0),
+                'round_success_counted': ns.get('round_success_counted', False)}
         task.node_status = _initial_node_status()
+        task.node_status['round_success_counted'] = keep['round_success_counted']
         task.node_status['pass_final_boss_count'] = keep['pass_final_boss_count']
         task.node_status['total_rounds'] = keep['total_rounds']
         task.node_status['success_rounds'] = keep['success_rounds']
