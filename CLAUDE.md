@@ -1,0 +1,65 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## 项目概况
+
+ok-kes：基于 [ok-script](https://github.com/ok-oldking/ok-script)（PyPI 包 `ok-script-kes`）的《卡厄思梦境》自动化工具，只用截图 + OCR + 模板匹配 + 模拟点击/按键，Windows / Python 3.12。
+代码、注释、日志、配置键、提交信息都用中文。本仓库是 `baoxin1100/ok-kes` 的 fork，`origin` 指向 `bluesxu/ok-kes`，`upstream` 为原作者仓库。
+
+## 常用命令
+
+`ok` 框架来自 `requirements.txt` 里的 `ok-script-kes`，不在仓库中（`.gitignore` 忽略了 `ok/`）。优先用仓库 `.venv`；没有时可借用已安装的 ok-kes：
+解释器 `D:\Program Files\ok-kes\data\apps\ok-kes\python\python.exe`，并把 `PYTHONPATH` 设为 `D:\Program Files\ok-kes\data\apps\ok-kes\working`（里面有 `ok/`）。
+
+```powershell
+pip install -r requirements.txt
+python main.py                      # 启动 GUI；main_debug.py 为调试模式
+.\run_tests.ps1                     # 逐个跑 tests\*.py（CI 同样如此）
+python -m unittest tests/TestSpeedup.py
+python -m unittest tests.TestSpeedup.TestSpeedup.test_card_play_waits_for_raise_and_hand_count   # 单个用例
+```
+
+`speedup_patch/tests` 下是另一套独立测试，不能放进 `tests/`（它自带 `ok.py`、`utils.py` 等替身模块，会遮住真实模块）：
+
+```powershell
+cd speedup_patch\tests; python test_speedup.py       # 替身环境下的离线测试，脚本式输出「N/N 项通过」
+python real_bugfix_check.py                           # 用官方安装目录里的原版 utils 验证补丁修正（需本机装有 ok-kes）
+```
+
+没有 lint 配置。打包见 `BUILD.md`；正式发布由推送 `v*` 标签触发 `.github/workflows/build.yml`（跑测试 → 按 `deploy.txt` 同步到更新库 → pyappify 打包 → Release）。
+
+## 架构
+
+**任务加载**：`src/config.py` 的 `config` 字典是 ok-script 的应用配置（窗口、截图方式、OCR 后端、模板标注 `ok_tasks/assets/coco_annotations.json` 等）。`custom_tasks: True` 让框架扫描 `ok_tasks/` 下的 `.py`，把其中定义的类当任务加载，且 `ok_tasks/` 在导入路径上，所以模块之间直接 `import utils`、`import utils_chaos`。**因此 `ok_tasks/` 下的工具模块不能定义顶层类**，否则会被当成任务。运行中修改 `ok_tasks/` 文件会触发热重载。`src/tasks/` 是框架模板里的示例任务（`TestMain.py` 测的就是它）。
+
+**模式 = TriggerTask + 页面处理函数列表**：`ChaosMode`（自动卡厄思）、`SortieMode`（自动出击）、`StoryMode` 都是 `TriggerTask`，`run()` 每帧做一次全屏 OCR，存到 `task.all_texts`（经 `_simplify_texts` 把繁体/日文字形转成简体），然后按顺序调用对应模块的 `PAGE_HANDLERS`（`utils_chaos.py` / `utils_sortie.py` / `utils_story.py`），第一个返回 True 的处理函数结束本帧。
+- 每个处理函数形如 `handle_xxx(task) -> bool`：先用固定相对坐标或文字判断“是不是这个页面”，不是就返回 False。**列表顺序就是优先级**，列表里的行尾注释说明了为什么要排在前面。
+- `utils.py`（约 4400 行）是两种模式共用的处理函数和工具：`find_box_at_point`（按相对坐标找 OCR 框）、`_move_and_click`（先悬停再点击）、`_clean_match`、生命值/信用点读取、选卡/牌库识别等。`utils_chaos` / `utils_sortie` 用 `from utils import ...` 按名字导入这些函数。
+- 跨帧状态存在任务实例上（`task.node_status`、`task.member_status` 等），由 `utils.reset_all_status` 复位。
+- 坐标一律是相对屏幕的 0~1 值（基准 2560×1440，16:9）。国服简体、国际服繁体都要支持：匹配文字时考虑两种写法，或依赖 `_simplify_texts` 统一成简体。注意 `wait_ocr` 等框架方法返回的文字不经过 `_simplify_texts`。
+
+**配置**：配置键就是中文显示名，会持久化到 `configs/*.json`。`config_io.py` 负责配置码导入/导出、本地多套配置、旧配置迁移（在 `load_config` 里调用），`UI_ONLY_CONFIG_KEYS` 里的键不进配置码也不上传；`config_sync.py` 负责匿名上传配置/胜率和“热门配置”。`config_description` 等界面文字要同步 `i18n/<locale>/LC_MESSAGES/ok.po`，并重新编译 `ok.mo`（`msgid` 必须与代码字符串完全一致）。
+
+**出击模式出牌 `ok_tasks/utils_battle.py`**：`utils_sortie.handle_battle_page` 只保留 Ego 释放和「结束回合」按钮检测，出牌交给 `utils_battle.play_turn`（设计见 `CONTEXT.md` 术语表和 `docs/adr/0001`）。
+- 手牌按张数排成固定扇形，`hand_slots` 由「N/10」推出每张牌的位置，**按键 = 位置序号**，不依赖 OCR 读牌上方的按键数字；牌名、类型、费用再按位置归属。
+- 敌人以洋红色血条为锚点（`enemy_bars`），血量/护盾/行动倒计时/意图图标都相对血条定位；Boss 的倒计时 ∞ 会被 OCR 读成 8，用字形宽高比区分。
+- 费用、倒计时这类压在彩色背景上的数字用 `_read_digit` 对裁剪区域试几种预处理；单张牌费用要两种预处理读数一致才采信，读不到的靠「AP不足」提示兜底。
+- `choose_play` / `choose_target` 是纯函数，`tests/TestBattle.py` 用 `tests/images/battle` 的真实截图 + 真实 OCR 测识别，改坐标或阈值后要跑它。
+- `battle_log.py` 写结构化战斗记录（`battle_logs/*.jsonl`）和异常截图，并按保留天数/总大小清理。
+
+**加速模式 `ok_tasks/speedup.py`**：`ChaosMode` / `SortieMode` 在 `__init__` 末尾调用 `speedup.install(self)`，它通过猴子补丁接管任务的 `sleep`/`click*`/`run` 等方法，以及 `utils*` 里的部分处理函数：
+- 延迟支付处理函数里的 sleep；点击后用“文字闸门”判断页面已响应就继续，最长不超过原时长。
+- 并行模板匹配、路线页/牌库滚动“停稳即识别”、出击出牌按手牌变化继续。
+- 替换处理函数时要同时替换各模块里按名字导入的引用和 `PAGE_HANDLERS` 列表里的函数对象，统一走 `_replace_function`。
+- `_EXPECTED_RUN_SOURCE` / `_handlers_module` 通过读 `run()` 源码来确认结构没变。**修改 `ChaosMode.run` / `SortieMode.run` 时要同步 `speedup._gated_run`**，`TestSpeedup` 里的 `test_real_*_run_matches_gated_run` 会检查这一点。
+- 其中几项与速度无关的修正（按钮文字被 OCR 切成两个框、国际服 BOSS 页/休息区、分解存档确认框）在源码里也已修好。补丁里保留同样的逻辑，是为了用 `speedup_patch/install_speedup.py` 装进未修改的官方版时同样生效；两边同时存在不冲突。
+
+**`speedup_patch/`**：把 `ok_tasks/speedup.py` 安装/卸载到官方安装目录（默认 `D:\Program Files\ok-kes\data\apps\ok-kes\working`）。它会在 `ChaosMode`/`SortieMode` 的 `load_config` 前插入 install 调用，并给 `src/config.py` 追加 OpenVINO f32 补丁；需要先关闭 ok-kes。官方版自动更新后要重新安装。
+
+## 仓库内的代理技能
+
+`.agents/skills/` 里有面向 Codex 的技能说明，涉及相关工作时可以参考：
+- `ok-script-tasks`、`ok-script-codegen`：ok-script 任务 API 和写法，比如优先用 `wait_*`；`sleep`/`next_frame` 会清掉当前帧。
+- `ok-script-i18n`：同步并编译 `.po`/`.mo`，辅助脚本是 `scripts/task_i18n_helper.py`。
+- `deploy`：打版本标签发布。提交信息的语言要跟最近一条非合并提交一致；不要改动或删除已有标签。
