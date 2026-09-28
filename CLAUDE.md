@@ -55,7 +55,7 @@ python real_bugfix_check.py                           # 用官方安装目录里
 - `_EXPECTED_RUN_SOURCE` / `_handlers_module` 通过读 `run()` 源码来确认结构没变。**修改 `ChaosMode.run` / `SortieMode.run` 时要同步 `speedup._gated_run`**，`TestSpeedup` 里的 `test_real_*_run_matches_gated_run` 会检查这一点。
 - 其中几项与速度无关的修正（按钮文字被 OCR 切成两个框、国际服 BOSS 页/休息区、分解存档确认框）在源码里也已修好。补丁里保留同样的逻辑，是为了用 `speedup_patch/install_speedup.py` 装进未修改的官方版时同样生效；两边同时存在不冲突。
 
-**`speedup_patch/`**：`install_speedup.py` 把本仓库的改动装进官方安装目录（默认 `D:\Program Files\ok-kes\datapps\ok-kes\working`），需要先关闭 ok-kes，官方版自动更新后要重新安装。安装目录里的 `utils.py`、`utils_sortie.py`、`ChaosMode.py`、`SortieMode.py` 和翻译文件与 v1.4.3 原版哈希（`BASE_SHA`）一致时整份替换，并复制 `speedup.py`、`utils_battle.py`、`battle_log.py`；对不上（官方已更新）时只往原版 `ChaosMode`/`SortieMode` 插入加速补丁调用。另给 `src/config.py` 追加 OpenVINO f32 补丁。**改了这些被整份替换的文件后，仓库要先合并对应的上游版本，再更新 `BASE_SHA`。**
+**`speedup_patch/`**：`install_speedup.py` 把本仓库的改动装进官方安装目录（默认 `D:\Program Files\ok-kes\data\apps\ok-kes\working`），需要先关闭 ok-kes，官方版自动更新后要重新安装。安装目录里的 `utils.py`、`utils_sortie.py`、`ChaosMode.py`、`SortieMode.py` 和翻译文件与 v1.4.3 原版哈希（`BASE_SHA`）一致时整份替换，并复制 `speedup.py`、`utils_battle.py`、`battle_log.py`；对不上（官方已更新）时只往原版 `ChaosMode`/`SortieMode` 插入加速补丁调用。另给 `src/config.py` 追加 OpenVINO f32 补丁。**改了这些被整份替换的文件后，仓库要先合并对应的上游版本，再更新 `BASE_SHA`。**
 
 ## 仓库内的代理技能
 
