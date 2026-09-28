@@ -1,15 +1,18 @@
 """
-卡厄思模式、出击模式的加速模式（实验性，默认关闭）。
+卡厄思模式、出击模式的加速补丁。
 
-原逻辑每次点击后按固定时长等待（click_box 自带 1 秒，处理函数再 sleep 0.5~2 秒），
-_move_and_click 点击前还固定悬停 0.5 秒，而界面通常不到 1 秒就切换完成。
+本仓库里 ChaosMode、SortieMode 在 __init__ 中直接调用 install；
+也可以用 speedup_patch/install_speedup.py 把本文件装进未修改的官方版。
 
-开启后：
+原版每次点击后按写死的时长等待（click_box 自带 1 秒，处理函数再 sleep 0.5~2 秒），
+_move_and_click 点击前还固定悬停 0.5 秒，实际界面通常不到 1 秒就切换完成。
+
+本补丁的做法：
 1. 延迟支付等待：处理函数里的 sleep 先记账不真睡，之后它若还要看画面或再操作，
    先把欠的时间补足，保持原有语义；处理函数结束时还欠着的等待交给第 2 步。
 2. 文字闸门：只做了一次点击的帧，下一轮 OCR 后先判断页面是否已响应——
    被点的文字还在原处就继续等；页面文字变了，再多识别一次确认不再变化才交给处理函数。
-   无论如何不会晚于原逻辑的等待时长。游戏背景一直有动画，所以只看文字，不看像素。
+   无论如何不会晚于原版的等待时长。游戏背景一直有动画，所以只看文字，不看像素。
 3. 点击前悬停 0.5 秒缩短为可配置值；非战斗时检测间隔 1 秒降为可配置值。
 4. 并行模板匹配：路线节点、小地图、牌库和选卡页的卡牌类型都是在同一帧、同一区域里逐个匹配多种图标，
    请求组内第一个图标时整组并行算完并缓存，后续直接取结果；每个图标的计算与原来完全相同。
@@ -27,14 +30,32 @@ _move_and_click 点击前还固定悬停 0.5 秒，而界面通常不到 1 秒�
    两段都以原时长封顶，判断不出结果（例如这张牌没打出去）时照原逻辑等满。
    有的牌打出后会弹出选择页面（如“请选择功能”），盖住手牌数：回车后连续几次读不到手牌数就结束等待，
    这次出牌流程剩下的按键也不再发送（兜底出牌会把手牌数到 1 的按键都按一遍），由下一轮马上处理弹窗。
+   为了不把牌卡在上滑状态：按数字键前先等手牌区静止（上一张牌的动画会被误判成上滑），
+   按键后连续两次截图都有变化才算上滑，上滑后再等 0.15 秒才回车。
+   结束回合（按 E）前再确认：出过牌 3 秒内不按（新抽的牌可能还没到手、网络卡顿），按过 E 后 5 秒内不再按
+   （连按的 E 可能落到我方下一回合），并且要连续两轮都判断该结束回合才按。
 
-只作用于卡厄思模式和出击模式，关闭任务配置里的“加速模式”即完全使用原逻辑。
+另外修正一处与速度无关的问题：OCR 有时把一个按钮的文字切成两个框（实测国际服的「赋予灵光一闪」被切成
+「赋予灵光-」和「一闪」），而处理函数是拿固定的一个点去找按钮，这个点会落进两框之间的空隙，
+于是按钮找不到也没人点，选完卡后一直停在选卡页。只在原逻辑一个框都没找到时，把同一行紧挨着的文字框
+合并后再判断一次。这一项关闭“加速模式”也生效。
+还修正了几处国际服上的问题（BOSS 选择页标题、休息区读不到生命值/信用点、等「確認」按钮），
+详见 _patch_bug_fixes，同样关闭“加速模式”也生效。
+自动卡厄思模式另有两条与速度无关的规则，关闭“加速模式”也生效：
+商店页信用点小于 80 就点「离开」退出，不再继续移除、购买或刷新；每次商店操作结束、回到商店页时再查一次，读不到数字不退出。
+配置面板里的「刷新商店」默认关闭：关闭时不点商店里的「免费」刷新，没货就离开；打开后恢复原版刷新。
+分解存档资料的确认框：没勾上「下次登入前不再显示」就先勾上，再点确认。点过已勾上的框会取消勾选，所以先看框是不是橙色。
+按钮文字切成两个框、国际服的几处问题、分解存档确认框，本仓库源码里也已直接修好，保留这里是为了装进官方版时同样生效。
+两边同时存在不冲突：大多只在原函数没处理时才兜底；休息区读不到数字时，这里的立即重读会先于源码的下一帧重读生效。
+
+只作用于装了本补丁的任务（卡厄思模式、出击模式），关闭任务配置里的“加速模式”即恢复原有的时序逻辑。
 
 注意：本文件不能定义顶层类，框架会把 ok_tasks 下含类的 .py 当作任务加载。
 """
 import functools
 import inspect
 import os
+import random
 import re
 import sys
 import time
@@ -49,13 +70,14 @@ import utils
 ENABLE_KEY = "加速模式"
 HOVER_KEY = "点击前悬停等待(秒)"
 INTERVAL_KEY = "非战斗检测间隔(秒)"
+SHOP_REFRESH_KEY = "刷新商店"
 
 _GRID = 10              # 文字中心按 10x10 网格量化后比较页面
 _SAME_PAGE = 0.6        # 与点击前文字布局相似度 >= 0.6 视为页面还没响应
 _STABLE = 0.75          # 相邻两次识别相似度 >= 0.75 视为文字已稳定
 _BUTTON_TOLERANCE = 0.02
 _GATE_INTERVAL = 0.05   # 闸门等待期间尽快再识别
-_BATTLE_INTERVAL = 1.0  # 战斗中保持原逻辑的 1 秒，避免多占 CPU
+_BATTLE_INTERVAL = 1.0  # 战斗中保持原版 1 秒，避免多占 CPU
 _STATS_EVERY = 30
 _EXPECTED_RUN_SOURCE = (
     "self.all_texts = _simplify_texts(self.ocr())",
@@ -63,7 +85,7 @@ _EXPECTED_RUN_SOURCE = (
 )
 # run() 里用的页面处理函数列表（卡厄思是 utils_chaos，出击是 utils_sortie）
 _HANDLERS_PATTERN = re.compile(r"for handle_page in (\w+)\.PAGE_HANDLERS:")
-# 战斗中的页面处理函数：检测间隔保持原逻辑的 1 秒，避免战斗时多占 CPU
+# 战斗中的页面处理函数：检测间隔保持原版的 1 秒，避免战斗时多占 CPU
 _BATTLE_HANDLERS = frozenset((
     "handle_battle_auto_check",                                    # 卡厄思：等自动战斗
     "handle_battle_page", "handle_battle_hand_select", "handle_discard_hand_card",  # 出击：出牌
@@ -93,17 +115,39 @@ _DECK_POLL = 0.03
 _NAME_ONLY_PAGES = ("select_card-移除", "select_card-复制")  # 只需要卡名的选卡流程
 _NAME_ONLY_THRESHOLD = 0.90  # 与原本咒术卡的“只凭卡名保留”阈值一致
 _SKIP_WORDS = ("跳过", "取消")  # 删卡流程找不够卡时原逻辑点的按钮
+_MERGE_GAP = 0.02       # 同一行相邻文字框的最大间隔（相对屏幕宽度），超过这个距离不合并
 # 出击模式战斗出牌：按数字键选中卡牌（卡牌上滑），回车打出
 _HAND_REGION = (0.159, 0.660, 0.836, 0.950)   # 手牌区域
 _HAND_SIZE = (192, 96)
 _HAND_MOVED = 0.15      # 手牌区相对按键前变化超过 15%：卡牌已上滑到位（实测 0.01~0.04 秒）
 _HAND_POLL = 0.02
-_RAISE_SETTLE = 0.05    # 上滑到位后再稍等一下才回车
+_RAISE_SETTLE = 0.15    # 上滑到位后再稍等一下才回车（网络卡顿时游戏处理按键会慢一点）
+_HAND_STILL = 0.02      # 按键前手牌区连续两次截图变化 <2% 视为静止（没有上一张牌的动画）
+_HAND_STILL_MAX = 0.5   # 手牌区一直在动时，按键前最多等这么久
+# 结束回合（按 E）前的确认：出牌太快时新抽的牌可能还没到手，网络卡顿时画面也会停一下
+_END_TURN_AFTER_PLAY = 3.0  # 出过牌后至少这么久才结束回合
+_END_TURN_REPEAT = 5.0      # 按过 E 后这么久内不再按（结束回合的动画期间按钮还在）
+_END_TURN_CONFIRM = 0.8     # 要连续两轮都判断该结束回合，两次至少相隔这么久
+_END_TURN_STALE = 4.0       # 第一次判断距今超过这么久就作废，重新确认
 _COUNT_REGION = (0.470, 0.950, 0.560, 0.995)  # 手牌数「N/10」
 _COUNT_PATTERN = re.compile(r"(\d+)\s*/\s*10")
 _PLAY_POLL = 0.04
 _PLAY_SETTLE = 0.10     # 手牌数减少后再稍等一下，让出牌动画开始
+# 国际服修正（见 _patch_bug_fixes）
+_BOSS_TITLE = re.compile(r"请选择.*遭遇的\s*boss", re.IGNORECASE)   # 繁中服「請選擇在核心遭遇的BOSS。」
+_BOSS_POINTS = ((0.358, 0.706), (0.641, 0.706))                    # 两个 BOSS 名字的位置（与原函数相同）
+_REREAD_TRIES = 4                                                   # 休息区读不到生命值/信用点时重新识别的次数
+_REREAD_INTERVAL = 0.25
+_CONFIRM_TEXT = re.compile(r"确认|確認")
+_CHAOS_MODE = "自动卡厄思模式"
+_SHOP_EXIT_CREDIT = 80          # 商店页信用点低于这个数就离开，不再继续买
+_SHOP_CREDIT_POINTS = ((0.794, 0.054), (0.734, 0.053))  # 与 utils._get_current_credit 相同
+_DECOMPOSE_TITLE = ("分解存档", "分解存檔")
+_DECOMPOSE_CHECK = ("不再显示", "不再顯示", "不再显", "不再顯")
+_CHECKBOX_LEFT = 0.029   # 勾选框中心在「下次登入前不再显示」文字左缘的左侧
+_CHECKBOX_SAMPLE = 0.012 # 在勾选框中心周围取样，避开中间的白色对勾
 _LEFT_BATTLE_POLLS = 3  # 回车后连续几次读不到手牌数：多半弹出了选择页面（如“请选择功能”），交给下一轮处理
+_PUNCTUATION = re.compile(r"[^一-鿿\w]")  # 与 utils._clean_match 相同的清理规则
 _PARTIAL_RETRY_SECONDS = 10     # 保留部分选择后这段时间内再次进入选卡，视为“移除”没点成
 
 
@@ -111,14 +155,18 @@ def install(task):
     """给卡厄思模式任务实例装上加速逻辑，重复调用无副作用。"""
     if getattr(task, "_speedup", None) is not None:
         return
-    task.default_config[ENABLE_KEY] = False
+    task.default_config[ENABLE_KEY] = True
     task.default_config[HOVER_KEY] = 0.1
     task.default_config[INTERVAL_KEY] = 0.3
-    task.config_description[ENABLE_KEY] = "实验性：点击后页面一响应就继续，不再固定等待；关闭时完全使用原逻辑"
-    task.config_description[HOVER_KEY] = "仅在开启加速模式时生效：鼠标移到目标后等待多久再点击，原逻辑固定 0.5 秒"
-    task.config_description[INTERVAL_KEY] = "仅在开启加速模式时生效：非战斗时两次识别的最短间隔，原逻辑 1 秒；战斗中保持 1 秒"
+    task.config_description[ENABLE_KEY] = "点击后页面一响应就继续，不再固定等待；关闭后完全恢复原版逻辑"
+    task.config_description[HOVER_KEY] = "鼠标移到目标后等待多久再点击，原版固定 0.5 秒"
+    task.config_description[INTERVAL_KEY] = "非战斗时两次识别的最短间隔，原版 1 秒；战斗中保持 1 秒"
     # 加速选项只影响本机，不写进导出的配置码和上传的统计
     config_io.UI_ONLY_CONFIG_KEYS.update({ENABLE_KEY, HOVER_KEY, INTERVAL_KEY})
+    if getattr(task, "name", None) == _CHAOS_MODE:
+        task.default_config[SHOP_REFRESH_KEY] = False
+        task.config_description[SHOP_REFRESH_KEY] = "关闭后商店不再点击「免费」刷新，没货就离开；开启后恢复原版刷新"
+        config_io.UI_ONLY_CONFIG_KEYS.add(SHOP_REFRESH_KEY)
 
     orig = {
         name: getattr(task, name)
@@ -139,10 +187,12 @@ def install(task):
         # 出击模式出牌：pay_hook 决定下一次补等待时怎么等（等卡牌上滑 / 等手牌数减少）
         "battle_play": False, "hand_before": None, "hand_count": None, "pay_hook": None,
         "battle_left": False,  # 出牌途中已离开战斗页面（弹出了选择页面）
+        # 结束回合的确认：上次出牌/按 E 的时刻、第一次判断该结束回合的时刻
+        "last_play_key": 0.0, "last_end_turn": 0.0, "end_turn_seen": 0.0, "end_turn_reason": None,
     }
     task._speedup = st
     if not st["gate_ok"]:
-        task.log_info(f"加速模式：{task.name} 的 run() 结构与 speedup.py 预期不一致，文字闸门已停用，其余优化照常")
+        task.log_info(f"加速补丁：{task.name} 的 run() 与预期不符（可能已更新版本），只启用悬停和检测间隔优化")
 
     def sleep(timeout):
         if not st["active"] or timeout is None or timeout <= 0:
@@ -158,7 +208,7 @@ def install(task):
             hover = _float_config(task, HOVER_KEY, 0.1, 0.0, 1.0)
             st["saved_total"] += max(0.0, timeout - hover)
             return orig["sleep"](min(timeout, hover))
-        # 连续多次 sleep 依次累加，与原逻辑串行等待一致
+        # 连续多次 sleep 依次累加，与原版串行等待一致
         st["owed_until"] = max(st["owed_until"], time.time()) + timeout
         task.executor.reset_scene(check_enabled=False)
         return True
@@ -172,6 +222,9 @@ def install(task):
                 _pay_owed(st)  # 出牌时这里会判断上一张牌是否已打出、是否弹出了选择页面
                 if name == "send_key" and st["battle_play"] and st["battle_left"]:
                     return True  # 出牌途中已弹出选择页面：剩下的出牌按键不再发送，交给下一轮处理弹窗
+                if name == "send_key" and st["battle_play"] and _key_of(args, kwargs) == "e" \
+                        and not _end_turn_allowed(task, st):
+                    return True  # 这一轮先不结束回合，下一轮再判断
                 if name == "mouse_down":
                     st["held"] = True
                     st["moved"] = False
@@ -270,11 +323,15 @@ def install(task):
     _keep_stuck_detection_at_one_second()
     _patch_deck_scan()
     _patch_partial_removal()
+    _patch_split_button_text()
     _patch_battle_play()
+    _patch_bug_fixes()
+    _patch_shop_exit()
+    _patch_decompose_checkbox()
 
 
 def _handlers_module(task):
-    """加速模式会接管 run()，只在其源码仍是“OCR -> 依次尝试页面处理函数 -> 上传检查”时启用闸门（修改 run() 后需同步 _gated_run）。
+    """本补丁会接管 run()，只在其源码仍是“OCR -> 依次尝试页面处理函数 -> 上传检查”时启用闸门。
     页面处理函数列表取自 run() 里用的那个模块（卡厄思是 utils_chaos，出击是 utils_sortie）；对不上就返回 None。"""
     try:
         source = inspect.getsource(type(task).run)
@@ -289,7 +346,7 @@ def _handlers_module(task):
 
 
 def _gated_run(task, st):
-    """与任务自己的 run() 相同，只在交给页面处理函数前多一道文字闸门。"""
+    """与原版 run() 相同，只在交给页面处理函数前多一道文字闸门。"""
     texts = utils._simplify_texts(task.ocr())
     if _gate_blocks(task, st, texts):
         return
@@ -312,7 +369,7 @@ def _finish_run(task, st):
             }
             st["owed_until"] = 0.0
         else:
-            _pay_owed(st)  # 多步操作或没有点击：保持原逻辑的等待时长
+            _pay_owed(st)  # 多步操作或没有点击：保持原版等待时长
     if st["hit"] in _BATTLE_HANDLERS and not st["battle_left"]:
         st["battle"] = True  # 出牌后弹出了选择页面时不算战斗，下一轮按非战斗间隔尽快来处理
     elif st["hit"] is not None:
@@ -340,6 +397,10 @@ def _gate_blocks(task, st, texts):
         if not _still_same_page(task, gate, texts, sig):
             gate["changed"] = True  # 页面刚变化，再识别一次确认已稳定
         return True
+    if _still_same_page(task, gate, texts, sig):
+        # 被点的文字又出现在原处：上一帧只是 OCR 闪了一下（按下动画等），页面其实没响应，继续等
+        gate["changed"] = False
+        return True
     if prev_sig is not None and _similarity(sig, prev_sig) >= _STABLE:
         _close_gate(task, st, now)
         return False
@@ -356,7 +417,7 @@ def _close_gate(task, st, now):
     st["saved_total"] += max(0.0, planned - actual)
     if st["count"] >= _STATS_EVERY:
         task.log_info(
-            f"加速统计：最近{st['count']}次点击后的等待，原逻辑{st['planned']:.1f}秒，实际{st['actual']:.1f}秒"
+            f"加速统计：最近{st['count']}次点击后的等待，原版{st['planned']:.1f}秒，实际{st['actual']:.1f}秒"
         )
         task.info_set("加速累计节省", f"{st['saved_total'] / 60:.1f} 分钟")
         st.update(planned=0.0, actual=0.0, count=0)
@@ -595,25 +656,49 @@ def _patch_partial_removal():
     utils.select_card = select_card
 
 
+
 def _patch_battle_play():
     """出击模式战斗出牌：原逻辑按数字键后固定等 0.5~1 秒才回车，回车后再固定等 1~2 秒。
     实测卡牌按下后 0.01~0.04 秒就上滑到位，回车后约 0.2~0.3 秒手牌数就减少了。
     这里把两段等待都改成“游戏一响应就继续”，最长仍是原来的时长；判断不出结果时照原逻辑等满。"""
-    try:
-        import utils_sortie
-    except ImportError:
+    utils_sortie = _import("utils_sortie")
+    if utils_sortie is None:
         return
-    handlers = getattr(utils_sortie, "PAGE_HANDLERS", None)
     for name in ("handle_battle_page", "_try_all_card_keys"):
-        current = getattr(utils_sortie, name, None)
-        if current is None:
+        _replace_function(utils_sortie, name, _battle_play_wrapper)
+
+
+def _import(module_name):
+    try:
+        return __import__(module_name)
+    except ImportError:
+        return None
+
+
+def _replace_function(module, name, make_wrapper):
+    """把 module.name 换成 make_wrapper(原函数)，重复调用不会重复包装。
+    页面处理函数列表里存的是函数对象本身，别的模块用 from utils import xxx 导入的也是函数对象，
+    只换模块属性不会生效，所以两个模式的 PAGE_HANDLERS 和模块命名空间里的原函数也一并换掉。"""
+    current = getattr(module, name, None)
+    if current is None:
+        return None
+    if not getattr(current, "_speedup_wrapped", False):
+        wrapped = make_wrapper(current)
+        wrapped._speedup_wrapped = True
+        wrapped.__wrapped__ = current
+        setattr(module, name, wrapped)
+        current = wrapped
+    original = current.__wrapped__
+    for module_name in ("utils", "utils_chaos", "utils_sortie"):
+        other = sys.modules.get(module_name)
+        if other is None:
             continue
-        if not getattr(current, "_speedup_wrapped", False):
-            current = _battle_play_wrapper(current)
-            setattr(utils_sortie, name, current)
-        # 页面处理函数列表里存的是函数对象本身，只换模块属性不会生效，列表里的也要换成包装后的
+        if getattr(other, name, None) is original:
+            setattr(other, name, current)
+        handlers = getattr(other, "PAGE_HANDLERS", None)
         if isinstance(handlers, list):
-            handlers[:] = [current if h is current.__wrapped__ else h for h in handlers]
+            handlers[:] = [current if h is original else h for h in handlers]
+    return current
 
 
 def _battle_play_wrapper(original):
@@ -630,24 +715,181 @@ def _battle_play_wrapper(original):
             # battle_left 保留到本轮结束：_finish_run 据此让下一轮尽快来处理弹窗；下一轮开始时复位
             st.update(battle_play=previous, hand_before=None, hand_count=None)
 
-    wrapped._speedup_wrapped = True
     return wrapped
+
+
+def _patch_bug_fixes():
+    """修正作者代码在国际服（繁中）上的几个问题，与“加速模式”开关无关，一直生效：
+    1. 出击模式 BOSS 选择页：标题是「请选择在核心遭遇的BOSS」，原逻辑只认国服的「遇见的首领」，这页没人处理，
+       只能等画面静止 10 秒后由卡住兜底随机点屏幕，碰巧点中 BOSS 才能继续（实测每次 11~23 秒）。
+    2. 休息区读不到生命值：出击模式当成 100% 去闪光（实测生命值 11% 时也闪光了），卡厄思模式选冥想不选休息。
+       读不到信用点当成 0：满血也不闪光。页面刚切过来时这两个数字常常还没显示，两三秒后就能读到。
+       改为只在休息区判断时，读不到就重新截图识别几次；仍读不到时生命值按 0% 处理（选休息，不冒险）。
+    3. 休息/闪光后等「确认」按钮：框架只在软件界面是繁体时才把 OCR 结果转简体，国际服游戏 + 简体界面时
+       拿「确认」去匹配「確認」永远匹配不上，每次白等 2 秒，而且没把“本节点已休息”的状态复位。"""
+    utils_sortie = _import("utils_sortie")
+    if utils_sortie is not None:
+        _replace_function(utils_sortie, "handle_boss_selection", _boss_selection_wrapper)
+        _replace_function(utils_sortie, "handle_rest_sortie", _rest_decision_wrapper)
+    _replace_function(utils, "handle_rest", _rest_decision_wrapper)
+    for module in (utils, utils_sortie):
+        if module is None:
+            continue
+        _replace_function(module, "_get_current_hp_percent", _hp_reader_wrapper)
+        _replace_function(module, "_get_current_credit", _credit_reader_wrapper)
+        _replace_function(module, "_wait_for_rest_confirm", _rest_confirm_wrapper)
+
+
+def _boss_selection_wrapper(original):
+    @functools.wraps(original)
+    def handle_boss_selection(task):
+        if original(task):
+            return True
+        box = utils.find_box_at_point(task, 0.484, 0.928)
+        if not (box and _BOSS_TITLE.search(box.name)):
+            return False
+        # 与原函数相同：随机选一个 BOSS，「确认」由下一轮的 handle_confirm 点击
+        bosses = [(b.name, x, y) for x, y in _BOSS_POINTS if (b := utils.find_box_at_point(task, x, y))]
+        if not bosses:
+            return False
+        name, x, y = random.choice(bosses)
+        task.log_info(f"首领选择: 随机选择「{name}」")
+        utils._move_and_click(task, x, y)
+        task.sleep(1)
+        return True
+
+    return handle_boss_selection
+
+
+def _rest_decision_wrapper(original):
+    @functools.wraps(original)
+    def wrapped(task, *args, **kwargs):
+        task._speedup_rest_decision = True  # 只在休息区判断时重读生命值/信用点，别处读不到照原逻辑
+        try:
+            return original(task, *args, **kwargs)
+        finally:
+            task._speedup_rest_decision = False
+
+    return wrapped
+
+
+def _reread(task, original):
+    """重新截图识别若干次再调用原来的读数函数；读到有效值就返回，否则返回 None。"""
+    saved = task.all_texts
+    try:
+        for _ in range(_REREAD_TRIES):
+            time.sleep(_REREAD_INTERVAL)
+            frame = _capture(task)
+            if frame is None:
+                return None
+            task.all_texts = utils._simplify_texts(task.ocr(frame=frame))
+            value = original(task)
+            if value is not False and value != 0:
+                return value
+    finally:
+        task.all_texts = saved
+    return None
+
+
+def _hp_reader_wrapper(original):
+    @functools.wraps(original)
+    def wrapped(task, *args, **kwargs):
+        value = original(task, *args, **kwargs)
+        if value is not False or not getattr(task, "_speedup_rest_decision", False):
+            return value
+        value = _reread(task, original)
+        if value is not None:
+            return value
+        task.log_info("修正：休息区读不到生命值，按 0% 处理（选择休息，不闪光/不冥想）")
+        return 0
+
+    return wrapped
+
+
+def _credit_reader_wrapper(original):
+    @functools.wraps(original)
+    def wrapped(task, *args, **kwargs):
+        value = original(task, *args, **kwargs)
+        if value != 0 or not getattr(task, "_speedup_rest_decision", False):
+            return value
+        value = _reread(task, original)
+        return value if value is not None else 0
+
+    return wrapped
+
+
+def _rest_confirm_wrapper(original):
+    @functools.wraps(original)
+    def _wait_for_rest_confirm(task, *args, **kwargs):
+        # 与原函数相同，只是同时认繁体「確認」
+        confirm_boxes = task.wait_ocr(0.170, 0.554, to_x=0.855, to_y=0.769, match=_CONFIRM_TEXT, time_out=2)
+        if not confirm_boxes:
+            task.log_info("等待休息确认按钮超时")
+            return False
+        return True
+
+    return _wait_for_rest_confirm
 
 
 def _before_battle_key(task, st, key):
     """按键前记下参照，并决定这次按键之后怎么补等待。"""
     key = str(key or "").lower()
     st["pay_hook"] = None
+    if key.isdigit() or key == "enter":
+        st["last_play_key"], st["end_turn_seen"] = time.time(), 0.0  # 出过牌：结束回合要重新确认
     if key.isdigit():
-        frame = _capture(task)
+        hand, frame = _still_hand(task)
         if frame is None:
             return
-        hand = _thumbnail(frame, _HAND_REGION, _HAND_SIZE)
         st["hand_count"] = _hand_count(task, frame)
         st["pay_hook"] = lambda deadline: _wait_card_raised(task, st, hand, deadline)
     elif key == "enter" and st["hand_count"]:
         before = st["hand_count"]
         st["pay_hook"] = lambda deadline: _wait_card_played(task, st, before, deadline)
+
+
+def _key_of(args, kwargs):
+    return str(args[0] if args else kwargs.get("key", "")).lower()
+
+
+def _end_turn_allowed(task, st):
+    """按 E 结束回合前再确认一次：
+    - 出过牌后 _END_TURN_AFTER_PLAY 秒内不结束：新抽的牌可能还没到手，网络卡顿时手牌也会晚一点刷新；
+    - 按过 E 后 _END_TURN_REPEAT 秒内不再按：结束回合的动画期间按钮还在，连按的 E 可能落到我方下一回合；
+    - 要连续两轮（至少相隔 _END_TURN_CONFIRM 秒）都判断该结束回合，才真正按 E。"""
+    now = time.time()
+    if now - st["last_end_turn"] < _END_TURN_REPEAT:
+        reason = f"{_END_TURN_REPEAT:g} 秒内刚按过 E"
+    elif now - st["last_play_key"] < _END_TURN_AFTER_PLAY:
+        reason = "刚出过牌，等手牌刷新"
+    elif not st["end_turn_seen"] or now - st["end_turn_seen"] > _END_TURN_STALE:
+        st["end_turn_seen"] = now
+        reason = "下一轮再确认一次手牌确实打完了"
+    elif now - st["end_turn_seen"] < _END_TURN_CONFIRM:
+        reason = "下一轮再确认一次手牌确实打完了"
+    else:
+        st.update(end_turn_seen=0.0, last_end_turn=now, end_turn_reason=None)
+        return True
+    if st["end_turn_reason"] != reason:
+        st["end_turn_reason"] = reason
+        task.log_info(f"加速：先不结束回合（{reason}）")
+    return False
+
+
+def _still_hand(task):
+    """按数字键前截一张手牌区“静止”时的参照图，返回 (缩略图, 帧)。
+    上一张牌的动画还在手牌区播放时，按键后的变化会被误判成卡牌已上滑而过早回车，结果牌停在上滑状态。
+    所以连续两次截图几乎不变才返回；一直在动时最多等 _HAND_STILL_MAX 秒。"""
+    previous, deadline = None, time.time() + _HAND_STILL_MAX
+    while True:
+        frame = _capture(task)
+        if frame is None:
+            return None, None
+        current = _thumbnail(frame, _HAND_REGION, _HAND_SIZE)
+        if previous is not None and (_deck_changed(current, previous) < _HAND_STILL or time.time() >= deadline):
+            return current, frame
+        previous = current
+        time.sleep(_HAND_POLL)
 
 
 def _hand_count(task, frame):
@@ -663,15 +905,20 @@ def _hand_count(task, frame):
 
 
 def _wait_card_raised(task, st, reference, deadline):
-    """按数字键后等卡牌上滑到位，到位就可以回车。"""
+    """按数字键后等卡牌上滑到位，到位就可以回车。连续两次截图都比按键前明显变化才算上滑，避免一帧误判。"""
+    hits = 0
     while time.time() < deadline:
         frame = _capture(task)
         if frame is None:
             return False
         if _deck_changed(_thumbnail(frame, _HAND_REGION, _HAND_SIZE), reference) > _HAND_MOVED:
-            st["orig_sleep"](min(_RAISE_SETTLE, max(0.0, deadline - time.time())))
-            st["saved_total"] += max(0.0, deadline - time.time())
-            return True
+            hits += 1
+            if hits >= 2:
+                st["orig_sleep"](min(_RAISE_SETTLE, max(0.0, deadline - time.time())))
+                st["saved_total"] += max(0.0, deadline - time.time())
+                return True
+        else:
+            hits = 0
         st["orig_sleep"](min(_HAND_POLL, max(0.0, deadline - time.time())))
     return True  # 没检测到上滑：已经等满原时长
 
@@ -699,6 +946,57 @@ def _wait_card_played(task, st, before, deadline):
             return True
         st["orig_sleep"](min(_PLAY_POLL, max(0.0, deadline - time.time())))
     return True  # 手牌数没减少（例如这张牌没打出去）：已经等满原时长
+
+
+def _patch_split_button_text():
+    """修正：OCR 有时把一个按钮的文字切成两个框（实测国际服的「赋予灵光一闪」被切成「赋予灵光-」和「一闪」），
+    而各处理函数是拿固定的一个点去找按钮，这个点会落进两框之间的空隙，于是按钮找不到、也没人点，
+    选完卡后一直停在选卡页。这里只在原逻辑一个框都没找到时兜底：把该点所在行里紧挨着的文字框合并后再判断一次。
+    与“加速模式”开关无关：关掉加速模式也保留这个修正。"""
+    original = utils.find_box_at_point
+    if not getattr(original, "_speedup_wrapped", False):
+        def find_box_at_point(task, rel_x, rel_y):
+            return original(task, rel_x, rel_y) or _merged_box_at_point(task, rel_x, rel_y)
+
+        find_box_at_point._speedup_wrapped = True
+        find_box_at_point.__wrapped__ = original
+        utils.find_box_at_point = find_box_at_point
+    # 卡厄思、出击的处理函数是按名字导入 find_box_at_point 的，它们模块里的名字也要换掉
+    for module_name in ("utils_chaos", "utils_sortie"):
+        module = sys.modules.get(module_name)
+        if module is not None and getattr(module, "find_box_at_point", None) is utils.find_box_at_point.__wrapped__:
+            module.find_box_at_point = utils.find_box_at_point
+
+
+def _merged_box_at_point(task, rel_x, rel_y):
+    """把 (rel_x, rel_y) 所在行里间隔小于 _MERGE_GAP 的相邻文字框合并成一个框；合不出覆盖该点的框时返回 None。"""
+    from ok import Box  # 延迟导入：合并出的框要能被 click_box 直接使用
+
+    x, y = rel_x * (task.width or 1), rel_y * (task.height or 1)
+    gap = _MERGE_GAP * (task.width or 1)
+    line = sorted((b for b in getattr(task, "all_texts", None) or []
+                   if b.name.strip() and b.y <= y <= b.y + b.height), key=lambda b: b.x)
+    run = []
+    for box in line:
+        if run and box.x - max(b.x + b.width for b in run) > gap:
+            if _run_covers(run, x):
+                break
+            run = []
+        run.append(box)
+    if len(run) < 2 or not _run_covers(run, x):
+        return None
+    name = _PUNCTUATION.sub("", "".join(b.name.strip() for b in run))  # 去掉切开处多出来的符号
+    merged = Box(min(b.x for b in run), min(b.y for b in run),
+                 to_x=max(b.x + b.width for b in run), to_y=max(b.y + b.height for b in run),
+                 confidence=min(getattr(b, "confidence", 1.0) for b in run), name=name)
+    if getattr(task, "_speedup_merged_name", None) != name:
+        task._speedup_merged_name = name
+        task.log_info(f"加速：OCR 把按钮文字切成了{len(run)}个框，合并为「{name}」后再判断")
+    return merged
+
+
+def _run_covers(run, x):
+    return run[0].x <= x <= max(b.x + b.width for b in run)
 
 
 def _signature(task, texts):
@@ -750,7 +1048,7 @@ def _box_key(box):
 
 def _enabled(task):
     try:
-        return bool(task.config.get(ENABLE_KEY, False))
+        return bool(task.config.get(ENABLE_KEY, True))
     except Exception:
         return True
 
@@ -778,3 +1076,153 @@ def _keep_stuck_detection_at_one_second():
 
     is_frame_stuck._speedup_wrapped = True
     utils.is_frame_stuck = is_frame_stuck
+
+
+def _patch_shop_exit():
+    """自动卡厄思模式：商店页信用点小于 80 就离开。与“加速模式”开关无关。"""
+    _replace_function(utils, "handle_shop", _shop_exit_wrapper)
+
+
+def _on_shop_page(task):
+    """与 handle_shop 相同的页面判定：移除卡牌，或移除位已售罄。"""
+    box = utils.find_box_at_point(task, 0.729, 0.261)
+    soldout = utils.find_box_at_point(task, 0.727, 0.286)
+    return bool((box and "移除卡牌" in box.name) or (soldout and "售" in soldout.name))
+
+
+def _read_shop_credit(task):
+    """读到数字才返回；两个位置都不是数字时返回 None，避免把识别失败当成 0 然后退出。"""
+    credit = None
+    for pos_x, pos_y in _SHOP_CREDIT_POINTS:
+        box = utils.find_box_at_point(task, pos_x, pos_y)
+        if box and str(box.name).isdigit():
+            credit = max(credit or 0, int(box.name))
+    return credit
+
+
+def _shop_refresh_enabled(task):
+    """配置面板上的「刷新商店」。没这项时按关闭处理。"""
+    config = getattr(task, "config", None)
+    if config is not None and SHOP_REFRESH_KEY in config:
+        return bool(config[SHOP_REFRESH_KEY])
+    return bool(getattr(task, "default_config", {}).get(SHOP_REFRESH_KEY, False))
+
+
+def _is_shop_refresh_box(task, box):
+    """与原版点「免费」刷新用的是同一块区域，避免误伤休息区的「免费」。"""
+    if box is None or "免费" not in getattr(box, "name", ""):
+        return False
+    width = getattr(task, "width", 0) or 1
+    height = getattr(task, "height", 0) or 1
+    center_x = (box.x + box.width / 2) / width
+    center_y = (box.y + box.height / 2) / height
+    return 0.012 <= center_x <= 0.258 and 0.892 <= center_y <= 0.979
+
+
+def _shop_exit_wrapper(original):
+    @functools.wraps(original)
+    def handle_shop(task):
+        if getattr(task, "name", None) != _CHAOS_MODE or not _on_shop_page(task):
+            return original(task)
+        credit = _read_shop_credit(task)
+        if credit is not None and credit < _SHOP_EXIT_CREDIT:
+            status = getattr(task, "node_status", None)
+            if isinstance(status, dict):
+                status["shop"] = False  # 否则离开后休息页会因为 shop 仍为 True 再次进入
+            task.log_info(f"德朗商店: 当前信用点={credit}，小于{_SHOP_EXIT_CREDIT}，退出商店")
+            leave = getattr(utils, "handle_leave", None)
+            if leave and leave(task):
+                return True
+            task.log_info("德朗商店: 离开按钮未点到，下一轮再试，期间不再购买")
+            return True
+        if _shop_refresh_enabled(task):
+            return original(task)
+        skipped = False
+        click_box = task.click_box
+
+        def click_box_no_refresh(box=None, *args, **kwargs):
+            nonlocal skipped
+            if _is_shop_refresh_box(task, box):
+                skipped = True
+                task.log_info("德朗商店: 刷新商店已关闭，不点击「免费」")
+                return True
+            return click_box(box, *args, **kwargs)
+
+        task.click_box = click_box_no_refresh
+        try:
+            result = original(task)
+        finally:
+            task.click_box = click_box
+        if skipped:
+            return False  # 没刷新，交给后面的离开按钮
+        return result
+
+    return handle_shop
+
+
+def _patch_decompose_checkbox():
+    """分解存档资料确认框：先勾选再确认。与“加速模式”开关无关。"""
+    _replace_function(utils, "handle_center_confirm", _decompose_checkbox_wrapper)
+
+
+def _text_has(box, needles):
+    name = getattr(box, "name", "") or ""
+    return any(needle in name for needle in needles)
+
+
+def _find_text(task, needles):
+    return next((box for box in getattr(task, "all_texts", []) or [] if _text_has(box, needles)), None)
+
+
+def _checkbox_point(task, label):
+    x = label.x / task.width - _CHECKBOX_LEFT
+    y = (label.y + label.height / 2) / task.height
+    return x, y
+
+
+def _checkbox_checked(task, x, y):
+    """勾选框填的是橙色，中间对勾是白的。周围橙色够多才算已勾上。"""
+    frame = getattr(task, "frame", None)
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return None
+    height, width = frame.shape[:2]
+    px, py = int(x * width), int(y * height)
+    half = max(4, int(_CHECKBOX_SAMPLE * width))
+    x1, y1 = max(0, px - half), max(0, py - half)
+    x2, y2 = min(width, px + half), min(height, py + half)
+    region = frame[y1:y2, x1:x2, :3]
+    if region.size == 0:
+        return None
+    blue, _, red = region[:, :, 0], region[:, :, 1], region[:, :, 2]
+    orange = (red > 170) & (blue < 100) & (red.astype(int) > blue.astype(int) + 60)
+    return float(orange.mean()) >= 0.2
+
+
+def _ensure_decompose_checkbox(task):
+    """是分解存档确认框且勾选框没勾上时点一下。不是这个框返回 False。"""
+    if _find_text(task, _DECOMPOSE_TITLE) is None:
+        return False
+    label = _find_text(task, _DECOMPOSE_CHECK)
+    if label is None:
+        return False
+    x, y = _checkbox_point(task, label)
+    checked = _checkbox_checked(task, x, y)
+    if checked:
+        task.log_info("分解存档资料：下次登入前不再显示已勾选")
+        return False
+    if checked is None:
+        task.log_info("分解存档资料：读不到勾选框颜色，不点击，避免把已勾选取消")
+        return False
+    task.log_info("分解存档资料：勾选下次登入前不再显示")
+    task.click_relative(x, y)
+    time.sleep(0.4)
+    return True
+
+
+def _decompose_checkbox_wrapper(original):
+    @functools.wraps(original)
+    def handle_center_confirm(task):
+        _ensure_decompose_checkbox(task)
+        return original(task)
+
+    return handle_center_confirm

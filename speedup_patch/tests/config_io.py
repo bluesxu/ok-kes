@@ -1,0 +1,1 @@
+UI_ONLY_CONFIG_KEYS = {"配置操作"}

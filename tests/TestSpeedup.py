@@ -1088,7 +1088,8 @@ class TestSpeedup(unittest.TestCase):
     def test_fallback_card_keys_speed_up_and_stop_on_popup(self):
         original, _, _ = self.play_card(False, handler=handle_battle_fallback)
         fast, game, _ = self.play_card(True, handler=handle_battle_fallback)
-        self.assertLess(fast, original / 2)
+        # 按键前等手牌静止、上滑后再稍等才回车，防止卡牌卡在上滑状态，所以加速幅度不到一半
+        self.assertLess(fast, original * 0.6)
         self.assertEqual(0, game.hand)
         elapsed, game, _ = self.play_card(True, popup=True, handler=handle_battle_fallback)
         self.assertLess(elapsed, 1.5)
@@ -1101,7 +1102,7 @@ class TestSpeedup(unittest.TestCase):
         task = SortieMode.SortieMode(executor=SimpleNamespace(scene=None, config=config), app=None)
         self.assertTrue(task._speedup["gate_ok"], "SortieMode.run() 已改动，请同步 speedup._gated_run")
         self.assertIs(utils_sortie, task._speedup["handlers"])
-        self.assertFalse(task.default_config[speedup.ENABLE_KEY])
+        self.assertTrue(task.default_config[speedup.ENABLE_KEY])
         entry = next(h for h in utils_sortie.PAGE_HANDLERS if h.__name__ == "handle_battle_page")
         self.assertTrue(getattr(entry, "_speedup_wrapped", False))
         self.assertIn("handle_battle_page", speedup._BATTLE_HANDLERS)
@@ -1113,7 +1114,7 @@ class TestSpeedup(unittest.TestCase):
 
         task = ChaosMode.ChaosMode(executor=SimpleNamespace(scene=None, config=config), app=None)
         self.assertTrue(task._speedup["gate_ok"], "ChaosMode.run() 已改动，请同步 speedup._gated_run")
-        self.assertFalse(task.default_config[speedup.ENABLE_KEY])
+        self.assertTrue(task.default_config[speedup.ENABLE_KEY])
 
 
 if __name__ == '__main__':

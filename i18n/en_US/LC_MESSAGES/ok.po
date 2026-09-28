@@ -269,11 +269,14 @@ msgstr ""
 "1. Enable auto battle and auto story in the game.\n"
 "2. International server players should set Game Language to Traditional Chinese in this mode."
 
-msgid "实验性：点击后页面一响应就继续，不再固定等待；关闭时完全使用原逻辑"
-msgstr "Experimental: continue as soon as the page responds to a click instead of waiting a fixed time. When off, the original logic is used unchanged."
+msgid "点击后页面一响应就继续，不再固定等待；关闭后完全恢复原版逻辑"
+msgstr "Continue as soon as the page responds to a click instead of waiting a fixed time. When off, the original logic is restored."
 
-msgid "仅在开启加速模式时生效：鼠标移到目标后等待多久再点击，原逻辑固定 0.5 秒"
-msgstr "Only applies when 加速模式 is on: how long to hover over the target before clicking (originally a fixed 0.5 s)."
+msgid "鼠标移到目标后等待多久再点击，原版固定 0.5 秒"
+msgstr "How long to hover over the target before clicking when 加速模式 is on (originally a fixed 0.5 s)."
 
-msgid "仅在开启加速模式时生效：非战斗时两次识别的最短间隔，原逻辑 1 秒；战斗中保持 1 秒"
-msgstr "Only applies when 加速模式 is on: minimum interval between recognitions outside battle (originally 1 s; stays 1 s in battle)."
+msgid "非战斗时两次识别的最短间隔，原版 1 秒；战斗中保持 1 秒"
+msgstr "Minimum interval between recognitions outside battle when 加速模式 is on (originally 1 s; stays 1 s in battle)."
+
+msgid "关闭后商店不再点击「免费」刷新，没货就离开；开启后恢复原版刷新"
+msgstr "When off, the shop's free refresh is not used and the shop is left when nothing is worth buying. When on, the original refresh behavior is restored."
