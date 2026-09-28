@@ -15,6 +15,7 @@
 import glob
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -48,14 +49,17 @@ _PANEL_CLOSE = (0.502, 0.092)                      # 关闭怪物信息面板（
 _DIGITS = re.compile(r"^\d{1,2}$")
 _ONE_DIGIT = re.compile(r"^\d$")
 _NUMBER = re.compile(r"^\d{1,6}$")
-_ICON_THRESHOLD = 0.80
+_ICON_THRESHOLD = 0.45     # 白色笔画重合度：已收集的图标里不同类别之间最高 0.31
+_GLYPH_FRAC = 0.75
+_GLYPH_MIN_PIXELS = 30
 _AP_SHORT = re.compile(r"AP\s*不足", re.IGNORECASE)
 _EXTRA_WAIT_CARDS = ("极光", "万众英雄")  # 打出后动画较长，沿用原逻辑额外等 2 秒
 _STUCK_LIMIT = 3            # 同一张牌连续这么多次还在手里（又没提示 AP不足），本回合不再出它
 _DRAG_FAIL_LIMIT = 2        # 拖动连续这么多次没打出去，改用按键 + 回车打默认目标
 _RED_SAMPLES = 4            # 读预计扣血时连续取样的帧数（红色段是闪烁的）
 _RED_INTERVAL = 0.25
-_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="出牌识别")  # 几块区域的 OCR 并行跑
+_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="出牌识别")  # 几块区域的裁剪识别并行跑
+_OCR_LOCK = threading.Lock()
 
 
 def install(task):
@@ -99,7 +103,11 @@ def _variants(crop):
 
 def _ocr_texts(task, image):
     try:
-        return [box.name.strip() for box in task.ocr(frame=image)]
+        # OpenVINO 的识别模型同一时间只能处理一个请求（并发会抛 Infer Request is busy），
+        # 所以裁剪、预处理在线程池里并行，调用 OCR 这一步排队
+        with _OCR_LOCK:
+            boxes = task.ocr(frame=image)
+        return [box.name.strip() for box in boxes]
     except Exception as e:  # OCR 失败不影响出牌，按读不到处理
         task.log_info(f"战斗识别 OCR 失败：{e}")
         return []
@@ -366,20 +374,41 @@ def _load_icons():
     return _icon_cache["icons"]
 
 
-def match_intent(crop):
-    """拿意图图标去比对本地图标库，返回类别（攻击/防御/增益）；认不出返回 None。"""
+def intent_glyph(crop):
+    """意图图标的白色笔画（剑、盾等），只取截图正中的一块：图标周围常常挤着别的状态图标、血条和背景，
+    整块比对时同一个图标两次截下来相似度只有 -0.1~0.5。返回 32x32 布尔图；白色笔画太少（截偏了）返回 None。"""
     if crop is None or crop.size == 0:
+        return None
+    h, w = crop.shape[:2]
+    side = int(min(h, w) * _GLYPH_FRAC)
+    x0, y0 = (w - side) // 2, (h - side) // 2
+    hsv = cv2.cvtColor(crop[y0:y0 + side, x0:x0 + side], cv2.COLOR_BGR2HSV)
+    white = ((hsv[:, :, 2] > 190) & (hsv[:, :, 1] < 60)).astype(np.uint8)
+    glyph = cv2.resize(white, (32, 32), interpolation=cv2.INTER_AREA) > 0.3
+    return glyph if glyph.sum() >= _GLYPH_MIN_PIXELS else None
+
+
+def match_intent(crop):
+    """拿意图图标去比对本地图标库（白色笔画的重合度），返回类别（攻击/防御/增益）；认不出返回 None。"""
+    glyph = intent_glyph(crop)
+    if glyph is None:
         return None
     best, best_score = None, _ICON_THRESHOLD
     for category, icon in _load_icons():
-        resized = cv2.resize(crop, (icon.shape[1], icon.shape[0]))
-        score = float(cv2.matchTemplate(resized, icon, cv2.TM_CCOEFF_NORMED).max())
+        known = intent_glyph(icon)
+        if known is None:
+            continue
+        union = (glyph | known).sum()
+        score = (glyph & known).sum() / union if union else 0.0
         if score >= best_score:
             best, best_score = category, score
     return best
 
 
 def save_intent_icon(crop, category, move_name):
+    """存进图标库；截偏了（中间没有白色笔画）的不存，返回 None。"""
+    if intent_glyph(crop) is None:
+        return None
     os.makedirs(os.path.join(ICON_DIR, category), exist_ok=True)
     safe = re.sub(r'[\\/:*?"<>|\s]', "", move_name or "未知")[:20]
     path = os.path.join(ICON_DIR, category, f"{safe}_{int(time.time() * 1000)}.png")
