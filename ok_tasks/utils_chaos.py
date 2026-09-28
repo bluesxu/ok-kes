@@ -926,6 +926,65 @@ def handle_chaos_reward_settlement(task: TriggerTask):
     return True
 
 
+def _decompose_checkbox_checked(task, x, y):
+    """勾选框填的是橙色，中间对勾是白的。周围橙色够多才算已勾上；读不到画面返回 None。"""
+    frame = getattr(task, "frame", None)
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return None
+    height, width = frame.shape[:2]
+    px, py = int(x * width), int(y * height)
+    half = max(4, int(0.012 * width))
+    x1, y1 = max(0, px - half), max(0, py - half)
+    x2, y2 = min(width, px + half), min(height, py + half)
+    region = frame[y1:y2, x1:x2, :3]
+    if region.size == 0:
+        return None
+    blue = region[:, :, 0]
+    red = region[:, :, 2]
+    orange = (red > 170) & (blue < 100) & (red.astype(int) > blue.astype(int) + 60)
+    return float(orange.mean()) >= 0.2
+
+
+def handle_decompose_archive_confirm(task: TriggerTask):
+    """分解存档资料确认框：没勾上「下次登入前不再显示」就先勾上，再点确认。
+    已勾上再点会取消，所以先看框是不是橙色。"""
+    if not any("分解存档" in box.name or "分解存檔" in box.name for box in task.all_texts):
+        return False
+    label = next(
+        (
+            box for box in task.all_texts
+            if any(needle in box.name for needle in ("不再显示", "不再顯示", "不再显", "不再顯"))
+        ),
+        None,
+    )
+    if label is None:
+        return False
+    x = label.x / task.width - 0.029
+    y = (label.y + label.height / 2) / task.height
+    checked = _decompose_checkbox_checked(task, x, y)
+    if checked:
+        task.log_info("分解存档资料：下次登入前不再显示已勾选")
+    elif checked is None:
+        task.log_info("分解存档资料：读不到勾选框颜色，不点击，避免把已勾选取消")
+    else:
+        task.log_info("分解存档资料：勾选下次登入前不再显示")
+        _move_and_click(task, x, y)
+        task.sleep(0.4)
+    confirm = next(
+        (
+            box for box in task.all_texts
+            if _clean_match(box.name, "确认") or "確認" in box.name
+        ),
+        None,
+    )
+    if confirm is None:
+        return True
+    task.log_info("分解存档资料：点击确认")
+    task.click_box(confirm)
+    task.sleep(1)
+    return True
+
+
 # 卡厄思模式 PAGE_HANDLERS
 PAGE_HANDLERS = [
     handle_auto_stop,
@@ -938,6 +997,7 @@ PAGE_HANDLERS = [
     handle_close_page, #点击屏幕关闭页面，优先于其他普通页面处理
 
     handle_refine_equipment_credit, #提炼装备信用点页面，优先于确认按钮
+    handle_decompose_archive_confirm, #分解存档资料：先勾选下次登入前不再显示，再确认
     handle_center_confirm, #页面中央确认按钮
     handle_archive_target_member, #信息统计页面，记录刷存档目标主战员
     handle_chaos_mask_engraving, #面具卡牌刻印获取页面
