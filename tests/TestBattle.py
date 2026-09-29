@@ -318,6 +318,15 @@ class TestKillPreview(unittest.TestCase):
                 self.assertEqual(after, value)
                 self.assertEqual(after == 0, battle.is_lethal(before, value))
 
+    def test_boss_bar_split_counts_once(self):
+        # 实跑 21:41：Boss 的长血条被切成两段，都挨着同一个数字，被当成两个 8644 血的敌人，击杀预览白白多停一次
+        task = SimpleNamespace(width=2560, height=1440, all_texts=[Box(int(0.70 * 2560), int(0.08 * 1440), 150, 40, name="8644")])
+        with mock.patch.object(battle, "enemy_bars", lambda frame: [(0.654, 0.102, 0.08), (0.733, 0.102, 0.05)]), \
+                mock.patch.object(battle, "_read_digit", lambda *a, **k: 3), \
+                mock.patch.object(battle, "match_intent", lambda crop: None):
+            enemies = battle.read_enemies(task, np.zeros((1440, 2560, 3), np.uint8))
+        self.assertEqual([(0.654, 8644)], [(e["x"], e["hp"]) for e in enemies])
+
     def test_lethal_needs_zero(self):
         self.assertTrue(battle.is_lethal(enemy(492, 2), 0))
         self.assertFalse(battle.is_lethal(enemy(492, 2), None))  # 读不到（出牌动画挡着）
@@ -562,6 +571,17 @@ class TestPlayTurnRecovery(TestPlayTurn):
                 battle.play_turn(self.task, 1, True)
         self.assertEqual([500], calls)  # 读不出意图也只点开一次，之后照常出牌
         self.assertIn("1", self.keys)
+
+    def test_played_banner_counts_as_played(self):
+        # 实跑 21:41:41：AP 为 0 时按出 0 费的「逆转之刃」，它又抽了一张牌，手牌数、AP 都没变，被误判成出不掉
+        hand = [dict(card("逆转之刃", 0, "强化", key="1"), x=0.4, y=None)]
+        with mock.patch.object(battle, "read_hand", lambda task, count: [dict(c) for c in hand]), \
+                mock.patch.object(battle, "read_remaining_cost", lambda task, frame: 0):
+            battle.play_turn(self.task, 1, True)
+            self.task.all_texts = [Box(int(0.05 * 2560), int(0.46 * 1440), 300, 50, name="逆转之刃")]
+            battle.play_turn(self.task, 1, True)
+        self.assertNotIn("逆转之刃", self.task._battle["unplayable"])
+        self.assertEqual(["1", "enter", "1", "enter"], self.keys)
 
     def test_zero_cost_remembered_when_ap_used_up(self):
         # 实跑 21:13:36：AP 用完，手里只剩 0 费的「逆转之刃」，费用读不到就结束了回合

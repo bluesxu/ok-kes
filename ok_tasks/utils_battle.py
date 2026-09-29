@@ -49,6 +49,7 @@ _CARD_TYPE_BOX = (-0.012, 0.004, 0.05, 0.055)     # 类型标签相对牌名左�
 _PANEL_REGION = (0.02, 0.02, 0.46, 0.46)           # 怪物信息面板
 _WEAKNESS_REGION = (0.30, 0.07, 0.45, 0.15)        # 怪物信息面板标题栏右侧的「弱点」：看到它说明面板开着
 _WEAKNESS = re.compile("弱[点點]")
+_PLAYED_BANNER = (0.0, 0.40, 0.25, 0.52)           # 打出一张牌后左侧显示牌名的横幅
 
 _DIGITS = re.compile(r"^\d{1,2}$")
 _ONE_DIGIT = re.compile(r"^\d$")
@@ -451,6 +452,7 @@ def read_enemies(task, frame):
     """每个敌人：血量、护盾、行动倒计时（∞ 或读不到为 None）、意图、拖牌落点、意图图标的位置。"""
     enemies = []
     blocked = [_rel(task, b) for b in task.all_texts if "无法攻击" in b.name]
+    used = set()
     for left, bar_y, bar_w in enemy_bars(frame):
         if any(left - 0.02 <= bx <= left + bar_w + 0.02 and bar_y - 0.05 <= by <= bar_y + 0.01 for bx, by in blocked):
             continue  # 「无法攻击」的单位（如地上的捕兽夹）不能当目标
@@ -462,6 +464,9 @@ def read_enemies(task, frame):
                 continue
             near = [(left + 0.055, bar_y - 0.012, hp_value)]
         hp = min(near, key=lambda n: abs(n[0] - (left + 0.055)) + abs(n[1] - (bar_y - 0.012)))
+        if (hp[0], hp[1]) in used:
+            continue  # Boss 的长血条会被切成几段，都挨着同一个血量数字：只算最左边那段（血条是从左往右排的）
+        used.add((hp[0], hp[1]))
         shields = [n for n in near if n is not hp and n[0] > hp[0] + 0.03]
         diamond = (left - 0.021, bar_y + 0.006)
         diamond_region = (diamond[0] - 0.026, diamond[1] - 0.036, diamond[0] + 0.024, diamond[1] + 0.036)
@@ -846,8 +851,10 @@ def _check_last_play(task, state, hand_count, remaining):
     if not last or hand_count is None:
         return
     state["last"] = None
+    # 0 费又抽牌的牌（如逆转之刃）打出后手牌数、AP 都不变：看左侧有没有出现这张牌的牌名横幅
     played = hand_count < last["hand"] or (
-        remaining is not None and last.get("remaining") is not None and remaining < last["remaining"])
+        remaining is not None and last.get("remaining") is not None and remaining < last["remaining"]) \
+        or _played_banner(task, last["name"])
     fails = state["attempts"]
     fails[last["slot"]] = 0 if played else fails.get(last["slot"], 0) + 1
     if last["method"] == "拖动":
@@ -871,6 +878,18 @@ def _check_last_play(task, state, hand_count, remaining):
     if not played and fails[last["slot"]] >= limit:
         _mark_unplayable(state, last)
         battle_log.anomaly(task, "出不掉牌", f"「{last['name']}」{last['method']}出牌 {limit} 次没打出去，本回合不再出它")
+
+
+def _played_banner(task, name):
+    if name.startswith("未识别") or len(name) < 2:
+        return False
+    x1, y1, x2, y2 = _PLAYED_BANNER
+    for box in task.all_texts:
+        cx, cy = _rel(task, box)
+        text = box.name.strip()
+        if x1 <= cx <= x2 and y1 <= cy <= y2 and len(text) >= 2 and (name in text or text in name):
+            return True
+    return False
 
 
 def _use_drag(task, state, card):
