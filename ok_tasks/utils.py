@@ -4533,14 +4533,31 @@ def handle_held_cards_page(task: TriggerTask):
         return True
     return False
 
-def handle_weakness_info(task: TriggerTask):
-    """怪物信息页面: 检测到弱点信息则关闭页面。"""
+def monster_panel_open(task: TriggerTask):
+    """怪物信息面板是否开着（面板标题栏右侧的「弱点」）。"""
     box = find_box_at_point(task, 0.387, 0.107)
-    if box and "弱点" in box.name:
-        task.log_info("检测到怪物信息页面，点击关闭")
+    return bool(box and "弱点" in box.name)
+
+
+def close_monster_panel(task: TriggerTask, tries=0):
+    """关怪物信息面板：偶数次点面板外的 (0.502, 0.092)，奇数次按 ESC。
+    体型大的 Boss（如维亚迪乌斯）身体会伸到 (0.502, 0.092)，点下去反而又把面板点开，实跑中来回卡了两个小时。"""
+    if tries % 2 == 0:
         _move_and_click(task, 0.502, 0.092)
-        return True
-    return False
+    else:
+        task.send_key("esc")
+
+
+def handle_weakness_info(task: TriggerTask):
+    """怪物信息页面: 检测到弱点信息则关闭页面；连续关不掉时轮流改用 ESC。"""
+    if not monster_panel_open(task):
+        task._weakness_tries = 0
+        return False
+    tries = getattr(task, "_weakness_tries", 0)
+    task._weakness_tries = tries + 1
+    task.log_info("检测到怪物信息页面，" + ("点击关闭" if tries % 2 == 0 else "点击没关掉，按 ESC 关闭"))
+    close_monster_panel(task, tries)
+    return True
 
 def handle_minimizemap(task: TriggerTask):
     """地图页面: 检测到小地图按钮则点击关闭小地图。"""

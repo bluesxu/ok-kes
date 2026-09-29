@@ -714,15 +714,25 @@ def handle_battle_hand_select(task: TriggerTask):
 
 
 def handle_card_info_popup(task: TriggerTask):
-    """确认卡牌资讯弹窗（带「使用卡牌 / 取消选择」按钮）: 点「取消选择」关掉。
-    这个弹窗盖住手牌区时手牌会识别成 0 张，没有它时曾经在同一个画面空转了近 10 小时。"""
+    """确认卡牌资讯弹窗（带「使用卡牌 / 取消选择」按钮）: 取消选择关掉。
+    这个弹窗盖住手牌区时手牌会识别成 0 张，没有它时曾经在同一个画面空转了近 10 小时。
+    出牌时选中了牌没打出去，左下角也会出现「ENTER 使用卡牌 / ESC 取消选择」的按键提示，这时点文字没用：
+    实跑中每 2 秒点一次「取消选择」、卡了 50 分钟。所以先按 ESC，还关不掉再轮流改点文字。"""
     if not any("使用卡牌" in b.name or "卡牌资讯" in b.name for b in task.all_texts):
+        task._card_popup_tries = 0
         return False
     cancel = next((b for b in task.all_texts if "取消选择" in b.name), None)
     if cancel is None:
+        task._card_popup_tries = 0
         return False
-    task.log_info("检测到确认卡牌资讯弹窗，点击取消选择")
-    task.click_box(cancel)
+    tries = getattr(task, "_card_popup_tries", 0)
+    task._card_popup_tries = tries + 1
+    if tries % 2 == 0:
+        task.log_info("检测到确认卡牌资讯弹窗，按 ESC 取消选择")
+        task.send_key("esc")
+    else:
+        task.log_info("检测到确认卡牌资讯弹窗，按 ESC 没关掉，点击取消选择")
+        task.click_box(cancel)
     task.sleep(1)
     return True
 

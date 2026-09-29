@@ -101,23 +101,29 @@ def anomaly(task, kind, detail, frame=None, **fields):
     task.log_info(f"战斗异常「{kind}」：{detail}")
     shot = None
     state = _state(task)
-    if enabled(task) and _config(task, SHOT_KEY) and kind not in state["shots"]:
-        frame = frame if frame is not None else getattr(task, "frame", None)
-        if frame is not None and getattr(frame, "size", 0):
+    if kind not in state["shots"]:
+        shot = save_shot(task, kind, frame if frame is not None else getattr(task, "frame", None))
+        if shot:
             state["shots"].add(kind)
-            try:
-                os.makedirs(SHOT_DIR, exist_ok=True)
-                name = f"{datetime.datetime.now():%Y%m%d-%H%M%S}_战斗{state['battle_id']}_{kind}.jpg"
-                shot = os.path.join(SHOT_DIR, name)
-                ok, data = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, _JPG_QUALITY])
-                if ok:
-                    data.tofile(shot)  # 路径含中文时 cv2.imwrite 会失败，改用 tofile
-                else:
-                    shot = None
-            except OSError as e:
-                task.log_info(f"异常截图保存失败：{e}")
-                shot = None
     record(task, "异常", kind=kind, detail=detail, screenshot=shot, **fields)
+
+
+def save_shot(task, kind, frame):
+    """开启截图时把 frame 存进截图目录，返回路径；没开或保存失败返回 None。"""
+    if not (enabled(task) and _config(task, SHOT_KEY)) or frame is None or not getattr(frame, "size", 0):
+        return None
+    try:
+        os.makedirs(SHOT_DIR, exist_ok=True)
+        name = f"{datetime.datetime.now():%Y%m%d-%H%M%S}_战斗{_state(task)['battle_id']}_{kind}.jpg"
+        shot = os.path.join(SHOT_DIR, name)
+        ok, data = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, _JPG_QUALITY])
+        if not ok:
+            return None
+        data.tofile(shot)  # 路径含中文时 cv2.imwrite 会失败，改用 tofile
+        return shot
+    except OSError as e:
+        task.log_info(f"截图保存失败：{e}")
+        return None
 
 
 def maybe_cleanup(task, force=False):

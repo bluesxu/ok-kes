@@ -258,6 +258,20 @@ class TestChoosePlay(unittest.TestCase):
         self.assertIsNone(battle.choose_play(cards, 1, [], [], False, {"1/1"})[0])  # 这个位置提示过 AP不足
         self.assertIsNotNone(battle.choose_play([card("孢子", 0)], 0, [], [], False, set())[0])  # 0 费照出
 
+    def test_zero_hp_skips_shield_and_collapse(self):
+        # 血量为 0：护盾无效、崩溃牌打不出，再挨一次打就输
+        cards = [card("冲动", 0, "崩溃", key="1"), card("寒霜盾牌", 1, key="2"), card("斩击", 1, "攻击", key="3")]
+        chosen, reason = battle.choose_play(cards, 3, ["寒霜盾牌"], [], True, set(), zero_hp=True)
+        self.assertEqual("斩击", chosen["name"])
+        self.assertIn("血量为 0", reason)
+        chosen, reason = battle.choose_play(cards[:2], 3, [], [], True, set(), zero_hp=True)
+        self.assertIsNone(chosen)
+
+    def test_zero_hp_still_plays_heal(self):
+        cards = [card("治疗", 1, key="1"), card("冰壁", 1, key="2")]
+        chosen, _ = battle.choose_play(cards, 3, [], [], True, set(), zero_hp=True)
+        self.assertEqual("治疗", chosen["name"])
+
     def test_collapse_card_first_even_without_ap(self):
         cards = [card("破碎", 3, "攻击"), card("冲动", 0, "崩溃", key="2")]
         cards[1]["progress"] = (1, 5)
@@ -369,6 +383,17 @@ class TestPlayTurn(unittest.TestCase):
         battle.play_turn(self.task, 1, True)
         self.assertEqual(["e"], self.keys)  # 唯一的牌出不起：结束回合
 
+    def test_zero_hp_targets_next_attacker_not_boss(self):
+        targets = []
+        enemies = [dict(enemy(8000, 5, "增益", x=0.7), drop=(0.7, 0.5)), dict(enemy(900, 1, "攻击", x=0.5), drop=(0.5, 0.5))]
+        self.task.default_config["出牌优先级"] = ["破碎"]
+        self.task.node_status = {"node_type": "boss"}
+        with mock.patch.object(battle, "read_hp", lambda task: (0, 1700)), \
+                mock.patch.object(battle, "read_enemies", lambda task, frame: enemies), \
+                mock.patch.object(battle, "_drag_card", lambda task, c, t: targets.append(t["hp"])):
+            battle.play_turn(self.task, 2, True)
+        self.assertEqual([900], targets)
+
     def test_attack_card_is_dragged(self):
         self.task.default_config["出牌优先级"] = ["破碎"]
         battle.play_turn(self.task, 2, True)
@@ -417,6 +442,34 @@ class TestPlayTurnRecovery(TestPlayTurn):
             battle.play_turn(self.task, 2, True)
         self.assertTrue(self.task._battle_session["drag_disabled"])
         self.assertEqual(["drag", "drag", "2", "enter"], self.keys)  # 改用按键打默认目标
+
+    def test_background_drag_releases_on_target(self):
+        # 框架的 PostMessage swipe 在窗口左上角 (0, 0) 松手，牌被放回手里；自己发的拖动要在落点松手
+        class PostMessageInteraction:
+            def __init__(self):
+                self.messages = []
+
+            def update_mouse_pos(self, x, y):
+                return (x, y)
+
+            def post(self, message, wparam, lparam):
+                self.messages.append((message, wparam, lparam))
+
+        interaction = PostMessageInteraction()
+        self.task.executor = SimpleNamespace(interaction=interaction)
+        hovered = []
+        with mock.patch.object(battle.time, "sleep", lambda seconds: None):
+            self.assertTrue(battle._post_drag(self.task, (0.5, 0.86), (0.7, 0.4),
+                                              on_hover=lambda: hovered.append(len(interaction.messages))))
+        messages = interaction.messages
+        self.assertEqual((battle._WM_LBUTTONDOWN, battle._MK_LBUTTON, (1280, 1238)), messages[1])
+        self.assertEqual((battle._WM_LBUTTONUP, 0, (1792, 576)), messages[-1])
+        self.assertEqual((battle._WM_MOUSEMOVE, battle._MK_LBUTTON, (1792, 576)), messages[-2])
+        self.assertEqual([len(messages) - 2], hovered)  # 悬停截图在松手之前
+
+    def test_drag_falls_back_to_swipe_without_post_message(self):
+        self.task.executor = SimpleNamespace(interaction=object())
+        self.assertFalse(battle._post_drag(self.task, (0.5, 0.86), (0.7, 0.4)))
 
     def test_blocked_name_ignores_ocr_noise(self):
         self.assertTrue(battle._blocked({"name": "日黑暗斩击", "slot": "1/5"}, {"黑暗斩击"}))
@@ -482,6 +535,61 @@ class TestStuckReport(unittest.TestCase):
             task._last_change_time = time.time() - 61  # 画面动过又卡住：新的一次
             utils.handle_stuck_log(task)
         self.assertEqual(2, len(reports))
+
+
+class TestStuckScreens(unittest.TestCase):
+    """实跑中卡住很久的两个画面（真实截图 + 真实 OCR）。"""
+
+    def actions(self, task):
+        done = []
+        task.send_key = lambda key: done.append(key)
+        task.click_box = lambda box, **k: done.append(box.name)
+        task.sleep = lambda s: None
+        return done
+
+    def test_selected_card_hint_cancelled_with_esc(self):
+        # 16:24：选中的牌没打出去，左下角「ENTER 使用卡牌 / ESC 取消选择」，点文字点了 50 分钟都没用
+        import utils_sortie
+        task = screenshot_task("card_selected_stuck")
+        done = self.actions(task)
+        self.assertFalse(utils.monster_panel_open(task))
+        self.assertTrue(utils_sortie.handle_card_info_popup(task))
+        self.assertTrue(utils_sortie.handle_card_info_popup(task))
+        self.assertEqual(["esc", "取消选择"], done)  # 先按 ESC，还在就改点文字
+
+    def test_monster_panel_alternates_click_and_esc(self):
+        # 17:48：大 Boss 的身体伸到关闭位置，点「关闭」又把面板点开，来回卡了两个小时
+        task = screenshot_task("monster_panel_stuck")
+        done = self.actions(task)
+        clicks = []
+        with mock.patch.object(utils, "_move_and_click", lambda task, x, y: clicks.append((x, y))):
+            self.assertTrue(utils.handle_weakness_info(task))
+            self.assertTrue(utils.handle_weakness_info(task))
+        self.assertEqual([(0.502, 0.092)], clicks)
+        self.assertEqual(["esc"], done)
+
+    def test_zero_hp_when_hp_text_unreadable(self):
+        # 实跑 17:35：血量打到 0 后血量文字读不出来（hp 为 null），照样去出崩溃牌「冲动」「衡重」，都出不掉
+        full = screenshot_task("boss_full_hp").frame
+        empty = np.zeros((1080, 1920, 3), np.uint8)
+        self.assertTrue(battle.is_zero_hp((0, 1583), None, full))
+        self.assertTrue(battle.is_zero_hp(None, (177, 1583), empty))
+        self.assertFalse(battle.is_zero_hp(None, (177, 1583), full))      # 血条上还有绿色：只是文字被挡住
+        self.assertFalse(battle.is_zero_hp(None, (1200, 1583), empty))    # 上次还剩很多血：不可能一下到 0
+        self.assertFalse(battle.is_zero_hp(None, None, empty))
+
+    def test_collect_intent_does_not_click_close_when_panel_never_opened(self):
+        # 意图采集点开敌人后没读到面板：不能去点「关闭」位置（大 Boss 身上）
+        task = screenshot_task("boss_full_hp")
+        task.sleep = lambda s: None
+        task.next_frame = lambda: task.frame
+        clicks = []
+        enemy_info = {"icon_region": (0.6, 0.1, 0.65, 0.15), "drop": (0.7, 0.4)}
+        with mock.patch.object(battle, "_move_and_click", lambda task, x, y: clicks.append((x, y))), \
+                mock.patch.object(battle.battle_log, "anomaly", lambda *a, **k: None), \
+                mock.patch.object(utils, "_move_and_click", lambda task, x, y: clicks.append(("close", x, y))):
+            battle.collect_intent(task, enemy_info)
+        self.assertEqual([(0.7, 0.4)], clicks)
 
 
 def flash_task(**config):

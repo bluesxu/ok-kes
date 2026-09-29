@@ -25,7 +25,7 @@ import numpy as np
 import battle_log
 import config_io
 from ok import Box
-from utils import _get_config_value, _move_and_click, _normalize_text, _simplify_texts
+from utils import _get_config_value, _move_and_click, _normalize_text, _simplify_texts, close_monster_panel
 
 DEFENSE_KEY = "防御卡牌列表"
 FINE_KEY = "精细化战斗"
@@ -47,7 +47,8 @@ _ENEMY_AREA = (0.30, 0.0, 1.0, 0.62)               # 敌人血条可能出现的
 _CARD_COST_BOX = (-0.030, -0.016, 0.004, 0.050)    # 费用数字相对牌名左上角的范围
 _CARD_TYPE_BOX = (-0.012, 0.004, 0.05, 0.055)     # 类型标签相对牌名左上角的范围；右边界太宽会拿到相邻牌的标签
 _PANEL_REGION = (0.02, 0.02, 0.46, 0.46)           # 怪物信息面板
-_PANEL_CLOSE = (0.502, 0.092)                      # 关闭怪物信息面板（与 handle_weakness_info 相同）
+_WEAKNESS_REGION = (0.30, 0.07, 0.45, 0.15)        # 怪物信息面板标题栏右侧的「弱点」：看到它说明面板开着
+_WEAKNESS = re.compile("弱[点點]")
 
 _DIGITS = re.compile(r"^\d{1,2}$")
 _ONE_DIGIT = re.compile(r"^\d$")
@@ -57,13 +58,21 @@ _GLYPH_FRAC = 0.75
 _GLYPH_MIN_PIXELS = 30
 _AP_SHORT = re.compile(r"AP\s*不足", re.IGNORECASE)
 # 牌名里带这些字的非攻击牌算保命牌（加护盾、回血）
-_DEFENSE_WORDS = ("盾", "格挡", "壁", "屏障", "防御", "防护", "守护", "治", "愈", "疗", "恢复", "回复", "再生", "包扎")
+_SHIELD_WORDS = ("盾", "格挡", "壁", "屏障", "防御", "防护", "守护")
+_DEFENSE_WORDS = _SHIELD_WORDS + ("治", "愈", "疗", "恢复", "回复", "再生", "包扎")
 _EXTRA_WAIT_CARDS = ("极光", "万众英雄")  # 打出后动画较长，沿用原逻辑额外等 2 秒
 _STUCK_LIMIT = 3            # 同一张牌连续这么多次还在手里（又没提示 AP不足），本回合不再出它
 _BUTTON_GONE_LIMIT = 30     # 「结束回合」按钮消失这么多秒还没回来，就不再当作敌人行动中干等
 _DRAG_FAIL_LIMIT = 2        # 拖动连续这么多次没打出去，改用按键 + 回车打默认目标
+_DRAG_STEPS = 12            # 后台拖动中途发几次鼠标移动
+_DRAG_STEP_INTERVAL = 0.02
+_DRAG_HOVER = 0.3           # 拖到敌人身上停多久再松手（等击杀预览显示出来）
+_PREVIEW_SHOTS = 20         # 每次运行最多存几张拖动悬停截图（精细化战斗的素材）
+_WM_MOUSEMOVE, _WM_LBUTTONDOWN, _WM_LBUTTONUP, _MK_LBUTTON = 0x0200, 0x0201, 0x0202, 0x0001
 _RED_SAMPLES = 4            # 读预计扣血时连续取样的帧数（红色段是闪烁的）
 _RED_INTERVAL = 0.25
+_HP_GREEN_MIN = 5           # 血条一行里绿色像素少于这个数算没有绿色（剩 5% 血时实测约 40 像素）
+_ZERO_HP_LAST_RATIO = 0.15  # 读不到血量时，本场上一次读到的血量低于上限的这个比例，才可能是打到 0 了
 _EGO_SLOTS = (("F1", 0.714), ("F2", 0.817), ("F3", 0.904))  # 左下角三个 Ego 头像上费用框的中心 y
 _EGO_COST_X = (0.057, 0.070)   # 费用框横向范围（取框内底色，不含边框）
 _EGO_READY = 0.4               # 费用框浅青色像素占比超过这个值：放得起（实测 0.60~0.84；放不起是灰色、空槽是暗的，都为 0）
@@ -208,6 +217,28 @@ def hp_bar_red(frame):
             start = (ri.min() + x0) / w
             red_start = start if red_start is None else min(red_start, start)
     return red_start, end
+
+
+def hp_bar_empty(frame):
+    """我方血条上一格绿色都没有（血量为 0）。"""
+    h, w = frame.shape[:2]
+    x0, x1 = int(_HP_BAR_X[0] * w), int(_HP_BAR_X[1] * w)
+    for row_y in _HP_BAR_ROWS:
+        row = cv2.cvtColor(frame[int(row_y * h):int(row_y * h) + 1, x0:x1], cv2.COLOR_BGR2HSV)[0]
+        green = (row[:, 0] > 35) & (row[:, 0] < 90) & (row[:, 1] > 80) & (row[:, 2] > 80)
+        if green.sum() >= _HP_GREEN_MIN:
+            return False
+    return True
+
+
+def is_zero_hp(hp, last_hp, frame):
+    """我方血量是否为 0：读到 0 就是；实跑中血量打到 0 后血量文字读不出来（记录里 hp 为 null），
+    这时要本场上一次读到的血量已经很低、且血条上没有绿色，才当成 0（文字被别的界面挡住时不误判）。"""
+    if hp:
+        return hp[0] == 0
+    if not last_hp or last_hp[0] > last_hp[1] * _ZERO_HP_LAST_RATIO or frame is None:
+        return False
+    return hp_bar_empty(frame)
 
 
 def incoming_lethal(task):
@@ -554,8 +585,16 @@ def collect_intent(task, enemy):
         trigger = f"行动次数{count}次后触发" if count is not None else "非行动次数触发"
         task.log_info(f"意图采集：「{move}」{category}，{trigger}，伤害={damage}，图标存到 {path}")
         battle_log.record(task, "意图采集", move=move, category=category, trigger=count, damage=damage, icon=path)
-    _move_and_click(task, *_PANEL_CLOSE)
-    task.sleep(0.5)
+    # 面板没打开就不点「关闭」：大 Boss 的身体会伸到关闭位置，点下去反而把面板点开（实跑中因此卡了两个小时）。
+    # 关完再看一眼，还开着就换 ESC；剩下的交给 handle_weakness_info 轮流用两种办法关
+    if not any(_WEAKNESS.search(text) for text, _ in lines):
+        return
+    for tries in range(2):
+        close_monster_panel(task, tries)
+        task.sleep(0.5)
+        task.next_frame()
+        if not any(_WEAKNESS.search(box.name) for box in task.ocr(*_WEAKNESS_REGION)):
+            return
 
 
 # ======================================================================
@@ -592,12 +631,19 @@ def _priority_rank(card, priority):
     return len(priority), None
 
 
-def choose_play(cards, remaining, priority, defense, danger, unplayable):
+def is_shield(card):
+    """加护盾的牌（牌名带「盾」「格挡」「壁」等字的非攻击牌）。"""
+    return card["type"] != "攻击" and any(word in card["name"] for word in _SHIELD_WORDS)
+
+
+def choose_play(cards, remaining, priority, defense, danger, unplayable, zero_hp=False):
     """挑这一次要出的牌。cards 为 [{name, key, type, cost}]，cost 读不到为 None；remaining 读不到为 None。
     unplayable 里是本回合出不起的牌名或位置（「按键/手牌数」）。返回 (牌, 理由)；没有能出的牌时返回 (None, 理由)。
 
     顺序：崩溃牌 → 预计会被打死或血量过低（danger）时先出防御牌 → 「出牌优先级」里的牌（按列表顺序）→ 0 费牌 → 强化牌 → 攻击牌 → 技能/防御/其余牌。
-    「出牌优先级」里的牌不看类型：类型常被读错（实跑中「破碎」读不出类型，排到了其余牌里，被普通攻击牌抢先）。"""
+    「出牌优先级」里的牌不看类型：类型常被读错（实跑中「破碎」读不出类型，排到了其余牌里，被普通攻击牌抢先）。
+    zero_hp（我方血量为 0）：游戏进入特殊状态，护盾无效、崩溃牌打不出，再挨一次打就输。
+    这时不出崩溃牌和加护盾的牌，也不走「先出防御牌」，AP 全留给其余的牌。"""
     def affordable(card):
         if _blocked(card, unplayable) or card.get("key") is None:
             return False
@@ -617,17 +663,20 @@ def choose_play(cards, remaining, priority, defense, danger, unplayable):
 
     # 1. 崩溃牌不花 AP、不计入敌人的行动次数：手里有就最先出，打够张数才能觉醒
     for card in cards:
+        if zero_hp:
+            break
         if card["type"] == "崩溃" and not _blocked(card, unplayable) and card.get("key") is not None:
             done = card.get("progress")
             shown = f"，进度 {'?' if done[0] is None else done[0]}/{done[1]}" if done else ""
             return card, f"崩溃牌（不花 AP，打够张数觉醒）{shown}"
 
-    playable = [c for c in cards if affordable(c) and c["type"] != "崩溃"]
+    playable = [c for c in cards if affordable(c) and c["type"] != "崩溃" and not (zero_hp and is_shield(c))]
     if not playable:
-        return None, "没有出得起的牌"
+        return None, "没有出得起的牌" + ("（血量为 0，不出护盾牌和崩溃牌）" if zero_hp else "")
     steps = (
         # 2. 这回合会被打死或打残：先把防御牌出了
-        ([c for c in playable if is_defense(c, defense)] if danger else [], "预计会被打死或血量过低，先出防御牌"),
+        ([c for c in playable if is_defense(c, defense)] if danger and not zero_hp else [],
+         "预计会被打死或血量过低，先出防御牌"),
         # 3. 用户在「出牌优先级」里指定的牌
         ([c for c in playable if _priority_rank(c, priority)[1]], "指定优先出的牌"),
         # 4. 0 费牌白出，可能带增益或抽牌
@@ -642,7 +691,7 @@ def choose_play(cards, remaining, priority, defense, danger, unplayable):
     for group, reason in steps:
         chosen = pick(group, reason)
         if chosen:
-            return chosen
+            return (chosen[0], "血量为 0，" + chosen[1]) if zero_hp else chosen
     return None, "没有出得起的牌"
 
 
@@ -711,7 +760,7 @@ def _session(task):
     """跨战斗保留的状态：这台机器上拖动出牌是否有效。后台拖动（PostMessage）可能不被游戏当成出牌。"""
     session = getattr(task, "_battle_session", None)
     if session is None:
-        session = {"drag_ok": 0, "drag_fail": 0, "drag_disabled": False}
+        session = {"drag_ok": 0, "drag_fail": 0, "drag_disabled": False, "preview_shots": 0}
         task._battle_session = session
     return session
 
@@ -866,15 +915,19 @@ def play_turn(task, hand_count, finish_turn_visible):
     priority = _get_config_value(task, "出牌优先级", [])
     defense = _get_config_value(task, DEFENSE_KEY, [])
     hp = read_hp(task)
+    # 血量为 0：再挨一次打就输，不出护盾牌、崩溃牌，攻击先打马上要动手的敌人
+    zero_hp = is_zero_hp(hp, state.get("last_hp"), frame)
+    if hp:
+        state["last_hp"] = hp
     lethal, after = False, 1.0
-    if remaining and any(is_defense(c, defense) for c in cards):
+    if remaining and not zero_hp and any(is_defense(c, defense) for c in cards):
         lethal, after = incoming_lethal(task)  # 只有手里有防御牌时才值得花时间读预计扣血
     danger = lethal or in_danger(hp, after, _get_config_value(task, DANGER_KEY, 25))
 
-    card, reason = choose_play(cards, remaining, priority, defense, danger, state["unplayable"])
+    card, reason = choose_play(cards, remaining, priority, defense, danger, state["unplayable"], zero_hp=zero_hp)
     observed = {
         "hand_count": hand_count, "remaining": remaining, "hp": hp, "shield": read_shield(task),
-        "hp_after_ratio": round(after, 3), "lethal": lethal, "danger": danger,
+        "hp_after_ratio": round(after, 3), "lethal": lethal, "danger": danger, "zero_hp": zero_hp,
         "cards": [{k: c.get(k) for k in ("name", "key", "type", "cost")} for c in cards],
         "enemies": [{k: e[k] for k in ("x", "y", "hp", "shield", "countdown", "intent")} for e in enemies],
         "unplayable": sorted(state["unplayable"]),
@@ -886,7 +939,12 @@ def play_turn(task, hand_count, finish_turn_visible):
     target, target_reason = None, None
     use_drag = _use_drag(task, state, card)
     if use_drag:
-        target, target_reason = choose_target(enemies, boss_battle, state["sticky"])
+        if zero_hp:
+            # 不再优先打 Boss、也不沿用上一个目标：先打有攻击意图、行动倒计时小、血少的
+            target, target_reason = choose_target(enemies, False, None)
+            target_reason = target_reason and "血量为 0，" + target_reason
+        else:
+            target, target_reason = choose_target(enemies, boss_battle, state["sticky"])
         use_drag = target is not None
     method = "拖动" if use_drag else "按键"
     battle_log.record(task, "出牌", card=card["name"], key=card["key"], cost=card["cost"], card_type=card["type"],
@@ -909,10 +967,72 @@ def play_turn(task, hand_count, finish_turn_visible):
     return True
 
 
+def _post_message_interaction(task):
+    """框架的后台交互对象（PostMessage）；不是后台交互（或测试替身）时返回 None。"""
+    interaction = getattr(getattr(task, "executor", None), "interaction", None)
+    if type(interaction).__name__ != "PostMessageInteraction":
+        return None
+    return interaction
+
+
+def _post_drag(task, start, drop, on_hover=None):
+    """后台拖动，返回 False 表示当前不是后台交互、没拖。
+    框架 PostMessageInteraction.swipe 在游戏里拖不出牌：松手消息的坐标固定是 (0, 0)（它的 mouse_pos 从不更新），
+    牌在窗口左上角松手被游戏当成取消；中途也只移 3 步、到不了终点。这里自己发消息：
+    按下 → 分步移到落点 → 停一下（on_hover 可截图看击杀预览）→ 在落点松手。"""
+    interaction = _post_message_interaction(task)
+    if interaction is None:
+        return False
+
+    def pos(point):
+        return interaction.update_mouse_pos(int(task.width * point[0]), int(task.height * point[1]))
+
+    lparam = pos(start)
+    interaction.post(_WM_MOUSEMOVE, 0, lparam)
+    time.sleep(0.05)
+    interaction.post(_WM_LBUTTONDOWN, _MK_LBUTTON, lparam)
+    time.sleep(0.08)
+    for i in range(1, _DRAG_STEPS + 1):
+        t = i / _DRAG_STEPS
+        lparam = pos((start[0] + (drop[0] - start[0]) * t, start[1] + (drop[1] - start[1]) * t))
+        interaction.post(_WM_MOUSEMOVE, _MK_LBUTTON, lparam)
+        time.sleep(_DRAG_STEP_INTERVAL)
+    time.sleep(_DRAG_HOVER)
+    if on_hover is not None:
+        try:
+            on_hover()
+        except Exception as e:  # 截图失败不能让牌一直拿在手上
+            task.log_info(f"拖动悬停时出错：{e}")
+    interaction.post(_WM_MOUSEMOVE, _MK_LBUTTON, lparam)
+    interaction.post(_WM_LBUTTONUP, 0, lparam)
+    return True
+
+
+def _sample_preview(task, card, target):
+    """精细化战斗的素材：拖到敌人身上悬停时截一张图，看击杀预览（预扣血、骷髅图标）长什么样。每次运行最多存几张。"""
+    session = _session(task)
+    if not _get_config_value(task, FINE_KEY, True) or session["preview_shots"] >= _PREVIEW_SHOTS:
+        return None
+
+    def hover():
+        # 加速模式包装过的 next_frame 会先补足欠下的等待，拖动途中不能停那么久
+        capture = getattr(task.executor, "_speedup_original_next_frame", None) or task.next_frame
+        frame = capture()
+        if frame is None:
+            return
+        session["preview_shots"] += 1
+        name = re.sub(r'[\\/:*?"<>|]', "", card["name"])
+        shot = battle_log.save_shot(task, f"击杀预览_{name}", frame)
+        battle_log.record(task, "击杀预览采样", card=card["name"], screenshot=shot,
+                          target={k: target.get(k) for k in ("x", "y", "hp", "shield", "countdown", "intent")})
+    return hover
+
+
 def _drag_card(task, card, target):
     # 从牌身中部拖起；牌名没读到时没有 y，用手牌区牌身的大致高度
     start = (card["x"] + 0.035, min(0.93, card["y"] + 0.07) if card.get("y") is not None else 0.86)
-    task.swipe_relative(start[0], start[1], target["drop"][0], target["drop"][1], duration=0.35)
+    if not _post_drag(task, start, target["drop"], on_hover=_sample_preview(task, card, target)):
+        task.swipe_relative(start[0], start[1], target["drop"][0], target["drop"][1], duration=0.35)
     speed = getattr(task, "_speedup", None)
     if speed is not None:
         # 加速模式按「数字键/回车」判断刚出过牌；拖动出牌也要告诉它，免得刚出完牌就被判定可以结束回合
