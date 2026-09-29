@@ -281,8 +281,8 @@ msgstr "Minimum interval between recognitions outside battle when 加速模式 i
 msgid "关闭后商店不再点击「免费」刷新，没货就离开；开启后恢复原版刷新"
 msgstr "When off, the shop's free refresh is not used and the shop is left when nothing is worth buying. When on, the original refresh behavior is restored."
 
-msgid "给我方加护盾的牌；预计这回合会被打死时，先给这些牌留出费用"
-msgstr "Cards that give your team a shield; when this turn's incoming damage would be lethal, AP is reserved for them first."
+msgid "保命牌（加护盾、回血）：牌名带「盾」「格挡」「壁」「治」「疗」「恢复」等字的会自动认出，这里只需补充认不出的牌；预计这回合会被打死时先出这些牌"
+msgstr "Survival cards (shield or heal): cards whose names contain words like 盾, 格挡, 壁, 治, 疗 or 恢复 are recognized automatically, so only list the ones that are missed; they are played first when this turn's incoming damage would be lethal."
 
 msgid "出牌前用击杀预览挑目标（当前版本尚未实现预览，行为与关闭相同）；关闭时集中打同一个敌人直到它死"
 msgstr "Pick targets using the kill preview before playing (preview is not implemented yet, so this currently behaves like off); when off, keep attacking the same enemy until it dies."

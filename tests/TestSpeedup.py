@@ -1117,5 +1117,29 @@ class TestSpeedup(unittest.TestCase):
         self.assertTrue(task.default_config[speedup.ENABLE_KEY])
 
 
+class TestEndTurnGate(unittest.TestCase):
+    """结束回合（按 E）前的确认。"""
+
+    def gate(self, since_play, sure):
+        st = {"last_play_key": time.time() - since_play, "last_end_turn": 0.0, "end_turn_seen": 0.0,
+              "end_turn_reason": None, "end_turn_sure": sure}
+        task = SimpleNamespace(log_info=lambda message: None)
+        return speedup._end_turn_allowed(task, st), st
+
+    def test_sure_end_turn_skips_wait_and_second_check(self):
+        # 实跑：AP 已用完，最后一张牌到按 E 要等 4~5 秒（出牌后 3 秒 + 再确认一轮）
+        allowed, st = self.gate(1.2, True)
+        self.assertTrue(allowed)
+        self.assertFalse(st["end_turn_sure"])  # 只对这一次有效
+        self.assertFalse(self.gate(0.5, True)[0])  # 刚出完牌还是要等 1 秒
+
+    def test_unsure_end_turn_still_confirms_twice(self):
+        self.assertFalse(self.gate(1.2, False)[0])
+        allowed, st = self.gate(3.5, False)
+        self.assertFalse(allowed)  # 第一轮只记下时间
+        st["end_turn_seen"] -= 1.0
+        self.assertTrue(speedup._end_turn_allowed(SimpleNamespace(log_info=lambda m: None), st))
+
+
 if __name__ == '__main__':
     unittest.main()

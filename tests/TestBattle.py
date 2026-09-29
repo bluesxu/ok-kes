@@ -125,6 +125,25 @@ class TestBattlePerception(unittest.TestCase):
                         self.assertEqual(true_cost, cost, f"按键 {card['key']}「{true_name}」的费用")
         self.assertGreaterEqual(costs_read, 8)  # 读不到的由「AP不足」兜底，但大部分应该能读到
 
+    def test_bracket_suffix_does_not_replace_name(self):
+        # 「破碎（屠戮）」的「（屠戮)」被单独读成一个框，以前按最长文字取牌名，破碎变成「（屠戮)」，出牌优先级匹配不上
+        task = screenshot_task("card_suffix")
+        cards = battle.read_hand(task, 7)
+        self.assertEqual("破碎", cards[5]["name"])
+        chosen, reason = battle.choose_play([dict(c, cost=None) for c in cards], 3, ["斗志", "破碎"], [], False, set())
+        self.assertEqual("6", chosen["key"])
+        self.assertIn("破碎", reason)
+        self.assertEqual("定位雷射", cards[3]["name"])  # 整屏 OCR 漏读，手牌区放大补读出来
+
+    def test_hand_lowered_when_ap_used_up(self):
+        # 实跑 09:08:10：AP 用完，手牌沉下去变暗，「0」读不出来，整屏 OCR 只读到第一张牌名
+        task = screenshot_task("hand_lowered")
+        self.assertTrue(battle.hand_lowered(task))
+        self.assertIsNone(battle.read_remaining_cost(task, task.frame))
+        for name in list(TRUTH) + ["card_suffix"]:
+            with self.subTest(name):
+                self.assertFalse(battle.hand_lowered(screenshot_task(name)))
+
     def test_hand_slots_match_measured_layout(self):
         # 截图里量出的牌名左端间距：3/5/7/10 张
         for count, spacing in ((3, 0.1375), (5, 0.113), (7, 0.0808), (10, 0.0561)):
@@ -163,15 +182,24 @@ class TestChoosePlay(unittest.TestCase):
             cards.remove(chosen)
         self.assertEqual(["孢子", "扭曲", "斩击", "刀背格挡"], order)
 
-    def test_logged_turn_no_longer_spends_all_ap_first(self):
-        # 实跑 21:03:54：3 AP，出牌优先级有「破碎」，以前先出 3 费破碎把 AP 用光
-        cards = [card("饥饿的枷锁", 1, "攻击"), card("扭曲：光荣的抵抗", None, "强化"), card("冻结之拳", None, "攻击"),
-                 card("寒霜盾牌", None, "技能"), card("破碎", 3, "攻击")]
-        chosen, reason = battle.choose_play(cards, 3, ["破碎"], [], False, set())
-        self.assertEqual("扭曲：光荣的抵抗", chosen["name"])
+    def test_priority_cards_before_zero_cost_enhance_and_attack(self):
+        cards = [card("饥饿的枷锁", 1, "攻击"), card("扭曲：光荣的抵抗", None, "强化"), card("孢子", 0),
+                 card("斗志", 2), card("破碎", 3, "攻击")]
+        chosen, reason = battle.choose_play(cards, 3, ["斗志", "破碎"], [], False, set())
+        self.assertEqual("斗志", chosen["name"])
+        self.assertIn("出牌优先级「斗志」", reason)
         cards.remove(chosen)
-        chosen, _ = battle.choose_play(cards, 2, ["破碎"], [], False, set())
-        self.assertEqual("饥饿的枷锁", chosen["name"])  # 破碎出不起（3 费），先出便宜的攻击
+        chosen, _ = battle.choose_play(cards, 3, ["斗志", "破碎"], [], False, set())
+        self.assertEqual("破碎", chosen["name"])
+        chosen, _ = battle.choose_play(cards, 1, ["斗志", "破碎"], [], False, set())
+        self.assertEqual("孢子", chosen["name"])  # 优先级里的牌出不起：按原顺序出其余的牌
+
+    def test_logged_priority_card_with_unknown_type(self):
+        # 实跑 09:08:55：「破碎」没读出类型，被排到其余牌里，先出了普通攻击「脉冲打击」
+        cards = [card("脉冲打击", None, "攻击"), card("脉冲打击", None, "攻击", key="2"), card("磁场", None, "技能", key="3"),
+                 card("破碎", 2, None, key="4")]
+        chosen, _ = battle.choose_play(cards, 2, ["斗志", "破碎", "水之根源"], [], False, set())
+        self.assertEqual("破碎", chosen["name"])
 
     def test_priority_orders_within_same_type_then_cost(self):
         cards = [card("斩击", 1, "攻击"), card("破碎", 2, "攻击"), card("秃鹰发射", 1, "攻击")]
@@ -183,7 +211,18 @@ class TestChoosePlay(unittest.TestCase):
         chosen, reason = battle.choose_play(cards, 3, ["破碎"], ["刀背格挡"], True, set())
         self.assertEqual("刀背格挡", chosen["name"])
         self.assertIn("会被打死", reason)
-        self.assertEqual("孢子", battle.choose_play(cards, 3, ["破碎"], ["刀背格挡"], False, set())[0]["name"])
+        self.assertEqual("破碎", battle.choose_play(cards, 3, ["破碎"], ["刀背格挡"], False, set())[0]["name"])
+        self.assertEqual("孢子", battle.choose_play(cards, 3, [], ["刀背格挡"], False, set())[0]["name"])
+
+    def test_defense_recognized_by_name_without_list(self):
+        # 护盾、回血牌在游戏里都标「基本技能」，按牌名里的字自动认，不用把每张都填进防御卡牌列表
+        for name in ("刀背格挡", "冰壁", "寒霜盾牌", "紧急治疗"):
+            self.assertTrue(battle.is_defense(card(name, 1), []), name)
+        self.assertFalse(battle.is_defense(card("盾击", 1, "攻击"), []))  # 攻击牌带「盾」字不算
+        self.assertFalse(battle.is_defense(card("斗志", 1), []))
+        self.assertTrue(battle.is_defense(card("斗志", 1), ["斗志"]))  # 列表用来补充认不出的
+        cards = [card("破碎", 2, "攻击"), card("冰壁", 2, "技能", key="2")]
+        self.assertEqual("冰壁", battle.choose_play(cards, 2, ["破碎"], [], True, set())[0]["name"])
 
     def test_unknown_cost_is_tried_but_not_when_no_cost_left(self):
         cards = [card("未识别1", None)]
@@ -248,6 +287,13 @@ class TestPlayTurn(unittest.TestCase):
             patcher = mock.patch.object(battle, name, fn)
             patcher.start()
             self.addCleanup(patcher.stop)
+
+    def test_lowered_hand_ends_turn_without_trying_cards(self):
+        labels = [Box(700, 1260, 150, 40, name="基本攻击"), Box(1200, 1270, 100, 40, name="攻击")]
+        self.task.all_texts = labels
+        with mock.patch.object(battle, "read_remaining_cost", lambda task, frame: None):
+            battle.play_turn(self.task, 2, True)
+        self.assertEqual(["e"], self.keys)  # 读不到费用的斗志、3 费的破碎都不试，直接结束回合
 
     def test_ap_insufficient_marks_card(self):
         battle.play_turn(self.task, 1, True)

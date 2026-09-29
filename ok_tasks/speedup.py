@@ -34,6 +34,7 @@ _move_and_click 点击前还固定悬停 0.5 秒，实际界面通常不到 1 �
    按键后连续两次截图都有变化才算上滑，上滑后再等 0.15 秒才回车。
    结束回合（按 E）前再确认：出过牌 3 秒内不按（新抽的牌可能还没到手、网络卡顿），按过 E 后 5 秒内不再按
    （连按的 E 可能落到我方下一回合），并且要连续两轮都判断该结束回合才按。
+   出牌逻辑确认 AP 已用完时（end_turn_sure）只要求出过牌 1 秒、不再确认第二轮：实跑中每回合最后一张牌到按 E 要等 4~5 秒。
 
 另外修正一处与速度无关的问题：OCR 有时把一个按钮的文字切成两个框（实测国际服的「赋予灵光一闪」被切成
 「赋予灵光-」和「一闪」），而处理函数是拿固定的一个点去找按钮，这个点会落进两框之间的空隙，
@@ -126,6 +127,7 @@ _HAND_STILL = 0.02      # 按键前手牌区连续两次截图变化 <2% 视为�
 _HAND_STILL_MAX = 0.5   # 手牌区一直在动时，按键前最多等这么久
 # 结束回合（按 E）前的确认：出牌太快时新抽的牌可能还没到手，网络卡顿时画面也会停一下
 _END_TURN_AFTER_PLAY = 3.0  # 出过牌后至少这么久才结束回合
+_END_TURN_AFTER_PLAY_SURE = 1.0  # 出牌逻辑确认 AP 已用完时，出过牌后只需等这么久
 _END_TURN_REPEAT = 5.0      # 按过 E 后这么久内不再按（结束回合的动画期间按钮还在）
 _END_TURN_CONFIRM = 0.8     # 要连续两轮都判断该结束回合，两次至少相隔这么久
 _END_TURN_STALE = 4.0       # 第一次判断距今超过这么久就作废，重新确认
@@ -189,6 +191,7 @@ def install(task):
         "battle_left": False,  # 出牌途中已离开战斗页面（弹出了选择页面）
         # 结束回合的确认：上次出牌/按 E 的时刻、第一次判断该结束回合的时刻
         "last_play_key": 0.0, "last_end_turn": 0.0, "end_turn_seen": 0.0, "end_turn_reason": None,
+        "end_turn_sure": False,  # 出牌逻辑确认 AP 已用完（utils_battle._end_turn 设置）
     }
     task._speedup = st
     if not st["gate_ok"]:
@@ -856,12 +859,17 @@ def _end_turn_allowed(task, st):
     """按 E 结束回合前再确认一次：
     - 出过牌后 _END_TURN_AFTER_PLAY 秒内不结束：新抽的牌可能还没到手，网络卡顿时手牌也会晚一点刷新；
     - 按过 E 后 _END_TURN_REPEAT 秒内不再按：结束回合的动画期间按钮还在，连按的 E 可能落到我方下一回合；
-    - 要连续两轮（至少相隔 _END_TURN_CONFIRM 秒）都判断该结束回合，才真正按 E。"""
+    - 要连续两轮（至少相隔 _END_TURN_CONFIRM 秒）都判断该结束回合，才真正按 E；
+    - 出牌逻辑确认 AP 已用完时（end_turn_sure），出过牌 _END_TURN_AFTER_PLAY_SURE 秒后直接按，不再确认第二轮。"""
     now = time.time()
+    sure, st["end_turn_sure"] = st.get("end_turn_sure", False), False
     if now - st["last_end_turn"] < _END_TURN_REPEAT:
         reason = f"{_END_TURN_REPEAT:g} 秒内刚按过 E"
-    elif now - st["last_play_key"] < _END_TURN_AFTER_PLAY:
+    elif now - st["last_play_key"] < (_END_TURN_AFTER_PLAY_SURE if sure else _END_TURN_AFTER_PLAY):
         reason = "刚出过牌，等手牌刷新"
+    elif sure:
+        st.update(end_turn_seen=0.0, last_end_turn=now, end_turn_reason=None)
+        return True
     elif not st["end_turn_seen"] or now - st["end_turn_seen"] > _END_TURN_STALE:
         st["end_turn_seen"] = now
         reason = "下一轮再确认一次手牌确实打完了"

@@ -4,8 +4,8 @@
 
 出牌规则（每次只出一张，出完下一帧重新观察）：
 1. 只考虑出得起的牌：读到费用的按费用判断；读不到的先试着出，没打出去（手牌数和 AP 都没减少）就本回合不再出。
-2. 顺序：崩溃牌 → 预计会被打死时先出防御牌 → 0 费牌 → 强化牌 → 攻击牌 → 技能/防御/其余牌；
-   「出牌优先级」只决定同一类牌里谁先出，同一优先级先出便宜的。
+2. 顺序：崩溃牌 → 预计会被打死时先出防御牌 → 「出牌优先级」里的牌（按列表顺序）→ 0 费牌 → 强化牌 → 攻击牌
+   → 技能/防御/其余牌；同一类牌里按出牌优先级、再按费用从低到高。
 3. 没有出得起的牌就按 E 结束回合。
 攻击牌拖到目标身上打出（见 docs/adr/0001）：Boss 战优先打 Boss；否则集中打同一个敌人直到它死，
 第一个目标按「攻击意图优先、行动倒计时小的优先、血少的优先」挑。非攻击牌仍用数字键 + 回车。
@@ -24,7 +24,8 @@ import numpy as np
 
 import battle_log
 import config_io
-from utils import _get_config_value, _move_and_click, _normalize_text
+from ok import Box
+from utils import _get_config_value, _move_and_click, _normalize_text, _simplify_texts
 
 DEFENSE_KEY = "防御卡牌列表"
 FINE_KEY = "精细化战斗"
@@ -53,6 +54,8 @@ _ICON_THRESHOLD = 0.45     # 白色笔画重合度：已收集的图标里不同
 _GLYPH_FRAC = 0.75
 _GLYPH_MIN_PIXELS = 30
 _AP_SHORT = re.compile(r"AP\s*不足", re.IGNORECASE)
+# 牌名里带这些字的非攻击牌算保命牌（加护盾、回血）
+_DEFENSE_WORDS = ("盾", "格挡", "壁", "屏障", "防御", "防护", "守护", "治", "愈", "疗", "恢复", "回复", "再生", "包扎")
 _EXTRA_WAIT_CARDS = ("极光", "万众英雄")  # 打出后动画较长，沿用原逻辑额外等 2 秒
 _STUCK_LIMIT = 3            # 同一张牌连续这么多次还在手里（又没提示 AP不足），本回合不再出它
 _DRAG_FAIL_LIMIT = 2        # 拖动连续这么多次没打出去，改用按键 + 回车打默认目标
@@ -67,7 +70,7 @@ def install(task):
     task.default_config[DEFENSE_KEY] = []
     task.default_config[FINE_KEY] = True
     task.default_config[COLLECT_KEY] = False
-    task.config_description[DEFENSE_KEY] = "给我方加护盾的牌；预计这回合会被打死时，先给这些牌留出费用"
+    task.config_description[DEFENSE_KEY] = "保命牌（加护盾、回血）：牌名带「盾」「格挡」「壁」「治」「疗」「恢复」等字的会自动认出，这里只需补充认不出的牌；预计这回合会被打死时先出这些牌"
     task.config_description[FINE_KEY] = "出牌前用击杀预览挑目标（当前版本尚未实现预览，行为与关闭相同）；关闭时集中打同一个敌人直到它死"
     task.config_description[COLLECT_KEY] = "前期收集数据用：遇到没见过的意图图标时点开怪物信息面板读出意图并记下图标，会变慢；图标收集够后关闭"
     config_io.UI_ONLY_CONFIG_KEYS.add(COLLECT_KEY)
@@ -195,6 +198,8 @@ def incoming_lethal(task):
 
 _HAND_CENTER = 0.471        # 手牌扇形正中那张牌的牌名左端 x
 _HAND_AREA = (0.15, 0.68, 0.86, 0.905)
+_HAND_STRIP = (0.15, 0.66, 0.86, 0.95)   # 补读牌名时裁剪的手牌区
+_LOWERED_LABEL_Y = 0.83     # 类型标签最高的一个都在这以下：手牌沉下去了（实测正常 ≤0.79，沉下去 ≥0.87）
 _CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩❶❷❸❹❺❻❼❽❾❿"
 
 
@@ -205,6 +210,32 @@ def hand_slots(count):
         return []
     spacing = min(0.1375, 1 / (1.79 * count - 0.1))
     return [_HAND_CENTER + (i - (count - 1) / 2) * spacing for i in range(count)]
+
+
+def _hand_strip_boxes(task):
+    """手牌区裁出来放大两倍 OCR，文字框换回整屏坐标、繁体转简体（与 task.all_texts 一致）。"""
+    x1, y1, x2, y2 = _HAND_STRIP
+    image = cv2.resize(_crop(task.frame, _HAND_STRIP), None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    sx, sy = task.width / task.frame.shape[1] / 2, task.height / task.frame.shape[0] / 2
+    try:
+        with _OCR_LOCK:
+            found = task.ocr(frame=image)
+    except Exception as e:  # OCR 失败不影响出牌，按读不到处理
+        task.log_info(f"手牌区补读 OCR 失败：{e}")
+        return []
+    boxes = [Box(int(b.x * sx + x1 * task.width), int(b.y * sy + y1 * task.height), int(b.width * sx),
+                 int(b.height * sy), confidence=b.confidence, name=b.name) for b in found]
+    return _simplify_texts(boxes)
+
+
+def hand_lowered(task):
+    """AP 用完后整排手牌会沉下去并变暗：牌上的类型标签从 y≈0.78 降到 0.87 以下。
+    这时剩余费用那个灰色的「0」OCR 怎么处理都读不出来，靠这个判断 AP 已经用完。"""
+    x1, _, x2, _ = _HAND_AREA
+    labels = [(b.y + b.height / 2) / task.height for b in task.all_texts
+              if x1 <= b.x / task.width <= x2 and b.y / task.height > 0.6 and len(b.name.strip()) <= 8
+              and _type_of(b.name)]
+    return bool(labels) and min(labels) > _LOWERED_LABEL_Y
 
 
 def read_hand(task, count):
@@ -219,32 +250,45 @@ def read_hand(task, count):
     names = [[] for _ in slots]
     types = [[] for _ in slots]
     progress = [None for _ in slots]
-    for box in task.all_texts:
-        left, top = box.x / task.width, box.y / task.height
-        cy = (box.y + box.height / 2) / task.height
-        if not (x1 <= left <= x2 and y1 <= cy <= y2):
-            continue
-        index = min(range(len(slots)), key=lambda i: abs(slots[i] - left))
-        if abs(slots[index] - left) > 0.45 * spacing + 0.012:
-            continue
-        text = box.name.strip()
-        # 崩溃牌在费用位置显示「已打张数/所需张数」，已打张数常被漏读（只读到「/5」），读不到记为 None
-        # 「1/5」常被读成「17/5」「175」：只有干净的「数字/数字」才采信已打张数，所需张数取「崩」字前那一位
-        clean = re.match(r"^(\d)\s*/\s*(\d)(?!\d)", text)
-        total = re.search(r"(\d)\s*崩", text)
-        if clean:
-            progress[index] = (int(clean.group(1)), int(clean.group(2)))
-        elif total:
-            progress[index] = (None, int(total.group(1)))
-        card_type = _type_of(text) if len(text) <= 8 else None
-        if card_type:
-            types[index].append(card_type)
-            continue
-        hint = re.match(r"^(\d)(?=\D)", text)  # 「3禿鷹髮」：费用数字和牌名连成了一个框
-        cleaned = re.sub(rf"^[\d{_CIRCLED}\s]+", "", text)
-        cleaned = re.sub(r"[（(]?\s*极强\s*[）)]?|\s*L[Vv]\.?\s*\d*$", "", cleaned).strip()
-        if len(cleaned) >= 2 and not re.search(r"\d+\s*/\s*\d+", cleaned) and "攻" not in cleaned[:1]                 and cleaned not in ("基本", "基础"):  # 「基本攻击」被拆开时剩下的「基本」不是牌名
-            names[index].append((len(cleaned), cleaned, top, int(hint.group(1)) if hint else None))
+
+    def collect(boxes, only=None):
+        for box in boxes:
+            left, top = box.x / task.width, box.y / task.height
+            cy = (box.y + box.height / 2) / task.height
+            if not (x1 <= left <= x2 and y1 <= cy <= y2):
+                continue
+            index = min(range(len(slots)), key=lambda i: abs(slots[i] - left))
+            if abs(slots[index] - left) > 0.45 * spacing + 0.012 or (only is not None and index not in only):
+                continue
+            text = box.name.strip()
+            # 崩溃牌在费用位置显示「已打张数/所需张数」，已打张数常被漏读（只读到「/5」），读不到记为 None
+            # 「1/5」常被读成「17/5」「175」：只有干净的「数字/数字」才采信已打张数，所需张数取「崩」字前那一位
+            clean = re.match(r"^(\d)\s*/\s*(\d)(?!\d)", text)
+            total = re.search(r"(\d)\s*崩", text)
+            if clean:
+                progress[index] = (int(clean.group(1)), int(clean.group(2)))
+            elif total:
+                progress[index] = (None, int(total.group(1)))
+            card_type = _type_of(text) if len(text) <= 8 else None
+            if card_type:
+                types[index].append(card_type)
+                continue
+            hint = re.match(r"^(\d)(?=\D)", text)  # 「3禿鷹髮」：费用数字和牌名连成了一个框
+            cleaned = re.sub(rf"^[\d{_CIRCLED}\s]+", "", text)
+            # 牌名后的括号词条「（极强）」「（屠戮）」和等级「Lv.3」不是牌名；括号词条常被单独读成一个框，
+            # 以前按「最长的文字」取牌名，「破碎」被同一位置上的「（屠戮)」顶掉，出牌优先级就匹配不上了
+            cleaned = re.sub(r"[（(][^）)]*[）)]?|\s*L[Vv]\.?\s*\d*$", "", cleaned)
+            cleaned = re.sub(r"[A-Za-z\s]+$", "", cleaned).strip()  # 牌名都是中文，末尾的字母是杂字（「鞭J」）
+            # 「攻」「技」开头的是没认出来的类型标签（「技育」「攻雪」），不是牌名
+            if len(cleaned) >= 2 and not re.search(r"\d+\s*/\s*\d+", cleaned) and cleaned[:1] not in ("攻", "技") \
+                    and cleaned not in ("基本", "基础"):  # 「基本攻击」被拆开时剩下的「基本」不是牌名
+                names[index].append((len(cleaned), cleaned, top, int(hint.group(1)) if hint else None))
+
+    collect(task.all_texts)
+    missing = {i for i in range(len(slots)) if not names[i]}
+    if missing and getattr(task, "frame", None) is not None:
+        # 整屏 OCR 漏读的牌名（压在亮色卡图上、或 AP 用完后整排手牌变暗）：手牌区单独裁出来放大再读一次，只补没读到的位置
+        collect(_hand_strip_boxes(task), missing)
     cards = []
     for i, x in enumerate(slots):
         best = max(names[i]) if names[i] else None
@@ -491,6 +535,14 @@ def _matches(name, candidates):
     return any(c and (c in name or name in c) for c in candidates)
 
 
+def is_defense(card, defense):
+    """保命牌：给我方加护盾或回血的牌。游戏里它们都标「基本技能/技能」，和别的技能分不开，
+    所以按牌名认：带「盾」「格挡」「治」「疗」这类字的非攻击牌自动算，「防御卡牌列表」只用来补充认不出的牌。"""
+    if _matches(card["name"], defense):
+        return True
+    return card["type"] != "攻击" and any(word in card["name"] for word in _DEFENSE_WORDS)
+
+
 def _blocked(card, unplayable):
     """这张牌是否已被记为本回合出不起。按牌名比对时允许一方包含另一方：
     OCR 会在牌名前后多读出杂字（「黑暗斩击」「日黑暗斩击」「B黑暗斩击」是同一张牌）。
@@ -513,9 +565,8 @@ def choose_play(cards, remaining, priority, defense, lethal, unplayable):
     """挑这一次要出的牌。cards 为 [{name, key, type, cost}]，cost 读不到为 None；remaining 读不到为 None。
     unplayable 里是本回合出不起的牌名或位置（「按键/手牌数」）。返回 (牌, 理由)；没有能出的牌时返回 (None, 理由)。
 
-    顺序：崩溃牌 → 会被打死时先出防御牌 → 0 费牌 → 强化牌 → 攻击牌 → 技能/防御/其余牌。
-    「出牌优先级」只决定同一类牌里谁先出，同一优先级先出便宜的。
-    （以前出牌优先级排在最前，回合一开始就用 3 费的牌把 AP 花光，强化牌和便宜的攻击牌都出不了。）"""
+    顺序：崩溃牌 → 会被打死时先出防御牌 → 「出牌优先级」里的牌（按列表顺序）→ 0 费牌 → 强化牌 → 攻击牌 → 技能/防御/其余牌。
+    「出牌优先级」里的牌不看类型：类型常被读错（实跑中「破碎」读不出类型，排到了其余牌里，被普通攻击牌抢先）。"""
     def affordable(card):
         if _blocked(card, unplayable) or card.get("key") is None:
             return False
@@ -543,17 +594,18 @@ def choose_play(cards, remaining, priority, defense, lethal, unplayable):
     playable = [c for c in cards if affordable(c) and c["type"] != "崩溃"]
     if not playable:
         return None, "没有出得起的牌"
-    is_defense = lambda c: _matches(c["name"], defense)
     steps = (
         # 2. 这回合会被打死：先把防御牌出了
-        ([c for c in playable if is_defense(c)] if lethal else [], "预计会被打死，先出防御牌"),
-        # 3. 0 费牌白出，可能带增益或抽牌
+        ([c for c in playable if is_defense(c, defense)] if lethal else [], "预计会被打死，先出防御牌"),
+        # 3. 用户在「出牌优先级」里指定的牌
+        ([c for c in playable if _priority_rank(c, priority)[1]], "指定优先出的牌"),
+        # 4. 0 费牌白出，可能带增益或抽牌
         ([c for c in playable if c["cost"] == 0], "0 费牌"),
-        # 4. 强化牌先上，后面的攻击才吃得到加成
+        # 5. 强化牌先上，后面的攻击才吃得到加成
         ([c for c in playable if c["type"] == "强化"], "强化牌"),
-        # 5. 攻击牌
-        ([c for c in playable if c["type"] == "攻击" and not is_defense(c)], "攻击牌"),
-        # 6. 剩下的：技能、防御和认不出类型的牌
+        # 6. 攻击牌
+        ([c for c in playable if c["type"] == "攻击" and not is_defense(c, defense)], "攻击牌"),
+        # 7. 剩下的：技能、防御和认不出类型的牌
         (playable, "其余牌"),
     )
     for group, reason in steps:
@@ -726,6 +778,10 @@ def play_turn(task, hand_count, finish_turn_visible):
     pending = {c["name"]: _POOL.submit(_card_cost, task, frame, c) for c in cards
                if not c["name"].startswith("未识别") and c["name"] not in state["costs"]}
     remaining = remaining_job.result()
+    if remaining is None and hand_lowered(task):
+        # 实跑中 AP 用完后读不到「0」，把每张牌都按一遍才结束回合，每回合白等 10 秒
+        remaining = 0
+        task.log_info("手牌沉下去变暗：AP 已用完")
     if remaining is not None and state["last_remaining"] is not None and remaining > state["last_remaining"]:
         _new_turn(state)  # 费用回满：新回合（也可能是某张牌加了费用，同样应该重新判断）
     state["last_remaining"] = remaining
@@ -760,7 +816,7 @@ def play_turn(task, hand_count, finish_turn_visible):
     defense = _get_config_value(task, DEFENSE_KEY, [])
     hp = read_hp(task)
     lethal, after = False, 1.0
-    if remaining and any(_matches(c["name"], defense) for c in cards):
+    if remaining and any(is_defense(c, defense) for c in cards):
         lethal, after = incoming_lethal(task)  # 只有手里有防御牌时才值得花时间读预计扣血
 
     card, reason = choose_play(cards, remaining, priority, defense, lethal, state["unplayable"])
@@ -773,7 +829,8 @@ def play_turn(task, hand_count, finish_turn_visible):
     }
     if card is None:
         battle_log.record(task, "结束回合", reason=reason, **observed)
-        return _end_turn(task, reason)
+        # AP 确实用完（读到 0 或手牌沉下去）且没有 0 费牌可出：加速模式不必再等 3 秒、再确认一轮
+        return _end_turn(task, reason, sure=remaining == 0)
 
     target, target_reason = None, None
     use_drag = _use_drag(task, state, card)
@@ -812,9 +869,12 @@ def _drag_card(task, card, target):
     task.sleep(1)
 
 
-def _end_turn(task, reason):
+def _end_turn(task, reason, sure=False):
     task.log_info(f"结束回合：{reason}")
     _state(task)["ended"] = True
+    speed = getattr(task, "_speedup", None)
+    if speed is not None:
+        speed["end_turn_sure"] = sure
     task.send_key("e")
     task.sleep(1)
     return True
