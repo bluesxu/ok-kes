@@ -4,7 +4,7 @@
 
 出牌规则（每次只出一张，出完下一帧重新观察）：
 1. 只考虑出得起的牌：读到费用的按费用判断；读不到的先试着出，没打出去（手牌数和 AP 都没减少）就本回合不再出。
-2. 顺序：崩溃牌 → 预计会被打死时先出防御牌 → 「出牌优先级」里的牌（按列表顺序）→ 0 费牌 → 强化牌 → 攻击牌
+2. 顺序：崩溃牌 → 预计挨打后会被打死或血量低于「防御血量线」时先出防御牌 → 「出牌优先级」里的牌（按列表顺序）→ 0 费牌 → 强化牌 → 攻击牌
    → 技能/防御/其余牌；同一类牌里按出牌优先级、再按费用从低到高。
 3. 没有出得起的牌就按 E 结束回合。
 攻击牌拖到目标身上打出（见 docs/adr/0001）：Boss 战优先打 Boss；否则集中打同一个敌人直到它死，
@@ -30,12 +30,14 @@ from utils import _get_config_value, _move_and_click, _normalize_text, _simplify
 DEFENSE_KEY = "防御卡牌列表"
 FINE_KEY = "精细化战斗"
 COLLECT_KEY = "意图采集"
+DANGER_KEY = "防御血量线(%)"
 
 ICON_DIR = os.path.join("configs", "battle_icons")
 INTENT_ATTACK, INTENT_DEFENSE, INTENT_BUFF = "攻击", "防御", "增益"
 
 # ---- 画面坐标（相对屏幕，基准 16:9） ----
 _REMAIN_REGION = (0.47, 0.88, 0.53, 0.96)          # 手牌下方中央的剩余费用
+_AP_DIGIT_BOX = (0.488, 0.903, 0.513, 0.953)       # 剩余费用数字本身（比 _REMAIN_REGION 紧，不含上方卡面）
 _HP_TEXT_REGION = (0.10, 0.0, 0.33, 0.07)          # 我方血量「当前/上限」
 _SHIELD_REGION = (0.40, 0.0, 0.48, 0.09)           # 我方护盾数值
 _HP_BAR_X = (0.015, 0.42)                          # 我方血条横向范围
@@ -58,9 +60,16 @@ _AP_SHORT = re.compile(r"AP\s*不足", re.IGNORECASE)
 _DEFENSE_WORDS = ("盾", "格挡", "壁", "屏障", "防御", "防护", "守护", "治", "愈", "疗", "恢复", "回复", "再生", "包扎")
 _EXTRA_WAIT_CARDS = ("极光", "万众英雄")  # 打出后动画较长，沿用原逻辑额外等 2 秒
 _STUCK_LIMIT = 3            # 同一张牌连续这么多次还在手里（又没提示 AP不足），本回合不再出它
+_BUTTON_GONE_LIMIT = 30     # 「结束回合」按钮消失这么多秒还没回来，就不再当作敌人行动中干等
 _DRAG_FAIL_LIMIT = 2        # 拖动连续这么多次没打出去，改用按键 + 回车打默认目标
 _RED_SAMPLES = 4            # 读预计扣血时连续取样的帧数（红色段是闪烁的）
 _RED_INTERVAL = 0.25
+_EGO_SLOTS = (("F1", 0.714), ("F2", 0.817), ("F3", 0.904))  # 左下角三个 Ego 头像上费用框的中心 y
+_EGO_COST_X = (0.057, 0.070)   # 费用框横向范围（取框内底色，不含边框）
+_EGO_READY = 0.4               # 费用框浅青色像素占比超过这个值：放得起（实测 0.60~0.84；放不起是灰色、空槽是暗的，都为 0）
+_EGO_TRIES = 2                 # 同一个 Ego 每回合最多按几次（按了没放出去就不再反复按）
+_EP_FULL_POINT = (0.032, 0.947)  # EP 条最下面一格：亮了就是满格
+_AP_ZERO_GRAY = 0.3         # 剩余费用数字区域灰色像素超过这个比例：AP 为 0（灰色空心的「0」，实测 0.42~0.50，白色数字 ≤0.001）
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="出牌识别")  # 几块区域的裁剪识别并行跑
 _OCR_LOCK = threading.Lock()
 
@@ -70,7 +79,9 @@ def install(task):
     task.default_config[DEFENSE_KEY] = []
     task.default_config[FINE_KEY] = True
     task.default_config[COLLECT_KEY] = False
-    task.config_description[DEFENSE_KEY] = "保命牌（加护盾、回血）：牌名带「盾」「格挡」「壁」「治」「疗」「恢复」等字的会自动认出，这里只需补充认不出的牌；预计这回合会被打死时先出这些牌"
+    task.default_config[DANGER_KEY] = 25
+    task.config_description[DEFENSE_KEY] = "保命牌（加护盾、回血）：牌名带「盾」「格挡」「壁」「治」「疗」「恢复」等字的会自动认出，这里只需补充认不出的牌；预计这回合会被打死、或挨打后血量低于「防御血量线」时先出这些牌"
+    task.config_description[DANGER_KEY] = "预计敌人这一轮打完后我方血量低于上限的百分之几，就先出保命牌；0 为只在会被打死时才出"
     task.config_description[FINE_KEY] = "出牌前用击杀预览挑目标（当前版本尚未实现预览，行为与关闭相同）；关闭时集中打同一个敌人直到它死"
     task.config_description[COLLECT_KEY] = "前期收集数据用：遇到没见过的意图图标时点开怪物信息面板读出意图并记下图标，会变慢；图标收集够后关闭"
     config_io.UI_ONLY_CONFIG_KEYS.add(COLLECT_KEY)
@@ -136,6 +147,24 @@ def read_remaining_cost(task, frame):
     return _read_digit(task, frame, _REMAIN_REGION)
 
 
+def ap_zero_outline(frame):
+    """剩余费用为 0 时游戏把数字画成灰色空心的「0」，中间透出后面的卡面，OCR 怎么处理都读不出来；
+    1 以上是白色实心数字。按颜色判断：数字区域里灰色像素占比高就是 0。"""
+    crop = _crop(frame, _AP_DIGIT_BOX)
+    if crop is None or crop.size == 0:
+        return False
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    gray = (hsv[:, :, 2] > 95) & (hsv[:, :, 2] < 185) & (hsv[:, :, 1] < 35)
+    return gray.mean() >= _AP_ZERO_GRAY
+
+
+def in_danger(hp, after, line):
+    """挨完这一轮打，剩余血量是否低于上限的 line%。after 是 incoming_lethal 读出的「剩余血量 / 当前血量」。"""
+    if not hp or not line or after >= 1:
+        return False
+    return after * hp[0] < hp[1] * line / 100
+
+
 def ap_insufficient(task):
     return any(_AP_SHORT.search(box.name) for box in task.all_texts)
 
@@ -147,7 +176,9 @@ def read_hp(task):
         cx, cy = _rel(task, box)
         match = re.search(r"(\d+)\s*/\s*(\d+)", box.name)
         if match and x1 <= cx <= x2 and y1 <= cy <= y2:
-            return int(match.group(1)), int(match.group(2))
+            current, maximum = int(match.group(1)), int(match.group(2))
+            if 0 < maximum and current <= maximum:  # 实跑中读出过 6177/1768、16657/1667（多读了一位）
+                return current, maximum
     return None
 
 
@@ -193,7 +224,7 @@ def incoming_lethal(task):
         red_start, end = hp_bar_red(frame)
         if red_start is not None and end and end > _HP_BAR_LEFT:
             worst = min(worst, max(0.0, (red_start - _HP_BAR_LEFT) / (end - _HP_BAR_LEFT)))
-    return worst <= 0.01, worst
+    return bool(worst <= 0.01), float(worst)
 
 
 _HAND_CENTER = 0.471        # 手牌扇形正中那张牌的牌名左端 x
@@ -561,11 +592,11 @@ def _priority_rank(card, priority):
     return len(priority), None
 
 
-def choose_play(cards, remaining, priority, defense, lethal, unplayable):
+def choose_play(cards, remaining, priority, defense, danger, unplayable):
     """挑这一次要出的牌。cards 为 [{name, key, type, cost}]，cost 读不到为 None；remaining 读不到为 None。
     unplayable 里是本回合出不起的牌名或位置（「按键/手牌数」）。返回 (牌, 理由)；没有能出的牌时返回 (None, 理由)。
 
-    顺序：崩溃牌 → 会被打死时先出防御牌 → 「出牌优先级」里的牌（按列表顺序）→ 0 费牌 → 强化牌 → 攻击牌 → 技能/防御/其余牌。
+    顺序：崩溃牌 → 预计会被打死或血量过低（danger）时先出防御牌 → 「出牌优先级」里的牌（按列表顺序）→ 0 费牌 → 强化牌 → 攻击牌 → 技能/防御/其余牌。
     「出牌优先级」里的牌不看类型：类型常被读错（实跑中「破碎」读不出类型，排到了其余牌里，被普通攻击牌抢先）。"""
     def affordable(card):
         if _blocked(card, unplayable) or card.get("key") is None:
@@ -595,8 +626,8 @@ def choose_play(cards, remaining, priority, defense, lethal, unplayable):
     if not playable:
         return None, "没有出得起的牌"
     steps = (
-        # 2. 这回合会被打死：先把防御牌出了
-        ([c for c in playable if is_defense(c, defense)] if lethal else [], "预计会被打死，先出防御牌"),
+        # 2. 这回合会被打死或打残：先把防御牌出了
+        ([c for c in playable if is_defense(c, defense)] if danger else [], "预计会被打死或血量过低，先出防御牌"),
         # 3. 用户在「出牌优先级」里指定的牌
         ([c for c in playable if _priority_rank(c, priority)[1]], "指定优先出的牌"),
         # 4. 0 费牌白出，可能带增益或抽牌
@@ -648,7 +679,32 @@ def _state(task):
 
 def _new_turn(state):
     # collected：本回合已经点开看过意图的敌人（意图每回合会变，所以每回合每个敌人最多采集一次）
-    state.update(unplayable=set(), attempts={}, costs={}, last=None, collected=set())
+    # ego_tries：本回合每个 Ego 按过几次
+    state.update(unplayable=set(), attempts={}, costs={}, last=None, collected=set(), ego_tries={})
+
+
+def _start_turn_if_new(state):
+    """敌人行动完、「结束回合」按钮重新出现：新回合。放 Ego 和出牌都在我方回合开头调用，只会复位一次。
+    不能只靠「剩余 AP 变多」判断——上回合末尾 AP 常读不到，曾因此没认出新回合，
+    上回合记下的「出不起」一直留着，新回合一张牌都不出就结束了。"""
+    if state.get("enemy_phase"):
+        _new_turn(state)
+        state.update(ended=False, enemy_phase=False)
+
+
+def _ensure_battle(task):
+    """超过 20 秒没看到战斗页面就当作新的一场战斗。"""
+    state = _state(task)
+    if not state or time.time() - state.get("last_seen", 0) > 20:
+        start_battle(task)
+    state["last_seen"] = time.time()
+    return state
+
+
+def node_type(task):
+    """当前节点类型（boss / 精英 / 小怪 …）。不用 final_boss_battle：它在路线图上看到 Boss 节点时就被置上，
+    实跑中第 7 节点的小怪、之后各层的小怪和精英都被当成了 Boss 战。"""
+    return (getattr(task, "node_status", None) or {}).get("node_type") or ""
 
 
 def _session(task):
@@ -740,10 +796,7 @@ def _read_costs(task, state, frame, cards, pending):
 
 def play_turn(task, hand_count, finish_turn_visible):
     """战斗页面一帧：看一眼、出一张牌或结束回合。返回 True 表示本帧已处理。"""
-    state = _state(task)
-    if not state or time.time() - state.get("last_seen", 0) > 20:
-        start_battle(task)
-    state["last_seen"] = time.time()
+    state = _ensure_battle(task)
     frame = task.frame
 
     # 上一张牌提示「AP不足」：记为本回合出不起，这一帧不再出牌
@@ -757,12 +810,9 @@ def play_turn(task, hand_count, finish_turn_visible):
     if not finish_turn_visible:
         if state.get("ended"):
             state["enemy_phase"] = True  # 按过结束回合后「结束回合」按钮消失：轮到敌人行动
-        return True  # 不是我方可操作的时候
-    if state.get("enemy_phase"):
-        # 敌人行动完、按钮重新出现：新回合。不能只靠「剩余 AP 变多」判断——上回合末尾 AP 常读不到，
-        # 曾因此没认出新回合，上回合记下的「出不起」一直留着，新回合一张牌都不出就结束了
-        _new_turn(state)
-        state.update(ended=False, enemy_phase=False)
+        return _wait_for_button(task, state)
+    state.update(button_gone=None, button_reported=False)
+    _start_turn_if_new(state)
 
     cards = read_hand(task, hand_count)
     if not cards:
@@ -778,10 +828,11 @@ def play_turn(task, hand_count, finish_turn_visible):
     pending = {c["name"]: _POOL.submit(_card_cost, task, frame, c) for c in cards
                if not c["name"].startswith("未识别") and c["name"] not in state["costs"]}
     remaining = remaining_job.result()
-    if remaining is None and hand_lowered(task):
-        # 实跑中 AP 用完后读不到「0」，把每张牌都按一遍才结束回合，每回合白等 10 秒
+    if remaining is None and (ap_zero_outline(frame) or hand_lowered(task)):
+        # 实跑中 AP 用完后读不到灰色的「0」，把每张牌都按一遍才结束回合。按键后手牌要过一会儿才沉下去，
+        # 所以先看数字颜色，手牌沉下去作为第二个判断
         remaining = 0
-        task.log_info("手牌沉下去变暗：AP 已用完")
+        task.log_info("AP 已用完（灰色的 0 或手牌沉下去）")
     if remaining is not None and state["last_remaining"] is not None and remaining > state["last_remaining"]:
         _new_turn(state)  # 费用回满：新回合（也可能是某张牌加了费用，同样应该重新判断）
     state["last_remaining"] = remaining
@@ -799,10 +850,10 @@ def play_turn(task, hand_count, finish_turn_visible):
             battle_log.anomaly(task, "手牌识别失败", f"手牌数 {hand_count} 但连续 {state['zero_frames']} 帧一张牌名都没读到")
     else:
         state["zero_frames"] = 0
-        if unnamed:
+        if unnamed and remaining != 0:  # AP 用完时手牌变暗，牌名本来就读不全，不算异常
             battle_log.anomaly(task, "牌名没读到", f"按键 {unnamed} 位置上的牌名没读到，仍按位置出牌")
 
-    boss_battle = bool((getattr(task, "node_status", None) or {}).get("final_boss_battle"))
+    boss_battle = node_type(task) == "boss"
     if _get_config_value(task, COLLECT_KEY, False):
         # 每回合每个敌人最多点开一次：读不出意图（比如没见过的写法）也不会反复点，卡在同一个画面
         unknown = next((e for e in enemies if e["intent"] is None
@@ -818,19 +869,19 @@ def play_turn(task, hand_count, finish_turn_visible):
     lethal, after = False, 1.0
     if remaining and any(is_defense(c, defense) for c in cards):
         lethal, after = incoming_lethal(task)  # 只有手里有防御牌时才值得花时间读预计扣血
+    danger = lethal or in_danger(hp, after, _get_config_value(task, DANGER_KEY, 25))
 
-    card, reason = choose_play(cards, remaining, priority, defense, lethal, state["unplayable"])
+    card, reason = choose_play(cards, remaining, priority, defense, danger, state["unplayable"])
     observed = {
         "hand_count": hand_count, "remaining": remaining, "hp": hp, "shield": read_shield(task),
-        "hp_after_ratio": round(after, 3), "lethal": lethal,
+        "hp_after_ratio": round(after, 3), "lethal": lethal, "danger": danger,
         "cards": [{k: c.get(k) for k in ("name", "key", "type", "cost")} for c in cards],
         "enemies": [{k: e[k] for k in ("x", "y", "hp", "shield", "countdown", "intent")} for e in enemies],
         "unplayable": sorted(state["unplayable"]),
     }
     if card is None:
-        battle_log.record(task, "结束回合", reason=reason, **observed)
         # AP 确实用完（读到 0 或手牌沉下去）且没有 0 费牌可出：加速模式不必再等 3 秒、再确认一轮
-        return _end_turn(task, reason, sure=remaining == 0)
+        return _end_turn(task, reason, sure=remaining == 0, observed=observed)
 
     target, target_reason = None, None
     use_drag = _use_drag(task, state, card)
@@ -869,12 +920,92 @@ def _drag_card(task, card, target):
     task.sleep(1)
 
 
-def _end_turn(task, reason, sure=False):
+def _wait_for_button(task, state):
+    """「结束回合」按钮不在：一般是敌人在行动，这一帧什么也不做。
+    实跑中出现过按钮一直不回来（画面上能读到手牌数，但盖着别的页面）：以前每帧都默默等，卡了 13 分钟只能手动撤退。
+    按钮消失超过 _BUTTON_GONE_LIMIT 秒就不再占着这一帧，让后面的页面处理函数（弹窗、选择页等）接手，
+    并存一张截图、记下画面上的文字，方便查是什么页面。"""
+    now = time.time()
+    if not state.get("button_gone"):
+        state["button_gone"] = now
+    waited = now - state["button_gone"]
+    if waited < _BUTTON_GONE_LIMIT:
+        return True
+    if not state.get("button_reported"):
+        state["button_reported"] = True
+        battle_log.anomaly(task, "结束回合按钮一直不出现",
+                           f"已 {waited:.0f} 秒没看到结束回合按钮，交给其他页面处理函数",
+                           texts=[b.name for b in task.all_texts][:120])
+    return False
+
+
+def ep_full(frame):
+    """EP 条满格：最下面一格亮成浅青色（RGB≈193,255,255）。"""
+    h, w = frame.shape[:2]
+    x, y = int(_EP_FULL_POINT[0] * w), int(_EP_FULL_POINT[1] * h)
+    region = frame[max(0, y - 2):y + 3, max(0, x - 2):x + 3, :3]
+    if region.size == 0:
+        return False
+    b, g, r = cv2.mean(region)[:3]
+    return abs(b - 255) <= 15 and abs(g - 255) <= 15 and abs(r - 193) <= 15
+
+
+def ego_slots(frame):
+    """三个 Ego 是否放得起：费用框是浅青色的放得起，灰色的 EP 不够，暗的是空槽。返回 [{key, y, ready}]。"""
+    slots = []
+    for key, cy in _EGO_SLOTS:
+        crop = _crop(frame, (_EGO_COST_X[0], cy - 0.012, _EGO_COST_X[1], cy + 0.012))
+        ready = False
+        if crop.size:
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            lit = (hsv[:, :, 0] > 80) & (hsv[:, :, 0] < 105) & (hsv[:, :, 1] > 40) & (hsv[:, :, 2] > 180)
+            ready = lit.mean() >= _EGO_READY
+        slots.append({"key": key, "y": cy, "ready": ready})
+    return slots
+
+
+def use_ego(task, finish_turn_visible):
+    """我方回合、出牌之前放 Ego。EP 会带到下一场战斗：Boss 战、精英战放得起就放；
+    其余战斗等 EP 满格再放（不放就溢出浪费）。放得起的里挑费用最高的；目标用回车选默认目标（与按键出牌相同）。
+    返回 True 表示本帧已按键。"""
+    if not finish_turn_visible:
+        return False
+    frame = task.frame
+    kind = node_type(task)
+    full = ep_full(frame)
+    if kind not in ("boss", "精英") and not full:
+        return False
+    state = _ensure_battle(task)
+    _start_turn_if_new(state)
+    tries = state.setdefault("ego_tries", {})
+    ready = [s for s in ego_slots(frame) if s["ready"] and tries.get(s["key"], 0) < _EGO_TRIES]
+    if not ready:
+        return False
+    for slot in ready:
+        slot["cost"] = _read_digit(task, frame, (0.054, slot["y"] - 0.017, 0.073, slot["y"] + 0.017), _ONE_DIGIT)
+    chosen = max(ready, key=lambda s: -1 if s["cost"] is None else s["cost"])
+    tries[chosen["key"]] = tries.get(chosen["key"], 0) + 1
+    reason = f"{kind or '普通'}战斗" + ("，EP 满格" if full else "，放得起就放")
+    task.log_info(f"释放 Ego {chosen['key']}（费用 {chosen['cost'] if chosen['cost'] is not None else '?'}，{reason}）")
+    battle_log.record(task, "释放Ego", key=chosen["key"], cost=chosen["cost"], reason=reason, ep_full=full,
+                      ready=[s["key"] for s in ready], tries=tries[chosen["key"]])
+    task.send_key(chosen["key"])
+    task.sleep(1)
+    task.send_key("enter")
+    task.sleep(4)  # 与原逻辑相同：等 Ego 动画播完
+    return True
+
+
+def _end_turn(task, reason, sure=False, observed=None):
     task.log_info(f"结束回合：{reason}")
     _state(task)["ended"] = True
     speed = getattr(task, "_speedup", None)
     if speed is not None:
         speed["end_turn_sure"] = sure
+        speed["end_turn_deferred"] = False
     task.send_key("e")
+    # 加速模式可能这一轮先不按 E（刚出过牌等手牌刷新）：只在真正按下时记一条，免得战斗记录里每回合结束两次
+    if observed is not None and not (speed is not None and speed.get("end_turn_deferred")):
+        battle_log.record(task, "结束回合", reason=reason, **observed)
     task.sleep(1)
     return True

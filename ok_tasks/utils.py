@@ -42,6 +42,34 @@ def is_subsequence(first: str, second: str) -> bool:
     return all(char in second_iter for char in first)
 
 
+def _flash_rules(task: TriggerTask):
+    """「闪光优先级」规则，写成「牌名:关键词」的只对这张牌生效、排在前面，其余是对所有牌生效的关键词。
+    返回 [(规则原文, 牌名或 None, 关键词)]，保持各自在列表里的先后顺序。"""
+    per_card, common = [], []
+    for rule in _get_card_list(task, "闪光优先级"):
+        if not isinstance(rule, str) or not re.sub(r"\s+", "", rule):
+            continue
+        rule = re.sub(r"\s+", "", rule)
+        parts = re.split(r"[:：]", rule, maxsplit=1)
+        if len(parts) == 2 and parts[0] and parts[1]:
+            per_card.append((rule, parts[0], parts[1]))
+        else:
+            common.append((rule, None, rule))
+    return per_card + common
+
+
+def _flash_rule_matches(rule, card):
+    """一条闪光规则是否命中这张牌。OCR 会把描述的语序打乱、夹杂杂字，关键词按「字依次出现」比对；
+    带牌名的规则先要求牌名对得上（互相包含，OCR 常漏读牌名的一两个字）。"""
+    _, name, keyword = rule
+    card_name = card["name"].strip()
+    if name is not None:
+        if not card_name or not (name in card_name or card_name in name):
+            return False
+        return is_subsequence(keyword, card["description"])
+    return is_subsequence(keyword, card["name"] + "：:" + card["description"])
+
+
 def _move_and_click(task: TriggerTask, x, y):
     """先将鼠标移动到目标位置，等待界面响应后再点击。"""
     page_handler = sys._getframe(1).f_code.co_name
@@ -1310,11 +1338,10 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
     )
     base_card_type = _get_game_text(task, "基础")
     target_member_box = task.box_of_screen(0.079, 0.092, 0.209, 0.675)
-    flash_priority = (
-        _get_card_list(task, "闪光优先级")
-        if action in ("闪光", "灵光")
-        else []
-    )
+    flash_rules = _flash_rules(task) if action in ("闪光", "灵光") else []
+    # 出击模式闪光：选牌页里只列出还能闪光的牌，记下看到过的牌名，用来判断列表里的牌是否已经闪完
+    sortie_flash = action in ("闪光", "灵光") and task.name == "自动出击模式"
+    seen_cards = {}
 
     def record_pending_removal():
         if action == "移除":
@@ -1324,20 +1351,13 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
 
     def filter_flash_priority_cards(cards):
         """闪光时排除已命中闪光优先级的卡牌，避免重复选择。"""
-        if not flash_priority:
+        if not flash_rules:
             return cards
 
         filtered_cards = []
         for card in cards:
-            combined_text = f"{card['name']}：:{card['description']}"
             matched_keyword = next(
-                (
-                    keyword.strip()
-                    for keyword in flash_priority
-                    if isinstance(keyword, str)
-                    and keyword.strip()
-                    and is_subsequence(keyword.strip(), combined_text)
-                ),
+                (rule[0] for rule in flash_rules if _flash_rule_matches(rule, card)),
                 None,
             )
             if matched_keyword:
@@ -1352,7 +1372,11 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
     def refresh_cards():
         task.all_texts = _simplify_texts(task.ocr())
         cards = recognize_cards_in_deck(task, page=page)
-        return filter_flash_priority_cards(cards)
+        cards = filter_flash_priority_cards(cards)
+        for card in cards:
+            if card["name"].strip():
+                seen_cards.setdefault(card["name"].strip(), card)
+        return cards
 
     def click_cards(cards, predicate, reason):
         nonlocal selected
@@ -1570,6 +1594,13 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
             if selected >= count:
                 return True
 
+    if sortie_flash and selected < count:
+        _record_flash_done(task, card_names, seen_cards, page)
+        # 点进闪光时已经扣了信用点，跳过也不退：按出牌优先级、再按攻击牌兜底选一张（2026-09-29 实跑中白跳过十几次）
+        fallback = _flash_fallback_card(task, seen_cards)
+        if fallback and _click_card_from_top(task, fallback, refresh_cards, page):
+            return True
+
     task.all_texts = _simplify_texts(task.ocr())
     action_box = task.box_of_screen(0.424, 0.882, 1.000, 0.999)
     for button_name in ("跳过", "取消"):
@@ -1599,6 +1630,68 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
     click_cards(fallback_cards, lambda card: True, "兜底补选卡牌，点击")
     task.log_info(f"{page}: 兜底处理完成，已选中{selected}/{count}张卡牌")
     return True
+
+
+def _names_match(first, second):
+    """牌名互相包含就算同一张（OCR 常多读或漏读一两个字）。"""
+    first, second = first.strip(), second.strip()
+    return bool(first and second) and (first in second or second in first)
+
+
+def _record_flash_done(task: TriggerTask, card_names, seen_cards, page):
+    """选牌页翻完了：「闪光卡牌列表」里没出现的牌记为本局不用再闪（已经闪过，或本局没拿到）。"""
+    status = getattr(task, "node_status", None)
+    if status is None:
+        return
+    done = status.setdefault("flash_done_cards", [])
+    for name in card_names:
+        if not isinstance(name, str) or not name.strip() or name.strip() in done:
+            continue
+        if not any(_names_match(name, seen) for seen in seen_cards):
+            done.append(name.strip())
+            task.log_info(f"{page}: 选牌页里没有「{name.strip()}」，本局不再为它进闪光")
+
+
+def flash_list_done(task: TriggerTask):
+    """「闪光卡牌列表」里的牌是否都已记为本局不用再闪；列表为空也算（没有想闪的牌）。"""
+    done = (getattr(task, "node_status", None) or {}).get("flash_done_cards", [])
+    names = [name.strip() for name in _get_card_list(task, "闪光卡牌列表") if isinstance(name, str) and name.strip()]
+    return all(name in done for name in names)
+
+
+def _flash_fallback_card(task: TriggerTask, seen_cards):
+    """列表里的牌都不在：按出牌优先级挑，再挑第一张攻击牌，再挑第一张牌。返回牌名。"""
+    for name in _get_card_list(task, "出牌优先级"):
+        if not isinstance(name, str):
+            continue
+        found = next((seen for seen in seen_cards if _names_match(name, seen)), None)
+        if found:
+            return found
+    attack = _get_game_text(task, "攻击")
+    found = next((seen for seen, card in seen_cards.items() if attack in card.get("type", "")), None)
+    return found or next(iter(seen_cards), None)
+
+
+def _click_card_from_top(task: TriggerTask, name, refresh_cards, page, max_scrolls=20):
+    """滚回选牌页顶部，再往下翻找到这张牌并点击。"""
+    for _ in range(max_scrolls):
+        if _point_is_white(task, 0.982, 0.128, page):
+            break
+        _scroll_card_page(task, 0.252, 0.179, 3, page)
+        task.next_frame()
+    for _ in range(max_scrolls):
+        cards = refresh_cards()
+        card = next((c for c in cards if _names_match(name, c["name"]) and not c["selected"]), None)
+        if card:
+            task.log_info(f"{page}: 闪光卡牌列表里的牌都不在，兜底选择「{card['name']}」")
+            _move_and_click(task, card["x"], card["y"])
+            task.sleep(0.3)
+            return True
+        if _point_is_white(task, 0.982, 0.846, page):
+            break
+        _scroll_card_page(task, 0.251, 0.735, -3, page)
+    task.log_info(f"{page}: 兜底没找回「{name}」")
+    return False
 
 
 def calculate_dominant_hue(task: TriggerTask, region):
@@ -1758,6 +1851,11 @@ def handle_stuck_log(task: TriggerTask):
         return False
 
     stuck_seconds = int(time.time() - task._last_change_time)
+    if stuck_seconds >= 60 and getattr(task, "_stuck_reported", None) != task._last_change_time:
+        # 实跑中出现过战斗里读不到手牌数、画面一动不动 55 分钟，事后不知道是什么页面：每次卡住留一张截图和画面文字
+        task._stuck_reported = task._last_change_time
+        battle_log.anomaly(task, "画面卡住", f"画面已 {stuck_seconds} 秒没有变化",
+                           texts=[box.name for box in (getattr(task, "all_texts", None) or [])][:120])
     close_page = task.find_one(
         feature_name="close_page",
         box=task.box_of_screen(0.921, 0.003, 0.998, 0.100),
@@ -3948,33 +4046,21 @@ def handle_view_original(task: TriggerTask):
     if not cards:
         return False
 
-    flash_priority = []
-    for keyword in _get_card_list(task, '闪光优先级'):
-        if not isinstance(keyword, str):
-            continue
-        normalized_keyword = re.sub(r"\s+", "", keyword)
-        if normalized_keyword:
-            flash_priority.append(normalized_keyword)
-    chosen_card = None
-    for desc_keyword in flash_priority:
-        for card in cards:
-            if is_subsequence(
-                desc_keyword,
-                card['name'] + "：:" + card['description'],
-            ):
-                chosen_card = card
-                task.log_info(f"优先选择「{card['name']}」({desc_keyword})")
-                if (
-                    _get_config_value(task, "首层刷特定闪光", False) is True
-                    and flash_priority
-                    and desc_keyword == flash_priority[0]
-                ):
-                    task.node_status["get_specific_flash"] = True
-                    task.log_info("已命中闪光优先级第一项，记录已获得特定闪光")
-                break
-            if chosen_card:
-                break
+    flash_rules = _flash_rules(task)
+    first_rule = next((re.sub(r"\s+", "", k) for k in _get_card_list(task, '闪光优先级')
+                       if isinstance(k, str) and re.sub(r"\s+", "", k)), None)
+    chosen_card, choose_reason = None, None
+    for rule in flash_rules:
+        chosen_card = next((card for card in cards if _flash_rule_matches(rule, card)), None)
         if chosen_card:
+            choose_reason = f"闪光优先级「{rule[0]}」"
+            task.log_info(f"优先选择「{chosen_card['name']}」({rule[0]})")
+            if (
+                _get_config_value(task, "首层刷特定闪光", False) is True
+                and rule[0] == first_rule
+            ):
+                task.node_status["get_specific_flash"] = True
+                task.log_info("已命中闪光优先级第一项，记录已获得特定闪光")
             break
 
     target_boxes, target_click_positions = find_target_card(task)
@@ -3998,11 +4084,33 @@ def handle_view_original(task: TriggerTask):
         return True
 
     if not chosen_card:
-        chosen_card = random.choice(cards)
-        task.log_info(f"随机选择「{chosen_card['name']}」")
+        chosen_card, choose_reason = choose_flash_version(cards)
+        task.log_info(f"闪光优先级都没命中，选择「{chosen_card['name']}」（{choose_reason}）")
 
+    options = [{"type": c.get("type"), "description": c.get("description")} for c in cards]
+    key = (chosen_card["name"], cards.index(chosen_card))
+    if getattr(task, "_last_flash_choice", (None, 0))[0] != key or time.time() - task._last_flash_choice[1] > 30:
+        # 这个页面会连续识别好几帧，同一次选择只记一条
+        battle_log.record(task, "闪光选择", card=chosen_card["name"], reason=choose_reason,
+                          chosen=cards.index(chosen_card) + 1, options=options)
+    task._last_flash_choice = (key, time.time())
     _move_and_click(task, chosen_card['x'], chosen_card['y'])
     return True
+
+
+def choose_flash_version(cards):
+    """闪光优先级都没命中时挑版本：先保留原来的类型（3 个版本里多数的类型，闪光可能把攻击牌变成技能牌，
+    会打乱出牌优先级），同类型里挑描述中最大的百分比数值（伤害/护盾/治愈），一样大时取靠前的。返回 (牌, 理由)。"""
+    types = [card.get("type") or "" for card in cards]
+    main_type = max(types, key=types.count) if types else ""  # 一样多时取靠前的，结果固定
+    same = [card for card in cards if (card.get("type") or "") == main_type] or cards
+
+    def top_percent(card):
+        return max((int(n) for n in re.findall(r"(\d+)\s*[%％]", card.get("description") or "")), default=-1)
+
+    best = max(same, key=lambda card: (top_percent(card), -cards.index(card)))
+    value = top_percent(best)
+    return best, f"保留类型「{main_type}」" + (f"，最大数值 {value}%" if value >= 0 else "，都读不到数值取第一个")
 
 
 def handle_escape(task: TriggerTask):
@@ -4090,7 +4198,8 @@ def _initial_node_status():
             "node_count": 0, "enter_new_node": False, "node_type": "", "is_escaped": False,
             "save_target_member": False, "target_mask_card_position": -1,
             "get_specific_flash": False, "removed_card_count": 0,
-            "neutral_card_count": 0}
+            "neutral_card_count": 0,
+            "flash_done_cards": []}  # 本局不用再为它进闪光的牌（闪光卡牌列表里的牌名）
 
 
 def _initial_member_status():
@@ -4178,6 +4287,7 @@ def reset_layer_status(task: TriggerTask):
                 'get_specific_flash': ns.get('get_specific_flash', False),
                 'removed_card_count': ns.get('removed_card_count', 0),
                 'neutral_card_count': ns.get('neutral_card_count', 0),
+                'flash_done_cards': ns.get('flash_done_cards', []),
                 'round_success_counted': ns.get('round_success_counted', False)}
         task.node_status = _initial_node_status()
         task.node_status['round_success_counted'] = keep['round_success_counted']
@@ -4189,6 +4299,7 @@ def reset_layer_status(task: TriggerTask):
         task.node_status['get_specific_flash'] = keep['get_specific_flash']
         task.node_status['removed_card_count'] = keep['removed_card_count']
         task.node_status['neutral_card_count'] = keep['neutral_card_count']
+        task.node_status['flash_done_cards'] = list(keep['flash_done_cards'])
 
 
 def handle_close_button(task: TriggerTask):

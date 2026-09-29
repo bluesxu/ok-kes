@@ -144,6 +144,24 @@ class TestBattlePerception(unittest.TestCase):
             with self.subTest(name):
                 self.assertFalse(battle.hand_lowered(screenshot_task(name)))
 
+    def test_gray_zero_ap_by_color(self):
+        # 实跑 12:14:50：刚打出 3 费的破碎，AP 已是灰色空心的「0」但手牌还没沉下去，读不出 AP 又去试了下一张牌
+        for name in ("ap_zero_raised", "hand_lowered"):
+            with self.subTest(name):
+                frame = cv2.imdecode(np.fromfile(os.path.join(IMAGES, name + ".jpg"), dtype=np.uint8), cv2.IMREAD_COLOR)
+                self.assertTrue(battle.ap_zero_outline(frame))
+        for name in list(TRUTH) + ["card_suffix"]:  # AP 1~4：白色实心数字
+            with self.subTest(name):
+                frame = cv2.imdecode(np.fromfile(os.path.join(IMAGES, name + ".jpg"), dtype=np.uint8), cv2.IMREAD_COLOR)
+                self.assertFalse(battle.ap_zero_outline(frame))
+
+    def test_hp_larger_than_max_is_ignored(self):
+        # 实跑中读出过 6177/1768、16657/1667（多读了一位）
+        task = SimpleNamespace(width=2560, height=1440, all_texts=[Box(400, 30, 300, 40, name="6177/1768")])
+        self.assertIsNone(battle.read_hp(task))
+        task.all_texts = [Box(400, 30, 300, 40, name="617/1768")]
+        self.assertEqual((617, 1768), battle.read_hp(task))
+
     def test_hand_slots_match_measured_layout(self):
         # 截图里量出的牌名左端间距：3/5/7/10 张
         for count, spacing in ((3, 0.1375), (5, 0.113), (7, 0.0808), (10, 0.0561)):
@@ -213,6 +231,14 @@ class TestChoosePlay(unittest.TestCase):
         self.assertIn("会被打死", reason)
         self.assertEqual("破碎", battle.choose_play(cards, 3, ["破碎"], ["刀背格挡"], False, set())[0]["name"])
         self.assertEqual("孢子", battle.choose_play(cards, 3, [], ["刀背格挡"], False, set())[0]["name"])
+
+    def test_danger_line(self):
+        # 实跑 11:42:14：505/1768 挨了 494，不算致命所以没防御，带着 11 血进了 Boss 战
+        self.assertTrue(battle.in_danger((505, 1768), 0.02, 25))
+        self.assertFalse(battle.in_danger((1500, 1768), 0.7, 25))   # 挨完还剩 1050，高于 25%
+        self.assertFalse(battle.in_danger((505, 1768), 1.0, 25))    # 没看到预计扣血
+        self.assertFalse(battle.in_danger((505, 1768), 0.02, 0))    # 0：只在会被打死时才防御
+        self.assertFalse(battle.in_danger(None, 0.02, 25))
 
     def test_defense_recognized_by_name_without_list(self):
         # 护盾、回血牌在游戏里都标「基本技能」，按牌名里的字自动认，不用把每张都填进防御卡牌列表
@@ -287,6 +313,43 @@ class TestPlayTurn(unittest.TestCase):
             patcher = mock.patch.object(battle, name, fn)
             patcher.start()
             self.addCleanup(patcher.stop)
+
+    def test_button_gone_too_long_hands_frame_to_other_handlers(self):
+        # 实跑 10:36:45：结束回合按钮一直不出现，每帧都当成敌人行动中干等了 13 分钟
+        now = [1000.0]
+        with mock.patch.object(battle.time, "time", lambda: now[0]):
+            for _ in range(battle._BUTTON_GONE_LIMIT - 1):  # 实际每秒左右调用一次
+                self.assertTrue(battle.play_turn(self.task, 2, False))  # 敌人行动中：这一帧不做事
+                now[0] += 1
+            now[0] += 1
+            self.assertFalse(battle.play_turn(self.task, 2, False))  # 太久了：交给后面的页面处理函数
+            self.assertTrue(self.task._battle["button_reported"])
+            now[0] += 1
+            battle.play_turn(self.task, 2, True)  # 按钮回来了：重新计时
+            self.assertIsNone(self.task._battle["button_gone"])
+        self.assertEqual([], [k for k in self.keys if k == "e"])
+
+    def test_deferred_end_turn_not_recorded(self):
+        # 加速模式这一轮先不按 E 时，战斗记录里曾每回合出现两条「结束回合」
+        events = []
+        self.task._speedup = {}
+        self.task.send_key = lambda key: self.task._speedup.update(end_turn_deferred=key == "e")
+        with mock.patch.object(battle.battle_log, "record", lambda task, event, **f: event == "结束回合" and events.append(event)), \
+                mock.patch.object(battle, "read_remaining_cost", lambda task, frame: 0):
+            battle.play_turn(self.task, 1, True)
+            self.assertEqual([], events)                   # E 没真正发出去：不记
+            self.task.send_key = lambda key: None
+            battle.play_turn(self.task, 1, True)
+        self.assertEqual(["结束回合"], events)
+
+    def test_low_hp_after_hit_plays_defense_first(self):
+        hand = [dict(card("破碎", 1, "攻击", key="1"), x=0.4, y=None), dict(card("刀背格挡", 1, key="2"), x=0.5, y=None)]
+        self.task.default_config["出牌优先级"] = ["破碎"]
+        with mock.patch.object(battle, "read_hand", lambda task, count: hand), \
+                mock.patch.object(battle, "read_hp", lambda task: (505, 1768)), \
+                mock.patch.object(battle, "incoming_lethal", lambda task: (False, 0.02)):
+            battle.play_turn(self.task, 2, True)
+        self.assertEqual(["2", "enter"], self.keys)
 
     def test_lowered_hand_ends_turn_without_trying_cards(self):
         labels = [Box(700, 1260, 150, 40, name="基本攻击"), Box(1200, 1270, 100, 40, name="攻击")]
@@ -403,6 +466,109 @@ class TestRoundSuccessCount(unittest.TestCase):
         for _ in range(3):  # 结算页连续识别三帧
             utils._finish_only_first_layer(task)
         self.assertEqual(1, task.node_status["success_rounds"])
+
+class TestStuckReport(unittest.TestCase):
+    def test_stuck_screen_reported_once_per_episode(self):
+        # 实跑 12:15~13:10：战斗里读不到手牌数、画面一动不动 55 分钟，没留任何截图
+        reports = []
+        task = SimpleNamespace(_last_change_time=time.time() - 70, all_texts=[Box(0, 0, 10, 10, name="某页面")],
+                               log_info=lambda m: None, sleep=lambda s: None, click_box=lambda b: None,
+                               find_one=lambda **k: object(), box_of_screen=lambda *a: None)
+        with mock.patch.object(utils, "is_frame_stuck", lambda task, **k: True), \
+                mock.patch.object(utils.battle_log, "anomaly", lambda task, kind, detail, **f: reports.append(f["texts"])):
+            utils.handle_stuck_log(task)
+            utils.handle_stuck_log(task)
+            self.assertEqual([["某页面"]], reports)
+            task._last_change_time = time.time() - 61  # 画面动过又卡住：新的一次
+            utils.handle_stuck_log(task)
+        self.assertEqual(2, len(reports))
+
+
+def flash_task(**config):
+    return SimpleNamespace(name="自动出击模式", config=config, default_config={}, node_status={"flash_done_cards": []},
+                           log_info=lambda m: None)
+
+
+def version(name, card_type, description):
+    return {"name": name, "type": card_type, "description": description}
+
+
+class TestFlash(unittest.TestCase):
+    """休息区闪光：选哪个版本、列表里的牌是否已经闪完。"""
+
+    def test_per_card_rule_only_applies_to_that_card(self):
+        task = flash_task(闪光优先级=["银色之幕", "水之根源:AP3"])
+        rules = utils._flash_rules(task)
+        self.assertEqual(["水之根源:AP3", "银色之幕"], [r[0] for r in rules])  # 按牌写的排在前面
+        water = version("水之根源", "技能", "获得124%治愈「消灭】获得AP3")
+        self.assertTrue(utils._flash_rule_matches(rules[0], water))
+        self.assertFalse(utils._flash_rule_matches(rules[0], version("破碎", "攻击", "获得AP3")))
+        self.assertTrue(utils._flash_rule_matches(rules[1], version("重新集结", "技能", "获得168%护盾银色之幕1")))
+
+    def test_version_keeps_type_then_largest_number(self):
+        # 实跑 13:55：秃鹰发射三个版本，原逻辑随机选
+        cards = [version("秃鹰发射", "攻击", "对所有敌人造成144%的伤害获得120%的护盾"),
+                 version("秃鹰发射", "技能", "获得336%护盾银色之幕1"),
+                 version("秃鹰发射", "攻击", "对所有敌人造成216%的伤害获得180%的护盾")]
+        chosen, reason = utils.choose_flash_version(cards)
+        self.assertIs(cards[2], chosen)  # 336% 的那个把攻击牌变成了技能牌，不选
+        self.assertIn("216", reason)
+
+    def test_missing_list_cards_are_done_for_this_run(self):
+        task = flash_task(闪光卡牌列表=["破碎", "斗志"])
+        seen = {"破碎": {"type": "攻击"}, "水之根源": {"type": "技能"}}
+        utils._record_flash_done(task, ["破碎", "斗志"], seen, "测试")
+        self.assertEqual(["斗志"], task.node_status["flash_done_cards"])
+        self.assertFalse(utils.flash_list_done(task))   # 破碎还在选牌页里：同名的继续闪
+        utils._record_flash_done(task, ["破碎", "斗志"], {"水之根源": {"type": "技能"}}, "测试")
+        self.assertTrue(utils.flash_list_done(task))    # 都不在了：休息区改为休息
+        self.assertTrue(utils.flash_list_done(flash_task(闪光卡牌列表=[])))
+
+    def test_fallback_uses_play_priority_then_attack(self):
+        seen = {"水之根源": {"type": "技能"}, "斩击": {"type": "基础攻击"}, "日破碎": {"type": "攻击"}}
+        with mock.patch.object(utils, "_get_game_text", lambda task, text: text):
+            self.assertEqual("日破碎", utils._flash_fallback_card(flash_task(出牌优先级=["斗志", "破碎"]), seen))
+            self.assertEqual("斩击", utils._flash_fallback_card(flash_task(出牌优先级=["斗志"]), seen))
+
+
+def read_frame(name):
+    return cv2.imdecode(np.fromfile(os.path.join(IMAGES, name + ".jpg"), dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
+class TestEgo(unittest.TestCase):
+    def test_ready_slots_by_color(self):
+        # 费用框浅青色放得起；灰色 EP 不够（左下角 EP 数字比费用小）
+        for name, ready in (("boss_full_hp", [True, True, True]), ("boss_minions_red", [False, False, True]),
+                            ("collapse_traps", [True, False, True]), ("intent_panel", [False, False, False])):
+            with self.subTest(name):
+                self.assertEqual(ready, [s["ready"] for s in battle.ego_slots(read_frame(name))])
+
+    def _use(self, node_type, slots, full=False, costs=None):
+        keys = []
+        task = SimpleNamespace(frame=np.zeros((1440, 2560, 3), np.uint8), node_status={"node_type": node_type},
+                               config={}, default_config={battle_log.LOG_KEY: False}, log_info=lambda m: None,
+                               sleep=lambda s: None, send_key=keys.append, _battle={})
+        ready = [{"key": k, "y": y, "ready": r} for (k, y), r in zip(battle._EGO_SLOTS, slots)]
+        costs = iter(costs or [])
+        with mock.patch.object(battle, "ego_slots", lambda frame: [dict(s) for s in ready]), \
+                mock.patch.object(battle, "ep_full", lambda frame: full), \
+                mock.patch.object(battle, "_read_digit", lambda *a, **k: next(costs, None)):
+            used = [battle.use_ego(task, True) for _ in range(3)]
+        return used, keys
+
+    def test_boss_uses_highest_cost_ready_ego(self):
+        used, keys = self._use("boss", [True, False, True], costs=[2, 5, 2, 5])
+        self.assertEqual("F3", keys[0])
+        self.assertEqual(["F3", "enter", "F3", "enter", "F1", "enter"], keys)  # 同一个最多按 2 次
+        self.assertEqual([True, True, True], used)
+
+    def test_normal_battle_waits_for_full_ep(self):
+        self.assertEqual(([False] * 3, []), self._use("小怪", [True, True, True]))
+        used, keys = self._use("小怪", [True, True, True], full=True, costs=[3, 6, 2])
+        self.assertEqual("F2", keys[0])
+
+    def test_elite_spends_like_boss(self):
+        self.assertTrue(self._use("精英", [False, True, False])[0][0])
 
 
 if __name__ == "__main__":

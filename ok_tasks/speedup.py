@@ -192,6 +192,7 @@ def install(task):
         # 结束回合的确认：上次出牌/按 E 的时刻、第一次判断该结束回合的时刻
         "last_play_key": 0.0, "last_end_turn": 0.0, "end_turn_seen": 0.0, "end_turn_reason": None,
         "end_turn_sure": False,  # 出牌逻辑确认 AP 已用完（utils_battle._end_turn 设置）
+        "end_turn_deferred": False,  # 这次的 E 没有真正发出去（utils_battle._end_turn 据此决定记不记「结束回合」）
     }
     task._speedup = st
     if not st["gate_ok"]:
@@ -224,9 +225,11 @@ def install(task):
             try:
                 _pay_owed(st)  # 出牌时这里会判断上一张牌是否已打出、是否弹出了选择页面
                 if name == "send_key" and st["battle_play"] and st["battle_left"]:
+                    st["end_turn_deferred"] = _key_of(args, kwargs) == "e"
                     return True  # 出牌途中已弹出选择页面：剩下的出牌按键不再发送，交给下一轮处理弹窗
                 if name == "send_key" and st["battle_play"] and _key_of(args, kwargs) == "e" \
                         and not _end_turn_allowed(task, st):
+                    st["end_turn_deferred"] = True
                     return True  # 这一轮先不结束回合，下一轮再判断
                 if name == "mouse_down":
                     st["held"] = True

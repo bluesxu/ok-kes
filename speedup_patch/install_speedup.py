@@ -115,15 +115,43 @@ def has_mark(working, rel):
         return MARK_BEGIN in f.read()
 
 
+def _manifest_path(working):
+    return os.path.join(working, "speedup_backup", "installed.json")
+
+
+def load_manifest(working):
+    """历次安装装进去的文件哈希 {rel: [hash, ...]}。"""
+    path = _manifest_path(working)
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_manifest(working, rels):
+    manifest = load_manifest(working)
+    for rel in rels:
+        path = os.path.join(working, rel)
+        if os.path.exists(path):
+            hashes = manifest.setdefault(rel, [])
+            if file_hash(path) not in hashes:
+                hashes.append(file_hash(path))
+    with open(_manifest_path(working), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=1)
+
+
 def is_ours(working, rel):
-    """安装目录里的这个文件是不是我们装进去的：打过补丁，或与本仓库的同名文件相同。"""
+    """安装目录里的这个文件是不是我们装进去的：打过补丁、与本仓库的同名文件相同，或是以前某次安装装进去的。
+    （只比对仓库当前版本时，仓库改过的文件会把上次装进去的旧版当成官方原版：覆盖原版备份，还误判成官方已更新。）"""
     path = os.path.join(working, rel)
     if not os.path.exists(path):
         return False
     if has_mark(working, rel):
         return True
     repo = os.path.join(ROOT, rel)
-    return os.path.exists(repo) and file_hash(path) == file_hash(repo)
+    if os.path.exists(repo) and file_hash(path) == file_hash(repo):
+        return True
+    return file_hash(path) in load_manifest(working).get(rel, []) and file_hash(path) != BASE_SHA.get(rel)
 
 
 def backup(working):
@@ -229,6 +257,7 @@ def install(working):
             with open(path, encoding="utf-8") as f:
                 compile(f.read(), path, "exec")
     set_ocr_backend(working, "OpenVINO")
+    save_manifest(working, results)
     for rel, result in results.items():
         print(f"{rel}: {result}")
     print("configs/OCR设置.json: OCR后端 = OpenVINO（f32）")

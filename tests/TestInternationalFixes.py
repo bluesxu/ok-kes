@@ -27,7 +27,8 @@ class PageTask:
 
     def __init__(self, texts, features=(), confirm=()):
         self.width, self.height = WIDTH, HEIGHT
-        self.config = {"游戏语言": "繁体中文", "生命值大于多少优先闪光(百分比)": "60", "多少信用点以上冥想": 100}
+        self.config = {"游戏语言": "繁体中文", "生命值大于多少优先闪光(百分比)": "60", "多少信用点以上冥想": 100,
+                       "闪光卡牌列表": ["破碎"]}
         self.node_status = {"flash_or_rest": True, "shop": False}
         self.member_status = {"deck": {"冥想": {"剑雨": True}}}
         self.all_texts = [text(*t) for t in texts]
@@ -142,6 +143,25 @@ class TestSortieRest(unittest.TestCase):
         task = self.rest_page(CREDIT, hp(300))
         self.assertTrue(utils_sortie.handle_rest_sortie(task))
         self.assertEqual(["rest"], task.clicked)
+
+    def test_flash_list_done_rests_even_at_full_hp(self):
+        # 本局列表里的牌都已不在选牌页：不再花信用点进闪光
+        task = self.rest_page(CREDIT, hp(1200))
+        task.node_status["flash_done_cards"] = ["破碎"]
+        self.assertTrue(utils_sortie.handle_rest_sortie(task))
+        self.assertEqual(["rest"], task.clicked)
+
+    def test_waits_for_flash_text_before_choosing_rest(self):
+        # 实跑 09:47:58：闪光文字还没显示就点了休息，下一帧又点了闪光
+        task = PageTask([("免費", 0.25, 0.70), CREDIT, hp(1200)], SORTIE_FEATURES, confirm=[])
+        self.assertTrue(utils_sortie.handle_rest_sortie(task))
+        self.assertEqual([], task.clicked)
+        task.show(SORTIE_REST + [CREDIT, hp(1200)])
+        self.assertTrue(utils_sortie.handle_rest_sortie(task))
+        self.assertEqual(["闪光"], task.clicked)
+        # 没等到确认按钮（点闪光后直接进选牌页），页面还没切走：不再点第二次
+        self.assertTrue(utils_sortie.handle_rest_sortie(task))
+        self.assertEqual(["闪光"], task.clicked)
 
 
 class TestChaosRest(unittest.TestCase):

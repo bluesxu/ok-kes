@@ -30,8 +30,9 @@ from utils_chaos import handle_archive_target_member
 
 import re
 import random
-import cv2
+import time
 
+import utils
 import utils_battle
 
 
@@ -429,7 +430,7 @@ def handle_secret_enemy(task: TriggerTask):
 
 
 def handle_battle_page(task: TriggerTask):
-    """战斗页面: EP 满时随机释放 Ego 技能；否则交给 utils_battle 按费用、出牌优先级、预计扣血出一张牌或结束回合。"""
+    """战斗页面: 先按条件释放 Ego；否则交给 utils_battle 按费用、出牌优先级、预计扣血出一张牌或结束回合。"""
 
     hand_count = _read_hand_count(task)
     if hand_count is None:
@@ -440,25 +441,11 @@ def handle_battle_page(task: TriggerTask):
         task.node_status['final_boss_battle'] = True
         task.log_info("检测到最终boss战斗开始，final_boss_battle=True")
 
-    # 检测 EP 能量条是否满（0.032,0.947 处 RGB 接近 (193,255,255)）
-    ep_px = int(0.032 * task.width)
-    ep_py = int(0.947 * task.height)
-    if 0 <= ep_px < task.width and 0 <= ep_py < task.height:
-        ep_region = task.frame[max(0, ep_py-2):ep_py+3, max(0, ep_px-2):ep_px+3, :3]
-        if ep_region.size > 0:
-            avg_bgr = cv2.mean(ep_region)[:3]
-            # OpenCV 是 BGR 格式，用户描述的是 RGB(193,255,255) → BGR(255,255,193)
-            avg_b, avg_g, avg_r = avg_bgr
-            if abs(avg_b - 255) <= 15 and abs(avg_g - 255) <= 15 and abs(avg_r - 193) <= 15:
-                task.log_info("EP能量达到最大值，随机释放Ego技能")
-                task.send_key(random.choice(["F1", "F2", "F3"]))
-                task.sleep(1)
-                task.send_key("enter")
-                task.sleep(4)
-                return True
-
     finishturn_box = task.box_of_screen(0.844, 0.782, 0.998, 0.990)
     finish_turn_visible = bool(task.find_feature(feature_name="finishturn", box=finishturn_box))
+    # Ego：我方回合、出牌之前，Boss/精英战放得起就放，其余战斗 EP 满格才放；只挑放得起的（见 utils_battle.use_ego）
+    if utils_battle.use_ego(task, finish_turn_visible):
+        return True
     # 出牌策略（按位置读手牌、读费用、预留防御、拖牌打目标、结束回合）见 utils_battle
     return utils_battle.play_turn(task, hand_count, finish_turn_visible)
 
@@ -840,6 +827,10 @@ def handle_return_to_draw_pile(task: TriggerTask):
 
 
 
+_REST_OPTIONS_WAIT = 1.5  # 刚进休息区时最多等这么久让闪光选项的文字显示出来
+_REST_CLICK_GAP = 4       # 点过闪光/休息后这么久内不再重复点
+
+
 def handle_rest_sortie(task: TriggerTask):
     """出击模式休息页面: 包含休息和闪光两个功能，检测到对应条件分别处理。"""
     # 检测闪光区域 (0.788,0.463)-(0.870,0.594) 是否存在“闪光”和不大于30的数字
@@ -868,7 +859,24 @@ def handle_rest_sortie(task: TriggerTask):
             f"{flash_feature.confidence:.2%}"
         )
 
-    if flash_feature and has_flash_text and flash_cost is not None and flash_box and hasattr(task, 'node_status') and task.node_status.get('flash_or_rest', False):
+    rest_feature = _find_rest_feature(task)
+    pending = hasattr(task, 'node_status') and task.node_status.get('flash_or_rest', False)
+    now = time.time()
+    if pending and (flash_feature or rest_feature):
+        if now - getattr(task, "_rest_clicked_at", 0.0) < _REST_CLICK_GAP:
+            return True  # 刚点过闪光/休息，页面还没切走：不重复点（实跑中等确认按钮超时后又点了一次）
+        if now - getattr(task, "_rest_page_last", 0.0) > 5:
+            task._rest_page_since = now  # 刚进休息区
+        task._rest_page_last = now
+        if flash_feature and not (has_flash_text and flash_cost is not None)                 and now - task._rest_page_since < _REST_OPTIONS_WAIT:
+            # 页面刚切过来时闪光文字、费用常常还没显示，曾因此直接点了休息：等两个选项都显示出来再决定
+            return True
+    flash_wanted = not utils.flash_list_done(task)
+    if pending and flash_feature and not flash_wanted and not task.node_status.get("flash_done_logged"):
+        task.node_status["flash_done_logged"] = True
+        task.log_info(f"闪光卡牌列表里的牌本局都已闪过或不在牌库（{task.node_status.get('flash_done_cards')}），不闪光，改为休息")
+
+    if flash_wanted and flash_feature and has_flash_text and flash_cost is not None and flash_box and pending:
         task.log_info("休息区存在可闪光选项")
 
         # 获取当前信用点
@@ -893,6 +901,7 @@ def handle_rest_sortie(task: TriggerTask):
         task.log_info(f"生命值={hp_percent}%, 阈值={flash_threshold}%, 信用点={credit}")
         if credit > flash_cost and hp_percent >= flash_threshold:
             task.log_info("满足闪光条件，点击闪光")
+            task._rest_clicked_at = time.time()
             task.click_box(flash_box)
             if not _wait_for_rest_confirm(task):
                 return True
@@ -901,11 +910,11 @@ def handle_rest_sortie(task: TriggerTask):
         else:
             task.log_info("不满足闪光条件，继续检测休息")
 
-    rest_feature = _find_rest_feature(task)
     free_text = _get_region_text(task, (0.154, 0.602, 0.359, 0.847))
     if (rest_feature and "免费" in free_text and hasattr(task, 'node_status')
             and task.node_status.get('flash_or_rest', False)):
         task.log_info("检测到休息界面，点击休息")
+        task._rest_clicked_at = time.time()
         task.click_box(rest_feature)
         if not _wait_for_rest_confirm(task):
             return True

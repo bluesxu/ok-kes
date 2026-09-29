@@ -39,6 +39,7 @@ class SortieMode(TriggerTask):
         self.default_config["移除卡牌列表"] = ["剑幕"]
         self.default_config["复制卡牌列表"] = ["剑雨", "展开极光", "一缕光芒","缕光芒"]
         self.default_config["闪光卡牌列表"] = ["剑雨", "展开极光", "一缕光芒","缕光芒"]
+        self.default_config["闪光优先级"] = []
         self.default_config["装备1号位优先级"] = ["蚀化臂铠"]
         self.default_config["装备2号位优先级"] = ["拷问工具箱"]
         self.default_config["装备3号位优先级"] = ["异象石碑"]
@@ -84,6 +85,13 @@ class SortieMode(TriggerTask):
             '第几层boss前自动暂停': {'type': 'drop_down', 'options': ['不暂停', '1', '2', '3']},
         }
         self.config_description['游戏语言'] = "国际服请设置为繁体中文"
+        self.config_description['闪光卡牌列表'] = (
+            "休息区闪光时选哪张牌，填牌名；本局这些牌都闪过（选牌页里不再出现）后，休息区改为休息"
+        )
+        self.config_description['闪光优先级'] = (
+            "闪光出来的 3 个版本选哪个：「牌名:关键词」只对这张牌生效，不带牌名的对所有牌生效；"
+            "关键词写描述里的几个字，顺序与原文一致。都没命中时保留原类型、选数值最大的"
+        )
         # 出牌策略与详细战斗日志的配置项
         utils_battle.install(self)
         battle_log.install(self)
