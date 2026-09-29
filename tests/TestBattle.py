@@ -154,24 +154,36 @@ class TestChoosePlay(unittest.TestCase):
         self.assertEqual("斗志", chosen["name"])  # 破碎 3 费出不起
         self.assertIn("出牌优先级", reason)
 
-    def test_attack_before_defense_before_others(self):
-        cards = [card("孢子", 0), card("刀背格挡", 1), card("斩击", 1, "攻击")]
-        self.assertEqual("斩击", battle.choose_play(cards, 3, [], ["刀背格挡"], False, set())[0]["name"])
-        cards = [card("孢子", 0), card("刀背格挡", 1)]
-        self.assertEqual("刀背格挡", battle.choose_play(cards, 3, [], ["刀背格挡"], False, set())[0]["name"])
+    def test_order_zero_cost_enhance_attack_then_rest(self):
+        cards = [card("刀背格挡", 1), card("斩击", 1, "攻击"), card("扭曲", 2, "强化"), card("孢子", 0)]
+        order = []
+        for _ in range(4):
+            chosen, _ = battle.choose_play(cards, 9, [], ["刀背格挡"], False, set())
+            order.append(chosen["name"])
+            cards.remove(chosen)
+        self.assertEqual(["孢子", "扭曲", "斩击", "刀背格挡"], order)
 
-    def test_lethal_reserves_cost_for_defense(self):
-        # 剩 2 费：2 费攻击牌 + 1 费防御牌，这回合会被打死 → 攻击牌只能用 1 费，出不起，先出防御牌
-        cards = [card("破碎", 2, "攻击"), card("刀背格挡", 1)]
-        chosen, _ = battle.choose_play(cards, 2, ["破碎"], ["刀背格挡"], True, set())
-        self.assertEqual("刀背格挡", chosen["name"])
-        # 不会被打死时照常攻击优先
-        chosen, _ = battle.choose_play(cards, 2, ["破碎"], ["刀背格挡"], False, set())
-        self.assertEqual("破碎", chosen["name"])
-        # 会被打死但费用够攻击 + 防御：先攻击
+    def test_logged_turn_no_longer_spends_all_ap_first(self):
+        # 实跑 21:03:54：3 AP，出牌优先级有「破碎」，以前先出 3 费破碎把 AP 用光
+        cards = [card("饥饿的枷锁", 1, "攻击"), card("扭曲：光荣的抵抗", None, "强化"), card("冻结之拳", None, "攻击"),
+                 card("寒霜盾牌", None, "技能"), card("破碎", 3, "攻击")]
+        chosen, reason = battle.choose_play(cards, 3, ["破碎"], [], False, set())
+        self.assertEqual("扭曲：光荣的抵抗", chosen["name"])
+        cards.remove(chosen)
+        chosen, _ = battle.choose_play(cards, 2, ["破碎"], [], False, set())
+        self.assertEqual("饥饿的枷锁", chosen["name"])  # 破碎出不起（3 费），先出便宜的攻击
+
+    def test_priority_orders_within_same_type_then_cost(self):
+        cards = [card("斩击", 1, "攻击"), card("破碎", 2, "攻击"), card("秃鹰发射", 1, "攻击")]
+        self.assertEqual("破碎", battle.choose_play(cards, 3, ["破碎"], [], False, set())[0]["name"])
+        self.assertEqual("斩击", battle.choose_play(cards, 3, [], [], False, set())[0]["name"])
+
+    def test_lethal_plays_defense_first(self):
+        cards = [card("破碎", 2, "攻击"), card("孢子", 0), card("刀背格挡", 1)]
         chosen, reason = battle.choose_play(cards, 3, ["破碎"], ["刀背格挡"], True, set())
-        self.assertEqual("破碎", chosen["name"])
-        self.assertIn("预留 1 费", reason)
+        self.assertEqual("刀背格挡", chosen["name"])
+        self.assertIn("会被打死", reason)
+        self.assertEqual("孢子", battle.choose_play(cards, 3, ["破碎"], ["刀背格挡"], False, set())[0]["name"])
 
     def test_unknown_cost_is_tried_but_not_when_no_cost_left(self):
         cards = [card("未识别1", None)]

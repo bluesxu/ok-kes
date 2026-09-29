@@ -3,10 +3,10 @@
 按规则挑一张牌，按键或拖到目标身上打出。术语见仓库根目录 CONTEXT.md。
 
 出牌规则（每次只出一张，出完下一帧重新观察）：
-1. 只考虑出得起的牌：读到费用的按费用判断；读不到的先试着出，弹出「AP不足」就记为本回合出不起。
-2. 预计扣血会把我方打死时，先给防御牌留出费用：非防御牌只能用「剩余费用 - 防御牌费用」。
-3. 「出牌优先级」里的牌先出；然后是其余攻击牌、防御卡牌列表里的牌、其他牌。
-4. 没有出得起的牌就按 E 结束回合。
+1. 只考虑出得起的牌：读到费用的按费用判断；读不到的先试着出，没打出去（手牌数和 AP 都没减少）就本回合不再出。
+2. 顺序：崩溃牌 → 预计会被打死时先出防御牌 → 0 费牌 → 强化牌 → 攻击牌 → 技能/防御/其余牌；
+   「出牌优先级」只决定同一类牌里谁先出，同一优先级先出便宜的。
+3. 没有出得起的牌就按 E 结束回合。
 攻击牌拖到目标身上打出（见 docs/adr/0001）：Boss 战优先打 Boss；否则集中打同一个敌人直到它死，
 第一个目标按「攻击意图优先、行动倒计时小的优先、血少的优先」挑。非攻击牌仍用数字键 + 回车。
 
@@ -501,52 +501,66 @@ def _blocked(card, unplayable):
     return not name.startswith("未识别") and _matches(name, [u for u in unplayable if len(u) >= 2 and "/" not in u])
 
 
+def _priority_rank(card, priority):
+    """在「出牌优先级」里的位置，越小越先出；不在列表里排最后。"""
+    for rank, name in enumerate(priority):
+        if name and (name in card["name"] or card["name"] in name):
+            return rank, name
+    return len(priority), None
+
+
 def choose_play(cards, remaining, priority, defense, lethal, unplayable):
     """挑这一次要出的牌。cards 为 [{name, key, type, cost}]，cost 读不到为 None；remaining 读不到为 None。
-    unplayable 里是本回合出不起的牌名或位置（「按键/手牌数」）。返回 (牌, 理由)；没有能出的牌时返回 (None, 理由)。"""
-    def affordable(card, budget):
+    unplayable 里是本回合出不起的牌名或位置（「按键/手牌数」）。返回 (牌, 理由)；没有能出的牌时返回 (None, 理由)。
+
+    顺序：崩溃牌 → 会被打死时先出防御牌 → 0 费牌 → 强化牌 → 攻击牌 → 技能/防御/其余牌。
+    「出牌优先级」只决定同一类牌里谁先出，同一优先级先出便宜的。
+    （以前出牌优先级排在最前，回合一开始就用 3 费的牌把 AP 花光，强化牌和便宜的攻击牌都出不了。）"""
+    def affordable(card):
         if _blocked(card, unplayable) or card.get("key") is None:
             return False
-        if budget is None:
+        if remaining is None:
             return True
         if card["cost"] is None:
-            return budget > 0  # 读不到费用：还有费用就试着出，AP不足时会被记为出不起
-        return card["cost"] <= budget
+            return remaining > 0  # 读不到费用：还有费用就试着出，出不去时会被记为出不起
+        return card["cost"] <= remaining
 
-    is_defense = [_matches(c["name"], defense) for c in cards]
-    reserve = 0
-    if lethal and remaining is not None:
-        costs = [c["cost"] for c, d in zip(cards, is_defense)
-                 if d and not _blocked(c, unplayable) and c["cost"] is not None and c["cost"] <= remaining]
-        if costs:
-            reserve = min(costs)
-        elif any(d and not _blocked(c, unplayable) and c["cost"] is None for c, d in zip(cards, is_defense)):
-            reserve = 1  # 防御牌费用读不到：至少留 1 费
-    # 预计会被打死时，非防御牌只能用预留之外的费用；防御牌照常可以用全部剩余费用
-    budget = None if remaining is None else remaining - reserve
+    def pick(group, reason):
+        """同一类牌里按出牌优先级、再按费用从低到高挑一张。"""
+        if not group:
+            return None
+        card = min(group, key=lambda c: (_priority_rank(c, priority)[0], 99 if c["cost"] is None else c["cost"]))
+        matched = _priority_rank(card, priority)[1]
+        return card, reason + (f"，出牌优先级「{matched}」" if matched else "")
 
-    # 崩溃牌不花 AP、不计入敌人的行动次数：手里有就最先出，打够张数才能觉醒
+    # 1. 崩溃牌不花 AP、不计入敌人的行动次数：手里有就最先出，打够张数才能觉醒
     for card in cards:
         if card["type"] == "崩溃" and not _blocked(card, unplayable) and card.get("key") is not None:
             done = card.get("progress")
             shown = f"，进度 {'?' if done[0] is None else done[0]}/{done[1]}" if done else ""
             return card, f"崩溃牌（不花 AP，打够张数觉醒）{shown}"
 
-    candidates = [(c, d) for c, d in zip(cards, is_defense) if affordable(c, remaining if d else budget)]
-    if not candidates:
+    playable = [c for c in cards if affordable(c) and c["type"] != "崩溃"]
+    if not playable:
         return None, "没有出得起的牌"
-    suffix = f"（预计会被打死，已给防御牌预留 {reserve} 费）" if reserve else ""
-    for name in priority:
-        for card, d in candidates:
-            if name and (name in card["name"] or card["name"] in name):
-                return card, f"命中出牌优先级「{name}」{suffix}"
-    for card, d in candidates:
-        if card["type"] == "攻击" and not d:
-            return card, f"其余攻击牌{suffix}"
-    for card, d in candidates:
-        if d:
-            return card, "防御牌（攻击牌出完后的剩余费用）"
-    return candidates[0][0], f"其余牌{suffix}"
+    is_defense = lambda c: _matches(c["name"], defense)
+    steps = (
+        # 2. 这回合会被打死：先把防御牌出了
+        ([c for c in playable if is_defense(c)] if lethal else [], "预计会被打死，先出防御牌"),
+        # 3. 0 费牌白出，可能带增益或抽牌
+        ([c for c in playable if c["cost"] == 0], "0 费牌"),
+        # 4. 强化牌先上，后面的攻击才吃得到加成
+        ([c for c in playable if c["type"] == "强化"], "强化牌"),
+        # 5. 攻击牌
+        ([c for c in playable if c["type"] == "攻击" and not is_defense(c)], "攻击牌"),
+        # 6. 剩下的：技能、防御和认不出类型的牌
+        (playable, "其余牌"),
+    )
+    for group, reason in steps:
+        chosen = pick(group, reason)
+        if chosen:
+            return chosen
+    return None, "没有出得起的牌"
 
 
 def choose_target(enemies, boss_battle, sticky):
