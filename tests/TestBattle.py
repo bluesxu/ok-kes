@@ -305,6 +305,83 @@ class TestChooseTarget(unittest.TestCase):
         self.assertEqual(300, battle.choose_target(enemies[:1], False, (0.71, 0.3))[0]["hp"])
 
 
+class TestKillPreview(unittest.TestCase):
+    """精细化战斗：拖到敌人身上悬停时，血条上方的数字变成打完后剩下的血量，打得死时是 0。"""
+
+    def test_reads_hp_after_hit_on_real_screens(self):
+        # 拖牌时镜头推近，敌人比拖动前的位置往右下偏了约 0.03；位置是拖动前那一帧读到的
+        for name, before, after in (("preview_hit", enemy(886, 2, x=0.507, y=0.361), 164),
+                                    ("preview_lethal", enemy(492, 2, x=0.643, y=0.279), 0)):
+            with self.subTest(name):
+                task = screenshot_task(name)
+                value = battle.read_preview_hp(task, task.frame, before)
+                self.assertEqual(after, value)
+                self.assertEqual(after == 0, battle.is_lethal(before, value))
+
+    def test_lethal_needs_zero(self):
+        self.assertTrue(battle.is_lethal(enemy(492, 2), 0))
+        self.assertFalse(battle.is_lethal(enemy(492, 2), None))  # 读不到（出牌动画挡着）
+        self.assertFalse(battle.is_lethal(enemy(492, 2), 164))
+
+    def test_candidates(self):
+        boss = enemy(8000, None, "增益", x=0.6)
+        minions = [enemy(300, 3, "攻击", x=0.3), enemy(200, 1, "防御", x=0.4), enemy(400, 1, None, x=0.8)]
+        self.assertEqual([400, 300], [e["hp"] for e in battle.preview_candidates([boss] + minions, boss, True)])
+        # 非 Boss 战：所有敌人都看，按攻击意图、倒计时、血量排
+        self.assertEqual([400, 200], [e["hp"] for e in battle.preview_candidates([boss] + minions, minions[0], False)])
+        target = minions[0]
+        self.assertEqual([], battle.preview_candidates([target], target, False))
+
+    def _hover(self, readings):
+        task = SimpleNamespace(log_info=lambda message: None)
+        target = dict(enemy(900, 3, "攻击", x=0.5), drop=(0.5, 0.5))
+        others = [dict(enemy(300, 1, "攻击", x=0.3), drop=(0.3, 0.5)), dict(enemy(200, 2, None, x=0.7), drop=(0.7, 0.5))]
+        values = dict(readings)
+        events = []
+        with mock.patch.object(battle, "_hover_reading", lambda task, e: (None, values.get(e["hp"]))), \
+                mock.patch.object(battle_log, "record", lambda task, event, **f: events.append(f)):
+            hover = battle._preview_hover(task, card("斩击", 1, "攻击"), target, others)
+            moves = []
+            while True:
+                nxt = hover()
+                if nxt is None:
+                    break
+                moves.append(nxt)
+        return moves, events[-1]
+
+    def test_releases_on_first_enemy_it_kills(self):
+        moves, event = self._hover({300: 120, 200: 0, 900: 700})
+        self.assertEqual([(0.7, 0.5)], moves)  # 第一个打不死，移到第二个：打得死，就在这里松手
+        self.assertEqual((200, "打得死"), (event["chosen"]["hp"], event["reason"]))
+
+    def test_back_to_default_target_when_nothing_dies(self):
+        moves, event = self._hover({300: 120, 200: None, 900: 0})
+        self.assertEqual([(0.7, 0.5), (0.5, 0.5)], moves)  # 最后回到默认目标上松手
+        self.assertEqual(900, event["chosen"]["hp"])
+        self.assertEqual([120, None, 0], [s["after"] for s in event["seen"]])
+
+    def test_drag_moves_between_hovers_and_releases_at_last_point(self):
+        class PostMessageInteraction:
+            def __init__(self):
+                self.messages = []
+
+            def update_mouse_pos(self, x, y):
+                return (x, y)
+
+            def post(self, message, wparam, lparam):
+                self.messages.append((message, wparam, lparam))
+
+        interaction = PostMessageInteraction()
+        task = SimpleNamespace(executor=SimpleNamespace(interaction=interaction), width=2560, height=1440,
+                               log_info=lambda message: None)
+        points = iter([(0.3, 0.4), None])
+        with mock.patch.object(battle.time, "sleep", lambda seconds: None):
+            battle._post_drag(task, (0.5, 0.86), (0.7, 0.4), on_hover=lambda: next(points))
+        ups = [m for m in interaction.messages if m[0] == battle._WM_LBUTTONUP]
+        self.assertEqual([(battle._WM_LBUTTONUP, 0, (768, 576))], ups)  # 只松手一次，在最后停的位置
+        self.assertIn((battle._WM_MOUSEMOVE, battle._MK_LBUTTON, (1792, 576)), interaction.messages)
+
+
 class TestPlayTurn(unittest.TestCase):
     """出牌流程：AP不足记为出不起、出不掉的牌本回合不再出、没牌可出按 E。"""
 
@@ -390,7 +467,7 @@ class TestPlayTurn(unittest.TestCase):
         self.task.node_status = {"node_type": "boss"}
         with mock.patch.object(battle, "read_hp", lambda task: (0, 1700)), \
                 mock.patch.object(battle, "read_enemies", lambda task, frame: enemies), \
-                mock.patch.object(battle, "_drag_card", lambda task, c, t: targets.append(t["hp"])):
+                mock.patch.object(battle, "_drag_card", lambda task, c, t, *rest: targets.append(t["hp"])):
             battle.play_turn(self.task, 2, True)
         self.assertEqual([900], targets)
 
@@ -485,6 +562,20 @@ class TestPlayTurnRecovery(TestPlayTurn):
                 battle.play_turn(self.task, 1, True)
         self.assertEqual([500], calls)  # 读不出意图也只点开一次，之后照常出牌
         self.assertIn("1", self.keys)
+
+    def test_zero_cost_remembered_when_ap_used_up(self):
+        # 实跑 21:13:36：AP 用完，手里只剩 0 费的「逆转之刃」，费用读不到就结束了回合
+        costs = {"逆转之刃": 0}
+        hand = [dict(card("逆转之刃", None, None, key="1"), x=0.4, y=None)]
+        with mock.patch.object(battle, "read_hand", lambda task, count: [dict(c) for c in hand]), \
+                mock.patch.object(battle, "_card_cost", lambda task, frame, c: costs.get(c["name"])):
+            battle.play_turn(self.task, 1, True)  # 有 AP 时读到过一次 0 费
+            self.keys.clear()
+            costs.clear()
+            battle.start_battle(self.task)  # 下一场战斗：本场记下的费用清空，本次运行记下的 0 费牌名还在
+            with mock.patch.object(battle, "read_remaining_cost", lambda task, frame: 0):
+                battle.play_turn(self.task, 1, True)
+        self.assertEqual(["1", "enter"], self.keys)  # AP 为 0、费用读不到，仍按 0 费出
 
     def test_turn_end_trigger_is_an_intent(self):
         lines = [("光秃铁壳虫1", 0.06), ("弱点", 0.1), ("翻滚", 0.17), ("回合结束时触发", 0.21),
