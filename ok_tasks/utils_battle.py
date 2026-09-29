@@ -689,7 +689,14 @@ def play_turn(task, hand_count, finish_turn_visible):
             battle_log.anomaly(task, "AP不足", f"「{last['name']}」费用不够，本回合不再出它")
         return True
     if not finish_turn_visible:
+        if state.get("ended"):
+            state["enemy_phase"] = True  # 按过结束回合后「结束回合」按钮消失：轮到敌人行动
         return True  # 不是我方可操作的时候
+    if state.get("enemy_phase"):
+        # 敌人行动完、按钮重新出现：新回合。不能只靠「剩余 AP 变多」判断——上回合末尾 AP 常读不到，
+        # 曾因此没认出新回合，上回合记下的「出不起」一直留着，新回合一张牌都不出就结束了
+        _new_turn(state)
+        state.update(ended=False, enemy_phase=False)
 
     cards = read_hand(task, hand_count)
     if not cards:
@@ -793,6 +800,7 @@ def _drag_card(task, card, target):
 
 def _end_turn(task, reason):
     task.log_info(f"结束回合：{reason}")
+    _state(task)["ended"] = True
     task.send_key("e")
     task.sleep(1)
     return True

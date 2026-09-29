@@ -265,6 +265,17 @@ class TestPlayTurn(unittest.TestCase):
             battle.play_turn(self.task, 1, True)
         self.assertNotIn("斗志", self.task._battle["unplayable"])
 
+    def test_new_turn_after_enemy_phase_even_without_ap(self):
+        with mock.patch.object(battle, "read_remaining_cost", lambda task, frame: None):
+            battle.play_turn(self.task, 1, True)
+            self.task._battle["unplayable"].add("斗志")
+            battle.play_turn(self.task, 1, True)      # 没有出得起的牌：结束回合
+            battle.play_turn(self.task, 1, False)     # 敌人行动中，「结束回合」按钮不在
+            self.keys.clear()
+            battle.play_turn(self.task, 1, True)      # 按钮重新出现：新回合，斗志又能出了
+        self.assertNotIn("斗志", self.task._battle["unplayable"])
+        self.assertEqual(["1", "enter"], self.keys)
+
     def test_new_turn_when_cost_refills(self):
         battle.play_turn(self.task, 1, True)
         self.task._battle["unplayable"].add("斗志")
