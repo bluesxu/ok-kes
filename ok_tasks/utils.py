@@ -3550,6 +3550,10 @@ def handle_route_selection(task: TriggerTask):
             except (ValueError, TypeError):
                 pass
 
+        if (_get_config_value(task, '只打第一层', False) and hasattr(task, 'node_status')
+                and task.node_status.get('pass_final_boss_count', 0) == 0):
+            return _retreat_before_boss(task)
+
         _move_and_click(task, 0.815, 0.492)
         task.sleep(2)
         return True
@@ -4113,6 +4117,25 @@ def choose_flash_version(cards):
     return best, f"保留类型「{main_type}」" + (f"，最大数值 {value}%" if value >= 0 else "，都读不到数值取第一个")
 
 
+def _retreat_before_boss(task: TriggerTask) -> bool:
+    """只打第一层：打完 boss 也是直接退出，所以到了 boss 节点就撤退，省掉一场 boss 战，本轮记成功。
+    点右上角打开菜单，再点「逃脱」。handle_escape 排在路线页后面，菜单弹出后路线页可能仍被识别到，
+    所以这里先自己找「逃脱」按钮；菜单还没出来时 3 秒内不重复点右上角，免得把刚打开的菜单又关上。"""
+    ns = task.node_status
+    if not ns.get('retreat_at_boss', False):
+        ns['retreat_at_boss'] = True
+        _count_round_success(task)
+        task.log_info(f"只打第一层：到达第一层boss，直接撤退，success_rounds + 1 (当前: {ns['success_rounds']})")
+    if handle_escape(task):
+        return True
+    now = time.time()
+    if now - getattr(task, '_boss_retreat_click_time', 0) >= 3:
+        task._boss_retreat_click_time = now
+        _move_and_click(task, 0.959, 0.053)
+    task.sleep(1)
+    return True
+
+
 def handle_escape(task: TriggerTask):
     """逃脱页面: 检测到逃脱按钮后点击逃脱。"""
     escape_box = find_box_at_point(task, 0.952, 0.928)
@@ -4159,6 +4182,9 @@ def handle_expedition_result(task: TriggerTask):
     failed_box = find_box_at_point(task, 0.296, 0.719)
     if hasattr(task, 'node_status'):
         task.node_status['total_rounds'] += 1
+    # 只打第一层：打过第一层 boss，或到 boss 前撤退，都算完成（撤退时游戏显示失败）
+    first_layer_done = (task.node_status.get('pass_final_boss_count', 0) >= 1
+                        or task.node_status.get('retreat_at_boss', False))
     if complete_box and "完成" in complete_box.name:
         if hasattr(task, 'node_status'):
             _count_round_success(task)
@@ -4166,10 +4192,12 @@ def handle_expedition_result(task: TriggerTask):
     elif complete_box and "失败" in complete_box.name:
         if not _get_config_value(task, '只打第一层', False):
             task.log_info("出击模式探险结果: 失败")
-        elif task.node_status.get('pass_final_boss_count', 0) == 0:
+        elif not first_layer_done:
             task.log_info("出击模式探险结果: 失败")
+        else:
+            task.log_info("出击模式探险结果: 只打第一层已完成")
     elif not complete_box and not failed_box:
-        if _get_config_value(task, '只打第一层', False) and task.node_status.get('pass_final_boss_count', 0) >= 1: # 完成第一层任务
+        if _get_config_value(task, '只打第一层', False) and first_layer_done: # 完成第一层任务
             task.log_info("卡厄思模式探险结果: 成功")
         elif not _get_config_value(task, '只打第一层', False) and not task.node_status.get('is_escaped', 0): # 完成了任务且没有逃脱
             _count_round_success(task)
@@ -4196,6 +4224,7 @@ def _initial_node_status():
     return {"shop": False, "flash_or_rest": False, "reach_final_boss": False, "final_boss_battle": False,
             "pass_final_boss_count": 0, "total_rounds": 0, "success_rounds": 0,
             "node_count": 0, "enter_new_node": False, "node_type": "", "is_escaped": False,
+            "retreat_at_boss": False,  # 只打第一层：到第一层 boss 前已撤退（本轮已记成功）
             "save_target_member": False, "target_mask_card_position": -1,
             "get_specific_flash": False, "removed_card_count": 0,
             "neutral_card_count": 0,

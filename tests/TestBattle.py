@@ -631,6 +631,24 @@ class TestRoundSuccessCount(unittest.TestCase):
             utils._finish_only_first_layer(task)
         self.assertEqual(1, task.node_status["success_rounds"])
 
+    def test_only_first_layer_retreats_at_boss(self):
+        clicks, escaped = [], []
+        task = mock.MagicMock()
+        task.node_status = utils._initial_node_status()
+        task.default_config = {"只打第一层": True}
+        task.config = {}
+        task._boss_retreat_click_time = 0
+        menu_open = {"value": False}
+        with mock.patch.object(utils, "_move_and_click", lambda t, x, y: clicks.append((x, y))), \
+                mock.patch.object(utils, "handle_escape", lambda t: menu_open["value"] and not escaped.append(1)):
+            for _ in range(3):  # 菜单还没弹出，路线页连续识别三帧：只点一次右上角
+                self.assertTrue(utils._retreat_before_boss(task))
+            menu_open["value"] = True
+            self.assertTrue(utils._retreat_before_boss(task))
+        self.assertEqual([(0.959, 0.053)], clicks)
+        self.assertEqual([1], escaped)
+        self.assertEqual(1, task.node_status["success_rounds"])
+
 class TestStuckReport(unittest.TestCase):
     def test_stuck_screen_reported_once_per_episode(self):
         # 实跑 12:15~13:10：战斗里读不到手牌数、画面一动不动 55 分钟，没留任何截图
