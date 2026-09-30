@@ -649,6 +649,25 @@ class TestRoundSuccessCount(unittest.TestCase):
         self.assertEqual([1], escaped)
         self.assertEqual(1, task.node_status["success_rounds"])
 
+    def test_escape_menu_only_clicked_after_deciding_to_retreat(self):
+        # 实跑 22:05：关卡牌弹窗的 ESC 落到战斗里打开了菜单，看到「撤退」就点了，满血放弃一轮
+        task = mock.MagicMock()
+        task.node_status = utils._initial_node_status()
+        task._escape_requested_at = 0
+        button = Box(0, 0, 10, 10, name="逃脱")
+        with mock.patch.object(utils, "find_box_at_point", lambda t, x, y: button), \
+                mock.patch.object(utils, "_get_game_text", lambda t, s: s), \
+                mock.patch.object(utils.battle_log, "anomaly", lambda *a, **k: None):
+            self.assertTrue(utils.handle_escape(task))
+            task.send_key.assert_called_with("esc")
+            task.click_box.assert_not_called()
+            self.assertFalse(task.node_status["is_escaped"])
+            with mock.patch.object(utils, "_move_and_click", lambda *a: None):
+                utils._open_escape_menu(task, 0.053)
+            self.assertTrue(utils.handle_escape(task))
+            task.click_box.assert_called_with(button)
+            self.assertTrue(task.node_status["is_escaped"])
+
 class TestStuckReport(unittest.TestCase):
     def test_stuck_screen_reported_once_per_episode(self):
         # 实跑 12:15~13:10：战斗里读不到手牌数、画面一动不动 55 分钟，没留任何截图

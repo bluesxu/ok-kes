@@ -3358,7 +3358,7 @@ def handle_event_task(task: TriggerTask):
                 f"{purpose}：未找到包含“{description_keyword}”的事件任务，"
                 "点击ESC重新开始"
             )
-            _move_and_click(task, 0.959, 0.053)
+            _open_escape_menu(task, 0.053)
         task.sleep(1)
         return True
 
@@ -3528,6 +3528,13 @@ def handle_route_selection(task: TriggerTask):
                 "special_features": [],
             })
 
+    # 点完普通节点后路线页还会停留 1~3 秒，节点图标已经淡出，一个都匹配不到（实跑 22:30 一轮里误判 4 次 boss，
+    # 把 reach_final_boss 置成 True，之后的普通战斗都被当成 boss 战）。刚点过节点就只等页面切走。
+    if not nodes and time.time() - getattr(task, '_route_node_click_time', 0) < 5:
+        task.log_info("刚点过路线节点，路线页图标已淡出，等待页面切换（不当作boss节点）")
+        task.sleep(0.5)
+        return True
+
     # 找不到任何普通节点类型特征时，当前路线节点即为boss。
     if not nodes:
         task.log_info("检测到最终boss节点，点击进入")
@@ -3669,6 +3676,7 @@ def handle_route_selection(task: TriggerTask):
         f"（特殊特征: {node['special_features']}，位置: {click_x:.3f}, {click_y:.3f}）"
     )
     _move_and_click(task, click_x, click_y)
+    task._route_node_click_time = time.time()
 
     task.sleep(2)
 
@@ -4131,18 +4139,35 @@ def _retreat_before_boss(task: TriggerTask) -> bool:
     now = time.time()
     if now - getattr(task, '_boss_retreat_click_time', 0) >= 3:
         task._boss_retreat_click_time = now
-        _move_and_click(task, 0.959, 0.053)
+        _open_escape_menu(task, 0.053)
     task.sleep(1)
     return True
 
 
+_ESCAPE_INTENT_SECONDS = 30  # 决定撤退后多久内点「逃脱」算数（菜单里点一次、确认页再点一次）
+
+
+def _open_escape_menu(task: TriggerTask, y: float):
+    """决定撤退：记下时间再点右上角打开菜单，handle_escape 只在这之后才点「逃脱」。"""
+    task._escape_requested_at = time.time()
+    _move_and_click(task, 0.959, y)
+
+
 def handle_escape(task: TriggerTask):
-    """逃脱页面: 检测到逃脱按钮后点击逃脱。"""
+    """逃脱页面: 检测到逃脱按钮后点击逃脱。
+    只有自己决定撤退（_open_escape_menu）后才点。菜单也会被意外打开：出牌时关卡牌弹窗按的 ESC 落到了战斗里、
+    切窗口等。以前看到就点，满血放弃了好几轮（结算页写「信號消失」，实跑 20:49、22:05 等）。这时按 ESC 关掉菜单。"""
     escape_box = find_box_at_point(task, 0.952, 0.928)
     if escape_box and (
         _get_game_text(task, '逃脱') in escape_box.name
         or "脱逃" in escape_box.name
     ):
+        if time.time() - getattr(task, '_escape_requested_at', 0) > _ESCAPE_INTENT_SECONDS:
+            task.log_info("检测到逃脱页面，但没有要撤退（菜单是意外打开的），按 ESC 关掉")
+            battle_log.anomaly(task, "意外打开撤退菜单", "没有要撤退，按 ESC 关掉菜单")
+            task.send_key("esc")
+            task.sleep(1)
+            return True
         task.log_info("检测到逃脱页面，点击逃脱")
         task.click_box(escape_box)
         task.node_status["is_escaped"] = True
@@ -4266,14 +4291,14 @@ def _finish_only_first_layer(task: TriggerTask) -> bool:
     ):
         _count_round_success(task)
         task.log_info("未刷到指定闪光且已通关第一层，退出重刷")
-        _move_and_click(task, 0.959, 0.051)
+        _open_escape_menu(task, 0.051)
         task.sleep(1)
         return True
 
     if _get_config_value(task, '只打第一层', False):
         _count_round_success(task)
         task.log_info(f"只打第一层任务已完成，success_rounds + 1 (当前: {task.node_status['success_rounds']}), 退出结算页面")
-        _move_and_click(task, 0.959, 0.051)
+        _open_escape_menu(task, 0.051)
         task.sleep(1)
         return True
     return False
