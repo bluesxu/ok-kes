@@ -293,6 +293,20 @@ class TestChooseTarget(unittest.TestCase):
         enemies = [enemy(1254, 1, "攻击", x=0.43), enemy(6078, None, x=0.70)]
         self.assertEqual(6078, battle.choose_target(enemies, True, None)[0]["hp"])
 
+    def test_elite_keeps_hitting_head_after_it_is_hurt(self):
+        # 精英会不断召唤小怪：头目打残后血比新小怪少，仍然打头目
+        state = {}
+        head, minion = enemy(1551, 6, "防御", x=0.66), enemy(728, 2, "攻击", x=0.49)
+        battle.update_head(state, [head, minion])
+        hurt = enemy(300, 6, "防御", x=0.66)
+        battle.update_head(state, [hurt, minion])
+        self.assertIs(hurt, battle.choose_target([hurt, minion], True, None, state["head"])[0])
+        # 开场先只认到了小怪，头目出现后改认血更多的那个
+        state = {}
+        battle.update_head(state, [minion])
+        battle.update_head(state, [minion, head])
+        self.assertIs(head, battle.choose_target([minion, head], True, None, state["head"])[0])
+
     def test_attack_intent_then_countdown_then_hp(self):
         enemies = [enemy(300, 2, "增益", x=0.3), enemy(900, 5, "攻击", x=0.5), enemy(500, 5, "攻击", x=0.7)]
         self.assertEqual(500, battle.choose_target(enemies, False, None)[0]["hp"])

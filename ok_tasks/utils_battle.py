@@ -704,13 +704,27 @@ def choose_play(cards, remaining, priority, defense, danger, unplayable, zero_hp
     return None, "没有出得起的牌"
 
 
-def choose_target(enemies, boss_battle, sticky):
-    """攻击牌的目标：Boss 战打 Boss（血量最多的敌人）；否则优先沿用上一个目标，
+def update_head(state, enemies):
+    """精英/Boss 战记住头目的位置（头目不移动）：头目被打残后血量可能比新召唤的小怪还少，只看血量会转去打小怪。
+    以见过的最多血量为准：开场第一帧没识别到头目、先记成了小怪，等真正的头目出现（血更多）再改过来。"""
+    if not enemies:
+        return
+    top = max(enemies, key=lambda e: e["hp"])
+    if state.get("head") is None or top["hp"] > state.get("head_hp", 0):
+        state["head"], state["head_hp"] = (top["x"], top["y"]), top["hp"]
+
+
+def choose_target(enemies, boss_battle, sticky, head=None):
+    """攻击牌的目标：精英/Boss 战打头目（血量最多的敌人）；否则优先沿用上一个目标，
     没有时按攻击意图（认不出按攻击算）、行动倒计时、血量挑。返回 (敌人, 理由)。"""
     if not enemies:
         return None, "没有识别到敌人"
     if boss_battle:
-        return max(enemies, key=lambda e: e["hp"]), "Boss 战优先打 Boss"
+        if head is not None:
+            same = [e for e in enemies if abs(e["x"] - head[0]) < 0.04 and abs(e["y"] - head[1]) < 0.04]
+            if same:
+                return same[0], "精英/Boss 战继续打头目"
+        return max(enemies, key=lambda e: e["hp"]), "精英/Boss 战优先打血量最多的头目"
     if sticky is not None:
         same = [e for e in enemies if abs(e["x"] - sticky[0]) < 0.04 and abs(e["y"] - sticky[1]) < 0.04]
         if same:
@@ -989,7 +1003,8 @@ def play_turn(task, hand_count, finish_turn_visible):
         if unnamed and remaining != 0:  # AP 用完时手牌变暗，牌名本来就读不全，不算异常
             battle_log.anomaly(task, "牌名没读到", f"按键 {unnamed} 位置上的牌名没读到，仍按位置出牌")
 
-    boss_battle = node_type(task) == "boss"
+    # 精英、Boss 战先打血量最多的头目：它们大多会不断召唤小怪，小怪打不完，头目死了就过关
+    boss_battle = node_type(task) in ("boss", "精英")
     if _get_config_value(task, COLLECT_KEY, False):
         # 每回合每个敌人最多点开一次：读不出意图（比如没见过的写法）也不会反复点，卡在同一个画面
         unknown = next((e for e in enemies if e["intent"] is None
@@ -1032,7 +1047,9 @@ def play_turn(task, hand_count, finish_turn_visible):
             target, target_reason = choose_target(enemies, False, None)
             target_reason = target_reason and "血量为 0，" + target_reason
         else:
-            target, target_reason = choose_target(enemies, boss_battle, state["sticky"])
+            if boss_battle:
+                update_head(state, enemies)
+            target, target_reason = choose_target(enemies, boss_battle, state["sticky"], state.get("head"))
         use_drag = target is not None
         if use_drag and _get_config_value(task, FINE_KEY, True):
             others = preview_candidates(enemies, target, boss_battle)
