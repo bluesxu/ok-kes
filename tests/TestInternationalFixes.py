@@ -9,6 +9,8 @@ sys.path.insert(0, os.path.join(ROOT, "ok_tasks"))
 from ok import Box  # noqa: E402
 import utils  # noqa: E402
 import utils_sortie  # noqa: E402
+import utils_chaos  # noqa: E402
+import speedup  # noqa: E402
 
 WIDTH, HEIGHT = 2560, 1440
 BOSS_POINTS = ["(0.358, 0.706)", "(0.641, 0.706)"]
@@ -184,6 +186,85 @@ class TestChaosRest(unittest.TestCase):
         task = self.rest_page(CREDIT, hp(1100))
         self.assertTrue(utils.handle_rest(task))
         self.assertEqual(["meditate"], task.clicked)
+
+
+# 零式系统初始页面（2026-09-30 更新后的法典卡片：不再显示存储数据价值层级，改为存档储存上限）
+ZERO_SYSTEM = [("零號系統", 0.120, 0.046), ("進入", 0.930, 0.910)]
+REROLL = "(0.968, 0.153)"
+
+
+def capacity(pt):
+    return (f"存檔資料儲存上限{pt}pt", 0.800, 0.558, 0.20)
+
+
+class TestZeroSystemCapacity(unittest.TestCase):
+
+    def page(self, *texts, required=None):
+        task = PageTask(ZERO_SYSTEM + list(texts))
+        if required is not None:
+            task.config[utils_chaos.STORAGE_CAPACITY_KEY] = required
+        return task
+
+    def test_capacity_meets_requirement_enters(self):
+        task = self.page(capacity(170), required=150)
+        self.assertFalse(utils_chaos.handle_zero_system_initial_page(task))
+        self.assertEqual([], task.clicked)
+
+    def test_capacity_below_requirement_rerolls(self):
+        task = self.page(capacity(170), required=200)
+        self.assertTrue(utils_chaos.handle_zero_system_initial_page(task))
+        self.assertEqual([REROLL], task.clicked)
+
+    def test_no_requirement_by_default(self):
+        self.assertFalse(utils_chaos.handle_zero_system_initial_page(self.page(capacity(120))))
+
+    def test_old_value_format_still_uses_level(self):
+        task = self.page(("存檔資料價值11", 0.800, 0.558, 0.20))
+        task.config["存储数据价值大于等于多少层级"] = 12
+        self.assertTrue(utils_chaos.handle_zero_system_initial_page(task))
+        self.assertEqual([REROLL], task.clicked)
+
+    def test_unreadable_waits_then_enters_without_reroll(self):
+        task = self.page(required=200)
+        for _ in range(utils_chaos._STORAGE_READ_RETRIES - 1):
+            self.assertTrue(utils_chaos.handle_zero_system_initial_page(task))
+        self.assertFalse(utils_chaos.handle_zero_system_initial_page(task))
+        self.assertEqual([], task.clicked)  # 原来每帧都点重新合成
+
+
+class TestZeroSystemCapacityPatch(unittest.TestCase):
+    """装进官方版时由 speedup 接管：官方原函数读不到存储数据价值就一直重新合成。"""
+
+    def setUp(self):
+        self.original_calls = 0
+
+        def official(task):
+            self.original_calls += 1
+            task.clicked.append(REROLL)
+            return True
+
+        self.handler = speedup._storage_capacity_wrapper(official)
+
+    def test_capacity_decides_without_official_logic(self):
+        task = PageTask(ZERO_SYSTEM + [capacity(170)])
+        task.config[speedup.STORAGE_CAPACITY_KEY] = 150
+        self.assertFalse(self.handler(task))
+        task.config[speedup.STORAGE_CAPACITY_KEY] = 200
+        self.assertTrue(self.handler(task))
+        self.assertEqual([REROLL], task.clicked)
+        self.assertEqual(0, self.original_calls)
+
+    def test_old_format_and_other_pages_use_official_logic(self):
+        self.handler(PageTask(ZERO_SYSTEM + [("存檔資料價值11", 0.800, 0.558, 0.20)]))
+        self.handler(PageTask([("審判之沼", 0.740, 0.220)]))
+        self.assertEqual(2, self.original_calls)
+
+    def test_unreadable_does_not_reroll_forever(self):
+        task = PageTask(ZERO_SYSTEM)
+        results = [self.handler(task) for _ in range(speedup._STORAGE_READ_RETRIES)]
+        self.assertEqual([True] * (speedup._STORAGE_READ_RETRIES - 1) + [False], results)
+        self.assertEqual([], task.clicked)
+        self.assertEqual(0, self.original_calls)
 
 
 if __name__ == '__main__':

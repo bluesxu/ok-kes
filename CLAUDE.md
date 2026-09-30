@@ -41,6 +41,14 @@ python real_bugfix_check.py                           # 用官方安装目录里
 
 **配置**：配置键就是中文显示名，会持久化到 `configs/*.json`。`config_io.py` 负责配置码导入/导出、本地多套配置、旧配置迁移（在 `load_config` 里调用），`UI_ONLY_CONFIG_KEYS` 里的键不进配置码也不上传；`config_sync.py` 负责匿名上传配置/胜率和“热门配置”。`config_description` 等界面文字要同步 `i18n/<locale>/LC_MESSAGES/ok.po`，并重新编译 `ok.mo`（`msgid` 必须与代码字符串完全一致）。
 
+**给某个角色写配置（查构筑资料 → 出配置码）**：产出是配置码（配置 JSON 的 base64，格式同 `config_io._export_config_to_text`），不改仓库文件。
+- 资料来源，按可信度排：
+  1. 玩家上传的真实配置：用 `config_sync.py` 里的 `SUPABASE_URL` / `SUPABASE_ANON_KEY` 分页拉 `configs` 表（`mode` 为 `sortie`/`chaos`），解码 `config_b64` 后按 `first_member` 或卡名筛选。这里的卡名、闪光描述是游戏里的原文，神闪词条原文（如「赋予敌人脆弱2」）也只在这里好找。
+  2. gamekee 角色页（`gamekee.com/czn/<id>`）：有国服卡面和每张牌 ①~⑤ 号灵光一闪的全文。正文在页面引用的 `api-cdn.gamekee.com/.../content/<id>.json` 里；curl 和 jina 会被 EdgeOne 拦（567），要在浏览器里打开角色页，再用页面内的 `fetch` 去取。Bwiki（`wiki.biligame.com/czn`）的 `api.php` 偶尔能用，页面本身常被拦。cznbuilds.com 有装备、配队推荐。
+  3. B站攻略视频：通常没有字幕，用 `bili audio <BV> --no-split` 下载后跑 `agent-reach transcribe`。转写出来的卡名、装备名是同音字（曾把「定位雷射」听成「追踪雷射」），只能用来取打法思路，名字必须拿 1、2 核对。
+- 写配置时的匹配规则：配置读取和 OCR 文字都会转成简体，国际服繁体名转完通常和国服一样，写一套简体即可。卡牌列表按「包含」匹配。「闪光优先级」写成 `牌名:关键词`，关键词按字依次出现比对（`_flash_rules` / `_flash_rule_matches`）。神闪 = 普通版本的描述末尾再加一行神词条，所以想要某个神闪就写 `牌名:普闪关键词+神词条关键词`，排在普闪规则前面。
+- 导入配置码只覆盖码里写到的键，没写的键沿用用户原来的值（往往是别的角色的配置）。所以要把该模式会读到的键都写上（`grep _get_config_value` 查全）。出击最容易漏的是「卡牌奖励优先级」：出击模式的牌靠奖励页发放，而且可以一直刷新，只填核心牌（如只填「定位雷射」），其余都会被刷掉。
+
 **出击模式出牌 `ok_tasks/utils_battle.py`**：`utils_sortie.handle_battle_page` 只保留 Ego 释放和「结束回合」按钮检测，出牌交给 `utils_battle.play_turn`（设计见 `CONTEXT.md` 术语表和 `docs/adr/0001`）。
 - 手牌按张数排成固定扇形，`hand_slots` 由「N/10」推出每张牌的位置，**按键 = 位置序号**，不依赖 OCR 读牌上方的按键数字；牌名、类型、费用再按位置归属。
 - 敌人以洋红色血条为锚点（`enemy_bars`），血量/护盾/行动倒计时/意图图标都相对血条定位；Boss 的倒计时 ∞ 会被 OCR 读成 8，用字形宽高比区分。
@@ -53,7 +61,7 @@ python real_bugfix_check.py                           # 用官方安装目录里
 - 并行模板匹配、路线页/牌库滚动“停稳即识别”、出击出牌按手牌变化继续。
 - 替换处理函数时要同时替换各模块里按名字导入的引用和 `PAGE_HANDLERS` 列表里的函数对象，统一走 `_replace_function`。
 - `_EXPECTED_RUN_SOURCE` / `_handlers_module` 通过读 `run()` 源码来确认结构没变。**修改 `ChaosMode.run` / `SortieMode.run` 时要同步 `speedup._gated_run`**，`TestSpeedup` 里的 `test_real_*_run_matches_gated_run` 会检查这一点。
-- 其中几项与速度无关的修正（按钮文字被 OCR 切成两个框、国际服 BOSS 页/休息区、分解存档确认框）在源码里也已修好。补丁里保留同样的逻辑，是为了用 `speedup_patch/install_speedup.py` 装进未修改的官方版时同样生效；两边同时存在不冲突。
+- 其中几项与速度无关的修正（按钮文字被 OCR 切成两个框、国际服 BOSS 页/休息区、分解存档确认框、零式系统法典卡片改为按存档储存上限 pt 判断）在源码里也已修好。补丁里保留同样的逻辑，是为了用 `speedup_patch/install_speedup.py` 装进未修改的官方版时同样生效；两边同时存在不冲突。
 
 **`speedup_patch/`**：`install_speedup.py` 把本仓库的改动装进官方安装目录（默认 `D:\Program Files\ok-kes\data\apps\ok-kes\working`），需要先关闭 ok-kes，官方版自动更新后要重新安装。安装目录里的 `utils.py`、`utils_sortie.py`、`ChaosMode.py`、`SortieMode.py` 和翻译文件与 v1.4.3 原版哈希（`BASE_SHA`）一致时整份替换，并复制 `speedup.py`、`utils_battle.py`、`battle_log.py`；对不上（官方已更新）时只往原版 `ChaosMode`/`SortieMode` 插入加速补丁调用。另给 `src/config.py` 追加 OpenVINO f32 补丁。**改了这些被整份替换的文件后，仓库要先合并对应的上游版本，再更新 `BASE_SHA`。**
 

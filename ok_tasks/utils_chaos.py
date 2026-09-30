@@ -32,10 +32,21 @@ import random
 # ------------------------- 卡厄思模式独有页面处理函数 -------------------------
 
 
+STORAGE_CAPACITY_KEY = "存档储存上限大于等于多少pt"
+_STORAGE_READ_RETRIES = 3  # 零式系统页连续几帧读不到存档价值/上限，就不再重新合成，直接进入
+
+
 def _match_storage_data_value(task: TriggerTask, text: str):
     """匹配当前游戏语言中的“存储数据价值+数字”，不要求末尾层级文本。"""
     storage_data_text = re.escape(_get_game_text(task, "存储数据"))
     return re.search(rf"{storage_data_text}价值\s*(\d+)", text)
+
+
+def _match_storage_capacity(task: TriggerTask, text: str):
+    """匹配“存储数据…上限+数字pt”（国际服「存檔資料儲存上限170pt」）。
+    2026-09-30 更新后法典卡片不再显示存储数据价值层级，改为显示存档储存上限。"""
+    storage_data_text = re.escape(_get_game_text(task, "存储数据"))
+    return re.search(rf"{storage_data_text}.{{0,4}}上限\s*(\d+)\s*pt", text, re.IGNORECASE)
 
 
 def handle_season_chaos_initial_page(task: TriggerTask):
@@ -90,11 +101,20 @@ def handle_zero_system_initial_page(task: TriggerTask):
 
     task.log_info("检测到零式系统初始页面")
     value_text = _get_region_text(task, (0.685, 0.317, 0.980, 0.825))
+    capacity_match = _match_storage_capacity(task, value_text)
     value_match = _match_storage_data_value(task, value_text)
-    required_level = int(
-        _get_config_value(task, "存储数据价值大于等于多少层级", 12)
-    )
-    if value_match:
+    if capacity_match:
+        task._storage_read_misses = 0
+        capacity = int(capacity_match.group(1))
+        required_pt = int(_get_config_value(task, STORAGE_CAPACITY_KEY, 0))
+        task.log_info(f"零式系统当前存档储存上限={capacity}pt，要求大于等于{required_pt}pt")
+        if capacity >= required_pt:
+            return False
+    elif value_match:
+        task._storage_read_misses = 0
+        required_level = int(
+            _get_config_value(task, "存储数据价值大于等于多少层级", 12)
+        )
         data_value_level = int(value_match.group(1))
         task.log_info(
             f"零式系统当前存储数据价值={data_value_level}层级，"
@@ -103,9 +123,18 @@ def handle_zero_system_initial_page(task: TriggerTask):
         if data_value_level >= required_level:
             return False
     else:
-        task.log_info(f"零式系统未识别到存储数据价值层级，区域文本=「{value_text}」")
+        # 以前读不到就重新合成，游戏改版后读不到的是格式而不是数字，会一直重新合成下去
+        misses = getattr(task, "_storage_read_misses", 0) + 1
+        task._storage_read_misses = misses
+        task.log_info(f"零式系统未识别到存储数据价值或存档储存上限（第{misses}次），区域文本=「{value_text}」")
+        if misses >= _STORAGE_READ_RETRIES:
+            task._storage_read_misses = 0
+            task.log_info("连续读不到存档价值，不再重新合成，直接进入")
+            return False
+        task.sleep(1)
+        return True
 
-    task.log_info("存储数据价值未达要求，点击进入重新合成")
+    task.log_info("存档价值未达要求，点击进入重新合成")
     _move_and_click(task, 0.968, 0.153)
     task.sleep(1)
     return True

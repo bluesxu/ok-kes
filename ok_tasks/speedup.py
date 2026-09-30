@@ -46,7 +46,9 @@ _move_and_click 点击前还固定悬停 0.5 秒，实际界面通常不到 1 �
 商店页信用点小于 80 就点「离开」退出，不再继续移除、购买或刷新；每次商店操作结束、回到商店页时再查一次，读不到数字不退出。
 配置面板里的「刷新商店」默认关闭：关闭时不点商店里的「免费」刷新，没货就离开；打开后恢复原版刷新。
 分解存档资料的确认框：没勾上「下次登入前不再显示」就先勾上，再点确认。点过已勾上的框会取消勾选，所以先看框是不是橙色。
-按钮文字切成两个框、国际服的几处问题、分解存档确认框，本仓库源码里也已直接修好，保留这里是为了装进官方版时同样生效。
+零式系统法典卡片：游戏更新后不再显示「存储数据价值 N」，改为「存档资料储存上限 N pt」，原版读不到就一直重新合成。
+改为按新增配置「存档储存上限大于等于多少pt」（0 为不限制）判断；两种都读不到时等 3 帧，仍读不到就直接进入。
+按钮文字切成两个框、国际服的几处问题、分解存档确认框、零式系统法典卡片，本仓库源码里也已直接修好，保留这里是为了装进官方版时同样生效。
 两边同时存在不冲突：大多只在原函数没处理时才兜底；休息区读不到数字时，这里的立即重读会先于源码的下一帧重读生效。
 
 只作用于装了本补丁的任务（卡厄思模式、出击模式），关闭任务配置里的“加速模式”即恢复原有的时序逻辑。
@@ -72,6 +74,7 @@ ENABLE_KEY = "加速模式"
 HOVER_KEY = "点击前悬停等待(秒)"
 INTERVAL_KEY = "非战斗检测间隔(秒)"
 SHOP_REFRESH_KEY = "刷新商店"
+STORAGE_CAPACITY_KEY = "存档储存上限大于等于多少pt"
 
 _GRID = 10              # 文字中心按 10x10 网格量化后比较页面
 _SAME_PAGE = 0.6        # 与点击前文字布局相似度 >= 0.6 视为页面还没响应
@@ -151,6 +154,7 @@ _CHECKBOX_SAMPLE = 0.012 # 在勾选框中心周围取样，避开中间的白�
 _LEFT_BATTLE_POLLS = 3  # 回车后连续几次读不到手牌数：多半弹出了选择页面（如“请选择功能”），交给下一轮处理
 _PUNCTUATION = re.compile(r"[^一-鿿\w]")  # 与 utils._clean_match 相同的清理规则
 _PARTIAL_RETRY_SECONDS = 10     # 保留部分选择后这段时间内再次进入选卡，视为“移除”没点成
+_STORAGE_READ_RETRIES = 3       # 零式系统页连续几帧读不到存档价值/上限，就不再重新合成，直接进入
 
 
 def install(task):
@@ -169,6 +173,15 @@ def install(task):
         task.default_config[SHOP_REFRESH_KEY] = False
         task.config_description[SHOP_REFRESH_KEY] = "关闭后商店不再点击「免费」刷新，没货就离开；开启后恢复原版刷新"
         config_io.UI_ONLY_CONFIG_KEYS.add(SHOP_REFRESH_KEY)
+        # 刷存档的门槛，跟着配置码导出
+        task.default_config.setdefault(STORAGE_CAPACITY_KEY, 0)
+        task.config_description[STORAGE_CAPACITY_KEY] = (
+            "零式系统法典卡片上「存档资料储存上限」低于这个值就重新合成，0 为不限制。"
+            "游戏更新后卡片不再显示存储数据价值层级，改看这一项"
+        )
+        config_type = getattr(task, "config_type", None)
+        if isinstance(config_type, dict):
+            config_type.setdefault(STORAGE_CAPACITY_KEY, {"min": 0, "max": 999})
 
     orig = {
         name: getattr(task, name)
@@ -334,6 +347,7 @@ def install(task):
     _patch_bug_fixes()
     _patch_shop_exit()
     _patch_decompose_checkbox()
+    _patch_storage_capacity()
 
 
 def _handlers_module(task):
@@ -1237,3 +1251,60 @@ def _decompose_checkbox_wrapper(original):
         return original(task)
 
     return handle_center_confirm
+
+
+def _patch_storage_capacity():
+    """零式系统法典卡片：游戏更新后「存储数据价值 N」换成了「存档资料储存上限 N pt」。
+    原版读不到存储数据价值就点重新合成，改版后会一直重新合成下去。与“加速模式”开关无关。"""
+    utils_chaos = _import("utils_chaos")
+    if utils_chaos is not None:
+        _replace_function(utils_chaos, "handle_zero_system_initial_page", _storage_capacity_wrapper)
+
+
+def _zero_system_value_text(task):
+    """与 handle_zero_system_initial_page 相同的页面判定；不是这个页面返回 None。"""
+    title_text = utils._get_region_text(task, (0.076, 0.011, 0.291, 0.106))
+    if utils._get_game_text(task, "零式系统") not in title_text:
+        return None
+    if "进入" not in utils._get_region_text(task, (0.681, 0.850, 0.988, 0.972)):
+        return None
+    return utils._get_region_text(task, (0.685, 0.317, 0.980, 0.825))
+
+
+def _storage_capacity_wrapper(original):
+    @functools.wraps(original)
+    def handle_zero_system_initial_page(task):
+        value_text = _zero_system_value_text(task)
+        if value_text is None:
+            return original(task)
+        storage = re.escape(utils._get_game_text(task, "存储数据"))
+        capacity = re.search(rf"{storage}.{{0,4}}上限\s*(\d+)\s*pt", value_text, re.IGNORECASE)
+        if capacity is None:
+            if re.search(rf"{storage}价值\s*(\d+)", value_text):
+                task._storage_read_misses = 0
+                return original(task)  # 旧版卡片，照原逻辑按层级判断
+            misses = getattr(task, "_storage_read_misses", 0) + 1
+            task._storage_read_misses = misses
+            task.log_info(f"零式系统未识别到存储数据价值或存档储存上限（第{misses}次），区域文本=「{value_text}」")
+            if misses >= _STORAGE_READ_RETRIES:
+                task._storage_read_misses = 0
+                task.log_info("连续读不到存档价值，不再重新合成，直接进入")
+                return False
+            task.sleep(1)
+            return True
+        task._storage_read_misses = 0
+        value = int(capacity.group(1))
+        required = utils._get_config_value(task, STORAGE_CAPACITY_KEY, 0)
+        try:
+            required = int(required)
+        except (TypeError, ValueError):
+            required = 0
+        task.log_info(f"零式系统当前存档储存上限={value}pt，要求大于等于{required}pt")
+        if value >= required:
+            return False
+        task.log_info("存档储存上限未达要求，点击进入重新合成")
+        utils._move_and_click(task, 0.968, 0.153)
+        task.sleep(1)
+        return True
+
+    return handle_zero_system_initial_page
