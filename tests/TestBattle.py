@@ -465,6 +465,35 @@ class TestPlayTurn(unittest.TestCase):
             battle.play_turn(self.task, 2, True)
         self.assertEqual(["2", "enter"], self.keys)
 
+    def test_hand_changed_after_reading_waits_for_next_frame(self):
+        # 实跑 15:40:27：出牌把牌移回手牌/抽牌，新牌还没到手就读了手牌，按旧排位按到了空位
+        changed = np.zeros((1440, 2560, 3), np.uint8)
+        changed[1000:1400, 400:2100] = 255  # 手牌区整片变了：新牌到手、整排牌挪位
+        self.task.next_frame = lambda: changed
+        clock = [1000.0]
+        fake_time = SimpleNamespace(time=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0] + s))
+        with mock.patch.object(battle, "time", fake_time):
+            for _ in range(battle._STALE_LIMIT):
+                self.assertTrue(battle.play_turn(self.task, 1, True))
+                self.assertEqual([], self.keys)  # 手牌变了：这一帧不出牌
+            battle.play_turn(self.task, 1, True)  # 一直在变也不卡住：照常出牌
+        self.assertEqual(["1", "enter"], self.keys)
+
+    def test_wait_hand_settled_waits_for_new_cards(self):
+        # 出牌后手牌区先静一下，新牌过一会儿才到手：要静够 _SETTLE_STILL 秒才继续
+        still, moving = np.zeros((1440, 2560, 3), np.uint8), np.zeros((1440, 2560, 3), np.uint8)
+        moving[1000:1400, 400:2100] = 255
+        clock = [0.0]
+        # 每 0.1 秒一帧：0~0.3 秒静止，0.4~0.6 秒新牌飞进来，之后静止
+        self.task.next_frame = lambda: moving if 0.35 <= clock[0] <= 0.65 else still
+        self.task._speedup = {"owed_until": 5.0, "pay_hook": object()}
+        fake_time = SimpleNamespace(time=lambda: clock[0], sleep=lambda s: clock.__setitem__(0, clock[0] + s))
+        with mock.patch.object(battle, "time", fake_time):
+            battle._wait_hand_settled(self.task)
+        self.assertGreaterEqual(clock[0], battle._SETTLE_MIN)
+        self.assertLess(clock[0], battle._SETTLE_MAX)
+        self.assertEqual({"owed_until": 0.0, "pay_hook": None}, self.task._speedup)  # 已等过，加速模式不用再补
+
     def test_lowered_hand_ends_turn_without_trying_cards(self):
         labels = [Box(700, 1260, 150, 40, name="基本攻击"), Box(1200, 1270, 100, 40, name="攻击")]
         self.task.all_texts = labels

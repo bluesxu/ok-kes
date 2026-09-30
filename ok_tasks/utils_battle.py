@@ -83,6 +83,17 @@ _EGO_READY = 0.4               # 费用框浅青色像素占比超过这个值�
 _EGO_TRIES = 2                 # 同一个 Ego 每回合最多按几次（按了没放出去就不再反复按）
 _EP_FULL_POINT = (0.032, 0.947)  # EP 条最下面一格：亮了就是满格
 _AP_ZERO_GRAY = 0.3         # 剩余费用数字区域灰色像素超过这个比例：AP 为 0（灰色空心的「0」，实测 0.42~0.50，白色数字 ≤0.001）
+# 有的牌打出后会把牌移回手牌、抽牌或生成新牌，新牌要过一两秒才到手。以前出牌后读得太早，
+# 按旧的手牌排位按键，按到的是另一张牌或空位（实跑 15:40:27、15:43:09 都是读到的手牌数比实际少）
+_HAND_AREA = (0.159, 0.660, 0.836, 0.995)  # 手牌区连同下方的手牌数、剩余费用
+_HAND_THUMB = (128, 48)
+_HAND_STILL_DIFF = 0.02     # 相邻两次截图变化像素少于这个比例：手牌区没在动
+_HAND_CHANGED_DIFF = 0.10   # 识别用的画面与出牌前的画面差这么多：手牌已经变了（多一张/少一张牌时整排牌都会挪位）
+_SETTLE_MIN = 1.0           # 出牌后至少等这么久（原来固定等 1 秒）
+_SETTLE_STILL = 0.5         # 手牌区连续静止这么久才算停稳
+_SETTLE_MAX = 3.0           # 最多等这么久
+_SETTLE_POLL = 0.1
+_STALE_LIMIT = 2            # 出牌前发现手牌变了，最多连续重读几次，之后照常出牌
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="出牌识别")  # 几块区域的裁剪识别并行跑
 _OCR_LOCK = threading.Lock()
 
@@ -944,6 +955,72 @@ def _read_costs(task, state, frame, cards, pending):
             card["cost"] = 0
 
 
+def _raw_capture(task):
+    """截一帧新画面。加速模式包装过的 next_frame 会先补足欠下的等待，这里用原来的；没有截图方法（测试替身）时返回 None。"""
+    executor = getattr(task, "executor", None)
+    return getattr(executor, "_speedup_original_next_frame", None) or getattr(task, "next_frame", None)
+
+
+def _hand_thumb(frame):
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = _HAND_AREA
+    area = frame[int(y1 * height):int(y2 * height), int(x1 * width):int(x2 * width)]
+    return cv2.cvtColor(cv2.resize(area, _HAND_THUMB, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+
+
+def _hand_diff(a, b):
+    return np.count_nonzero(cv2.absdiff(a, b) > 12) / a.size
+
+
+def _wait_hand_settled(task):
+    """出牌后等手牌区停稳：至少 _SETTLE_MIN 秒，且连续 _SETTLE_STILL 秒没在动，最多 _SETTLE_MAX 秒。
+    移回手牌、抽牌、生成新牌都要等出牌动画和效果结算完才到手，中间手牌区会静一下，所以要静够一段时间。"""
+    capture = _raw_capture(task)
+    if capture is None:
+        task.sleep(1)
+        return
+    start = time.time()
+    previous, still_since = None, None
+    while True:
+        frame = capture()
+        now = time.time()
+        if frame is None:
+            break
+        thumb = _hand_thumb(frame)
+        if previous is not None and _hand_diff(thumb, previous) < _HAND_STILL_DIFF:
+            still_since = still_since or now
+        else:
+            still_since = None
+        previous = thumb
+        if now - start >= _SETTLE_MIN and still_since and now - still_since >= _SETTLE_STILL:
+            break
+        if now - start >= _SETTLE_MAX:
+            task.log_info(f"出牌后手牌区 {_SETTLE_MAX:g} 秒还没停稳，照常继续")
+            break
+        time.sleep(_SETTLE_POLL)
+    speed = getattr(task, "_speedup", None)
+    if speed is not None:
+        # 已经等到手牌停稳：加速模式记着的出牌等待不用再补
+        speed.update(owed_until=0.0, pay_hook=None)
+
+
+def _hand_changed(task, state, frame):
+    """识别完手牌、准备出牌前再截一帧：手牌区和识别用的画面差很多，说明手牌变了（新牌刚到手），
+    按旧的排位出牌会按错，这一帧放弃，下一帧重新识别。连续 _STALE_LIMIT 次都这样就照常出牌，免得卡住。"""
+    capture = _raw_capture(task)
+    now = capture() if capture is not None else None
+    if now is None or frame is None:
+        return False
+    diff = _hand_diff(_hand_thumb(now), _hand_thumb(frame))
+    if diff < _HAND_CHANGED_DIFF or state.get("stale", 0) >= _STALE_LIMIT:
+        state["stale"] = 0
+        return False
+    state["stale"] = state.get("stale", 0) + 1
+    task.log_info(f"识别完手牌后手牌区又变了（变化 {diff:.0%}，可能刚到手新牌），重新识别")
+    battle_log.record(task, "手牌变化重读", diff=round(diff, 3))
+    return True
+
+
 def play_turn(task, hand_count, finish_turn_visible):
     """战斗页面一帧：看一眼、出一张牌或结束回合。返回 True 表示本帧已处理。"""
     state = _ensure_battle(task)
@@ -1037,6 +1114,8 @@ def play_turn(task, hand_count, finish_turn_visible):
     if card is None:
         # AP 确实用完（读到 0 或手牌沉下去）且没有 0 费牌可出：加速模式不必再等 3 秒、再确认一轮
         return _end_turn(task, reason, sure=remaining == 0, observed=observed)
+    if _hand_changed(task, state, frame):
+        return True
 
     target, target_reason, others = None, None, []
     use_drag = _use_drag(task, state, card)
@@ -1068,7 +1147,7 @@ def play_turn(task, hand_count, finish_turn_visible):
         task.send_key(card["key"])
         task.sleep(0.5)
         task.send_key("enter")
-        task.sleep(1)
+        _wait_hand_settled(task)
     if any(word in card["name"] for word in _EXTRA_WAIT_CARDS):
         task.sleep(2)
     return True
@@ -1187,7 +1266,7 @@ def _drag_card(task, card, target, others=()):
     if speed is not None:
         # 加速模式按「数字键/回车」判断刚出过牌；拖动出牌也要告诉它，免得刚出完牌就被判定可以结束回合
         speed["last_play_key"], speed["end_turn_seen"] = time.time(), 0.0
-    task.sleep(1)
+    _wait_hand_settled(task)
 
 
 def _wait_for_button(task, state):
