@@ -4415,10 +4415,12 @@ def handle_expedition_result(task: TriggerTask):
     # 只打第一层：打过第一层 boss，或到 boss 前撤退，都算完成（撤退时游戏显示失败）
     first_layer_done = (task.node_status.get('pass_final_boss_count', 0) >= 1
                         or task.node_status.get('retreat_at_boss', False))
+    outcome = "失败"  # 写进「一轮结束」的 result
     if complete_box and "完成" in complete_box.name:
         if hasattr(task, 'node_status'):
             _count_round_success(task)
             task.log_info("出击模式探险结果: 成功")
+            outcome = "成功"
     elif complete_box and "失败" in complete_box.name:
         if not _get_config_value(task, '只打第一层', False):
             task.log_info("出击模式探险结果: 失败")
@@ -4426,12 +4428,15 @@ def handle_expedition_result(task: TriggerTask):
             task.log_info("出击模式探险结果: 失败")
         else:
             task.log_info("出击模式探险结果: 只打第一层已完成")
+            outcome = "只打第一层已完成"
     elif not complete_box and not failed_box:
         if _get_config_value(task, '只打第一层', False) and first_layer_done: # 完成第一层任务
             task.log_info("卡厄思模式探险结果: 成功")
+            outcome = "成功"
         elif not _get_config_value(task, '只打第一层', False) and not task.node_status.get('is_escaped', 0): # 完成了任务且没有逃脱
             _count_round_success(task)
             task.log_info("卡厄思模式探险结果: 成功")
+            outcome = "成功"
         else:
             task.log_info("卡厄思模式探险结果: 失败")
     else:
@@ -4440,8 +4445,7 @@ def handle_expedition_result(task: TriggerTask):
     if hasattr(task, 'node_status'):
         success = task.node_status.get('round_success_counted', False)
         # 失败不截图：结算页看不出原因，要从这一轮的「进入节点」「战斗结束」等记录往回查
-        battle_log.end_round(task, success=success,
-                             result=complete_box.name if complete_box else None,
+        battle_log.end_round(task, success=success, result=outcome,
                              escaped=task.node_status.get('is_escaped', False),
                              reached_boss=task.node_status.get('reach_final_boss', False),
                              passed_boss=task.node_status.get('pass_final_boss_count', 0),

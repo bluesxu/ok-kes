@@ -498,6 +498,16 @@ def handle_memory_elimination(task: TriggerTask):
     return False
 
 
+def handle_threat_detection(task: TriggerTask):
+    """「威胁侦测」过场页（零式系统选完记忆卡后提示「记忆的尽头BOSS怪物已变更为…」）：点屏幕没反应，按 ESC 关掉。"""
+    if not find_text(task, r'威胁侦测'):
+        return False
+    task.log_info("检测到威胁侦测页面，按 ESC 关闭")
+    task.send_key("esc")
+    task.sleep(1)
+    return True
+
+
 def handle_chaos_craft(task: TriggerTask):
     """卡厄思合成页面: 检测"卡厄思合成"(0.774,0.925)或"免费合成"(0.563,0.922)按钮，点击并等待。"""
     box = find_box_at_point(task, 0.774, 0.925)
@@ -1072,6 +1082,7 @@ PAGE_HANDLERS = [
     log_node_status,
     handle_stuck_log, #画面卡住检测及兜底处理
     handle_close_page, #点击屏幕关闭页面，优先于其他普通页面处理
+    handle_threat_detection, #威胁侦测过场页，按 ESC 关闭
 
     handle_refine_equipment_credit, #提炼装备信用点页面，优先于确认按钮
     handle_decompose_archive_confirm, #分解存档资料：先勾选下次登入前不再显示，再确认

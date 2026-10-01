@@ -844,6 +844,20 @@ class TestBattleLogEvents(unittest.TestCase):
         self.assertEqual((2, None), (rows[6]["round"], rows[6]["hp_change"]))  # 新一轮不跟上一轮比
         self.assertEqual(1, rows[2]["battle"])
 
+    def test_lost_battle_ends_with_the_round(self):
+        # 实跑 10/01 09:15：最终 boss 战输了直接进结算页，「战斗结束」被记到了下一轮
+        battle_log.battle_frame(self.task, True)
+        self.now[0] += 100
+        battle_log.battle_frame(self.task, True)
+        self.now[0] += 2
+        battle_log.end_round(self.task, success=False, result="失败")
+        self.now[0] += battle_log._BATTLE_GONE
+        battle_log.battle_frame(self.task, False)
+        rows = self.rows()
+        self.assertEqual(["战斗开始", "战斗结束", "一轮结束"], [r["event"] for r in rows])
+        self.assertEqual((1, 100), (rows[1]["round"], rows[1]["seconds"]))
+        self.assertEqual("失败", rows[2]["result"])
+
     def test_unhandled_page_reported_once_and_not_during_battle(self):
         for _ in range(15):
             battle_log.unhandled_frame(self.task)

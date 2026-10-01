@@ -120,6 +120,10 @@ def anomaly(task, kind, detail, frame=None, **fields):
 def end_round(task, **fields):
     """一轮结束：记一条带用时的「一轮结束」，之后的记录算下一轮。"""
     state = _state(task)
+    if state["in_battle"]:
+        # 输掉的战斗直接进结算页，等不到离开战斗画面 8 秒：先在本轮记上「战斗结束」，不然会算到下一轮
+        state["in_battle"] = False
+        record(task, "战斗结束", seconds=round(state["battle_last"] - state["battle_start"]))
     record(task, "一轮结束", seconds=round(time.time() - state["round_start"]), rerolls=state["rerolls"], **fields)
     state.update(round_id=state["round_id"] + 1, round_start=time.time(), shots=set(), last_hp=None, rerolls=0, once=set())
 

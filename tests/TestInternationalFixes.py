@@ -58,6 +58,9 @@ class PageTask:
     def click(self, x=-1, y=-1, *args, **kwargs):
         self.clicked.append(f"({x:.3f}, {y:.3f})")
 
+    def send_key(self, key, *args, **kwargs):
+        self.clicked.append(key)
+
     def move_relative(self, x, y):
         pass
 
@@ -500,6 +503,18 @@ class TestMemoryImprint(unittest.TestCase):
             self.assertEqual(names.index("handle_confirm") - 1, names.index("handle_memory_imprint"))
         finally:
             utils_chaos.PAGE_HANDLERS[:] = handlers
+
+
+class TestThreatDetection(unittest.TestCase):
+    """实跑 9/30 23:15：零式系统选完记忆卡后弹出「威胁侦测」，点屏幕关不掉，卡了 4 分多钟。"""
+
+    def test_traditional_title_presses_esc(self):
+        task = PageTask([("威脅偵測", 0.500, 0.845, 0.08), ("記憶的盡頭BOSS怪物已變更為渴望的啟動。", 0.500, 0.910, 0.36)])
+        self.assertTrue(utils_chaos.handle_threat_detection(task))
+        self.assertEqual(["esc"], task.clicked)
+
+    def test_other_page_is_ignored(self):
+        self.assertFalse(utils_chaos.handle_threat_detection(PageTask([("記憶的盡頭", 0.500, 0.910)])))
 
 
 class TestEquipmentSlotColor(unittest.TestCase):
