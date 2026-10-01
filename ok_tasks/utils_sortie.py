@@ -32,6 +32,7 @@ import re
 import random
 import time
 
+import battle_log
 import utils
 import utils_battle
 
@@ -48,6 +49,12 @@ def _get_blacklisted_members(task: TriggerTask):
     """读取拉黑主战员列表，返回列表；解析失败使用默认值。"""
     value = _get_config_value(task, '拉黑主战员', ["黛安娜", "阿黛尔海特"])
     return list(value) if isinstance(value, (list, tuple)) else ["黛安娜", "阿黛尔海特"]
+
+
+# 会合选主战员页面每张卡右下角的职能标签：核心（输出）、支援（抽牌）、保护（护盾）、治疗（奶妈）。
+# 优先级里的角色没出现时，按这个顺序选职能；刷新时也至少留一个这类角色不刷
+SURVIVAL_ROLES = ("保护", "治疗")
+_MEMBER_ROLES = ("核心", "支援") + SURVIVAL_ROLES
 
 
 def _get_battle_member_priority(task: TriggerTask):
@@ -229,6 +236,7 @@ def _read_member_slots(task: TriggerTask):
         box for box in region_boxes
         if refresh_text in box.name
     ]
+    role_boxes = [box for box in region_boxes if box.name.strip() in _MEMBER_ROLES]
 
     slots = []
     unused_refresh_boxes = list(refresh_boxes)
@@ -239,6 +247,13 @@ def _read_member_slots(task: TriggerTask):
         name_y = level_center_y + 0.042
         name_box = find_box_at_point(task, name_x, name_y)
         name = name_box.name if name_box else ""
+        # 职能标签在名字正上方（名字和标签都靠卡片右边对齐）
+        role_box = next((
+            box for box in role_boxes
+            if abs((box.x + box.width / 2) / task.width - name_x) < 0.06
+            and 0.02 < name_y - (box.y + box.height / 2) / task.height < 0.08
+        ), None)
+        role = role_box.name.strip() if role_box else ""
 
         refresh_box = None
         if unused_refresh_boxes:
@@ -257,7 +272,7 @@ def _read_member_slots(task: TriggerTask):
         if name_box:
             task.log_info(
                 f"_read_member_slots: 等级位置({level_center_x:.3f},{level_center_y:.3f}) "
-                f"识别到名称=「{name}」，重新搜索y={refresh_y}"
+                f"识别到名称=「{name}」，职能=「{role}」，重新搜索y={refresh_y}"
             )
         else:
             task.log_info(
@@ -269,6 +284,7 @@ def _read_member_slots(task: TriggerTask):
             "x": name_x,
             "y": name_y,
             "refresh_y": refresh_y,
+            "role": role,
         })
     return slots
 
@@ -394,6 +410,7 @@ def handle_boss_selection(task: TriggerTask):
         return False
     boss = random.choice(bosses)
     task.log_info(f"首领选择: 随机选择「{boss['name']}」")
+    battle_log.record(task, "BOSS选择", bosses=[b["name"] for b in bosses], chosen=boss["name"], reason="随机")
     _move_and_click(task, boss["x"], boss["y"])
     task.sleep(1)
     # _move_and_click(task, 0.919, 0.930)
@@ -468,11 +485,15 @@ def handle_get_card(task: TriggerTask):
         chosen = next((card for card in cards if name in card["name"]), None)
         if chosen:
             task.log_info(f"获得卡牌: 优先选择「{chosen['name']}」(匹配优先级「{name}」)")
+            battle_log.record(task, "卡牌奖励", cards=[c["name"] for c in cards], chosen=chosen["name"],
+                              reason=f"获得卡牌优先级「{name}」")
             _move_and_click(task, chosen["x"], chosen["y"])
             task.sleep(0.5)
             _move_and_click(task, 0.912, 0.931)
             return True
     task.log_info("获得卡牌: 未命中任何优先级卡牌，跳过非优先级卡牌")
+    battle_log.record(task, "卡牌奖励", cards=[c["name"] for c in cards], chosen="跳过",
+                      reason=f"未命中获得卡牌优先级 {priority}")
     _move_and_click(task, 0.749, 0.931)
     task.sleep(1)
     return True
@@ -576,7 +597,8 @@ def handle_battle_member_selection(task: TriggerTask):
 
 
 def handle_member_selection(task: TriggerTask):
-    """主战员选择页面: 优先选配置角色（跳过拉黑角色）；没有则点击每个名字下方按钮刷新一次，仍没有就随机选（跳过拉黑角色）。"""
+    """主战员选择页面: 优先选配置角色（跳过拉黑角色）；没有则点击名字下方按钮刷新一次，
+    刷新时留一个治疗/保护角色不刷；仍没有配置角色就选保护、再选治疗，都没有才随机选（跳过拉黑角色）。"""
     prompt = find_box_at_point(task, 0.500, 0.931)
     if not (prompt and _get_game_text(task, '主战员') in prompt.name):
         return False
@@ -587,6 +609,14 @@ def handle_member_selection(task: TriggerTask):
     def not_blacklisted(slot):
         return not any(blk in slot["name"] for blk in blacklisted)
 
+    def survival_slot(slots):
+        """按 SURVIVAL_ROLES 的顺序找第一个治疗/保护角色。"""
+        for role in SURVIVAL_ROLES:
+            slot = next((s for s in slots if s.get("role") == role and s["name"] and not_blacklisted(s)), None)
+            if slot:
+                return slot
+        return None
+
     slots = _read_member_slots(task)
     chosen = None
     for name in priority:
@@ -595,9 +625,13 @@ def handle_member_selection(task: TriggerTask):
             task.log_info(f"主战员选择: 优先选择「{chosen['name']}」")
             break
     if chosen is None:
-        task.log_info("主战员选择: 未找到优先角色或优先角色被拉黑，点击三个名字下方按钮刷新一次")
+        keep = survival_slot(slots)
+        if keep:
+            task.log_info(f"主战员选择: 未找到优先角色，保留{keep['role']}角色「{keep['name']}」，刷新其余候选")
+        else:
+            task.log_info("主战员选择: 未找到优先角色或优先角色被拉黑，点击三个名字下方按钮刷新一次")
         for slot in slots:
-            if slot["refresh_y"] is not None:
+            if slot is not keep and slot["refresh_y"] is not None:
                 _move_and_click(task, slot["x"], slot["refresh_y"])
                 task.sleep(1)
         task.sleep(1)
@@ -608,6 +642,10 @@ def handle_member_selection(task: TriggerTask):
             if chosen:
                 task.log_info(f"主战员选择: 刷新后选择「{chosen['name']}」")
                 break
+    if chosen is None:
+        chosen = survival_slot(slots)
+        if chosen:
+            task.log_info(f"主战员选择: 没有优先角色，选择{chosen['role']}角色「{chosen['name']}」")
     if chosen is None:
         valid_slots = [slot for slot in slots if slot["name"] and not_blacklisted(slot)]
         if not valid_slots:
@@ -911,6 +949,8 @@ def handle_rest_sortie(task: TriggerTask):
         task.log_info(f"生命值={hp_percent}%, 阈值={flash_threshold}%, 信用点={credit}")
         if credit > flash_cost and hp_percent >= flash_threshold:
             task.log_info("满足闪光条件，点击闪光")
+            battle_log.record(task, "休息区", choice="闪光", hp=utils._get_current_hp(task), credit=credit,
+                              hp_percent=hp_percent, flash_threshold=flash_threshold, flash_cost=flash_cost)
             task._rest_clicked_at = time.time()
             task.click_box(flash_box)
             if not _wait_for_rest_confirm(task):
@@ -924,6 +964,8 @@ def handle_rest_sortie(task: TriggerTask):
     if (rest_feature and "免费" in free_text and hasattr(task, 'node_status')
             and task.node_status.get('flash_or_rest', False)):
         task.log_info("检测到休息界面，点击休息")
+        battle_log.record(task, "休息区", choice="休息", hp=utils._get_current_hp(task),
+                          credit=utils._get_current_credit(task))
         task._rest_clicked_at = time.time()
         task.click_box(rest_feature)
         if not _wait_for_rest_confirm(task):
@@ -944,6 +986,38 @@ def handle_rest_sortie(task: TriggerTask):
     return False
 
 
+# 剧情对话停在同一句多久没变就按空格翻页
+_DIALOG_STALL_SECONDS = 2.5
+
+
+def handle_event_dialog(task: TriggerTask):
+    """事件里的剧情对话: 右下角有 SPACE、右上角有 ALT。
+    游戏的自动对话被关掉时对话会一直停住，同一句停留超过 2.5 秒就后台按一次空格翻页；
+    不去点右上角的自动按钮，它有多个挡位，点了反而可能关掉。"""
+    space = [b for b in task.all_texts
+             if b.name.strip().upper() == "SPACE"
+             and b.x > task.width * 0.85 and b.y > task.height * 0.85]
+    alt = [b for b in task.all_texts
+           if b.name.strip().upper() == "ALT"
+           and b.x > task.width * 0.85 and b.y < task.height * 0.12]
+    if not space or not alt:
+        task._dialog_state = None
+        return False
+    lines = tuple(b.name for b in task.all_texts
+                  if task.height * 0.6 < b.y < task.height * 0.85)
+    now = time.time()
+    state = getattr(task, "_dialog_state", None)
+    if not state or state[0] != lines:
+        task._dialog_state = (lines, now)
+        return False
+    if now - state[1] < _DIALOG_STALL_SECONDS:
+        return False
+    task.log_info(f"剧情对话停了 {now - state[1]:.1f} 秒没翻页，按空格继续: {'/'.join(lines)[:40]}")
+    task.send_key("space")
+    task._dialog_state = (lines, time.time())
+    return True
+
+
 # 出击模式 PAGE_HANDLERS
 PAGE_HANDLERS = [
     handle_auto_stop,
@@ -952,6 +1026,7 @@ PAGE_HANDLERS = [
     log_credit,
     log_node_status,
     handle_stuck_log,
+    handle_event_dialog, #事件剧情对话停住时按空格翻页
     handle_close_page, #点击屏幕关闭页面，优先于其他普通页面处理
 
     handle_ether_supply,
@@ -1018,4 +1093,5 @@ PAGE_HANDLERS = [
     handle_minimizemap,
     handle_held_cards_page,
     handle_escape,
+    utils.log_unhandled_page, #放最后：连续 10 秒没有处理函数认领画面时记「未识别页面」
 ]

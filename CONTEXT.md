@@ -93,3 +93,45 @@ _Avoid_: 精细模式、智能出牌
 **Ego 技能**:
 EP 能量条满后可以释放的技能，用 F1/F2/F3 触发。
 _Avoid_: 大招、终极技能
+
+## 详细日志
+
+两个模式共用 `battle_logs/战斗记录_YYYY-MM-DD.jsonl`，每行一条 JSON，用 `task` 区分模式（「自动出击模式」/「自动卡厄思模式」）。
+每行都有 `time`、`task`、`round`、`battle`、`event`、`node`、`node_type`、`layer`、`boss_battle`。
+一次决定只在真正点下去的那一刻记一行；页面停好几帧的「看了没点」（如达标后交给「进入」按钮）每轮只记第一次。
+
+**轮**:
+`round` 字段：本次运行的第几轮，一轮出击（或卡厄思的一局）在探险结果页结束；刷存档的重开算在下一轮里。
+_Avoid_: 局号
+
+**重开**:
+刷存档类的重来：零式系统重新合成、获得法典卡厄思合成、赛季再次观测、刷初始卡牌/刷空档时 ESC 重开。每次记一行「重开」，一轮结束时汇总成 `rerolls`。
+_Avoid_: 重刷、reroll
+
+**未识别页面**:
+连续 10 秒没有任何页面处理函数认领画面（战斗画面除外）。记一条异常，带截图和画面上的全部文字，用来发现新页面。
+_Avoid_: 卡住（那是画面不动，另记「画面卡住」）
+
+### 事件表
+
+| 事件 | 模式 | 主要字段 |
+|---|---|---|
+| 进入节点 | 两者 | `hp`[当前,上限]、`hp_change`（与本轮上一个节点比）、`credit`、`next_node`、`next_node_type`、`equipment`、`removed_cards`、`neutral_cards`、`flash_done`、`meditation` |
+| 路线选择 | 两者 | `nodes`、`chosen`、`reason`、`plan` |
+| 战斗开始 / 战斗结束 | 两者 | 结束带 `seconds`；离开战斗画面 8 秒才算结束（出击模式战斗中会弹出选择页） |
+| 一轮结束 | 两者 | `success`、`result`、`escaped`、`reached_boss`、`passed_boss`、`nodes`、`rerolls`、`seconds`、`rounds` |
+| 重开 | 卡厄思 | `page` 以及当时读到的值和门槛 |
+| 零式系统 / 赛季初始页 / 获得法典 | 卡厄思 | `value`/`options`、`unit`（pt 或层级）、`required`、`decision`/`chosen` |
+| 记忆卡选择 / 记忆卡刷新 | 卡厄思 | `options`（三张卡的文字）、`chosen`、`reason`；刷新带 `slot`、`remaining` |
+| 面具刻印 | 卡厄思 | `choice`（确认/刷新/跳过）、`description`、`wanted`、`remaining` |
+| 装备分配 | 两者 | `equipment`、`slot`、`quality`、`member`、`member_index`、`reason`、`current`、`target_slots`（刷存档主战员三个装备格的品质+RGB） |
+| 选牌 | 两者 | `action`（移除/复制/闪光…）、`card`、`reason`、`description` |
+| 闪光选择 | 两者 | `card`、`reason`、`chosen`、`options` |
+| 卡牌奖励 / 卡牌分配 | 两者 | `cards`/`card`、`chosen`（牌名/刷新/跳过）、`reason`、`member_index` |
+| 事件选项 | 两者 | `options`、`chosen`、`reason` |
+| 休息区 | 两者 | `choice`（休息/冥想/闪光）、`hp`、`credit` |
+| 商店 | 两者 | `item`、`price`、`credit` |
+| BOSS选择 | 出击 | `bosses`、`chosen` |
+| ESC兜底 | 两者 | `reason`（连续 20 秒没有处理函数认领画面，或画面卡住 20 秒且别的兜底都没动作） |
+| 出牌 / 结束回合 / 释放Ego / 击杀预览 / 意图采集 / 手牌变化重读 | 出击 | 见 `utils_battle.py` |
+| 异常 | 两者 | `kind`、`detail`、`screenshot`；同一种异常每场战斗（卡厄思为每轮）最多截 1 张 |

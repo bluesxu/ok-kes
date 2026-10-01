@@ -1,6 +1,9 @@
 from ok import TriggerTask
 
+import battle_log
+
 from utils import (
+    log_unhandled_page,
     _move_and_click, _simplify_texts, _get_config_value, _get_card_list, _get_route_priority, _get_game_text, _get_region_text, _get_current_hp_percent, _finish_only_first_layer,
     find_box_at_point, find_text, recognize_cards,
     _card_has_type_below, select_card,
@@ -33,6 +36,9 @@ import random
 
 
 STORAGE_CAPACITY_KEY = "存档储存上限大于等于多少pt"
+# 游戏更新前的「存储数据价值 N 层级」门槛。界面上已换成「存档储存上限大于等于多少pt」，
+# 还显示层级的页面（赛季卡厄思、获得法典、旧版零式系统卡片）按原来的默认值判断
+_DATA_VALUE_LEVEL = 12
 _STORAGE_READ_RETRIES = 3  # 零式系统页连续几帧读不到存档价值/上限，就不再重新合成，直接进入
 
 
@@ -50,7 +56,7 @@ def _match_storage_capacity(task: TriggerTask, text: str):
 
 
 def handle_season_chaos_initial_page(task: TriggerTask):
-    """赛季卡厄思初始页面：存储数据价值层级不足时再次观测。"""
+    """赛季卡厄思初始页面：存档储存上限（旧版为存储数据价值层级）不足时再次观测。"""
     title_text = _get_region_text(task, (0.075, 0.014, 0.305, 0.090))
     if "卡厄思" not in title_text:
         return False
@@ -67,26 +73,30 @@ def handle_season_chaos_initial_page(task: TriggerTask):
 
     task.log_info("检测到赛季卡厄思初始页面")
     value_text = _get_region_text(task, (0.684, 0.308, 0.982, 0.754))
-    value_match = _match_storage_data_value(task, value_text)
-    if not value_match:
-        task.log_info(f"未识别到存储数据价值层级，区域文本=「{value_text}」")
+    value, unit = _discovery_option_value(task, value_text)
+    if value is None:
+        task.log_info(f"未识别到存档储存上限或存储数据价值，区域文本=「{value_text}」")
+        if battle_log.once(task, "赛季初始页读不到"):
+            battle_log.anomaly(task, "赛季初始页读不到存档价值", f"区域文本=「{value_text}」")
         return False
 
-    data_value_level = int(value_match.group(1))
-    required_level = int(
-        _get_config_value(task, "存储数据价值大于等于多少层级", 12)
-    )
-    task.log_info(
-        f"当前存储数据价值={data_value_level}层级，"
-        f"要求大于等于{required_level}层级"
-    )
-    if data_value_level >= required_level:
+    required = _discovery_required(task)[unit]
+    task.log_info(f"当前存档={value}{unit}，要求大于等于{required}{unit}")
+    if value >= required:
+        if battle_log.once(task, "赛季初始页进入"):
+            battle_log.record(task, "赛季初始页", value=value, unit=unit, required=required, decision="进入")
         return False
 
-    task.log_info("存储数据价值层级不足，点击再次观测")
+    task.log_info("存档价值不足，点击再次观测")
+    battle_log.reroll(task, "赛季初始页", value=value, unit=unit, required=required)
     task.click_box(observe_boxes[0])
     task.sleep(1)
     return True
+
+
+def _log_zero_system_enter(task, value, unit, required):
+    if battle_log.once(task, "零式系统进入"):
+        battle_log.record(task, "零式系统", value=value, unit=unit, required=required, decision="进入")
 
 
 def handle_zero_system_initial_page(task: TriggerTask):
@@ -108,19 +118,21 @@ def handle_zero_system_initial_page(task: TriggerTask):
         capacity = int(capacity_match.group(1))
         required_pt = int(_get_config_value(task, STORAGE_CAPACITY_KEY, 0))
         task.log_info(f"零式系统当前存档储存上限={capacity}pt，要求大于等于{required_pt}pt")
+        value, unit, required = capacity, "pt", required_pt
         if capacity >= required_pt:
+            _log_zero_system_enter(task, value, unit, required)
             return False
     elif value_match:
         task._storage_read_misses = 0
-        required_level = int(
-            _get_config_value(task, "存储数据价值大于等于多少层级", 12)
-        )
+        required_level = _DATA_VALUE_LEVEL
         data_value_level = int(value_match.group(1))
         task.log_info(
             f"零式系统当前存储数据价值={data_value_level}层级，"
             f"要求大于等于{required_level}层级"
         )
+        value, unit, required = data_value_level, "层级", required_level
         if data_value_level >= required_level:
+            _log_zero_system_enter(task, value, unit, required)
             return False
     else:
         # 以前读不到就重新合成，游戏改版后读不到的是格式而不是数字，会一直重新合成下去
@@ -130,11 +142,13 @@ def handle_zero_system_initial_page(task: TriggerTask):
         if misses >= _STORAGE_READ_RETRIES:
             task._storage_read_misses = 0
             task.log_info("连续读不到存档价值，不再重新合成，直接进入")
+            battle_log.anomaly(task, "零式系统读不到存档价值", f"区域文本=「{value_text}」")
             return False
         task.sleep(1)
         return True
 
     task.log_info("存档价值未达要求，点击进入重新合成")
+    battle_log.reroll(task, "零式系统", value=value, unit=unit, required=required)
     _move_and_click(task, 0.968, 0.153)
     task.sleep(1)
     return True
@@ -386,50 +400,68 @@ def handle_battle_auto_check(task: TriggerTask):
     return True
 
 
+_CHAOS_SYNTH_POINT = (0.460, 0.924)  # 获得法典页底部「卡厄思合成」按钮（花卡厄思宝珠重抽三个选项）
+
+
+def _discovery_option_value(task, text):
+    """获得法典选项的 (比较值, 单位)：优先读「存档资料储存上限 N pt」（2026-09-30 更新后），
+    其次旧版「存储数据价值 N」；「无法获得存档资料」的选项两者都没有，返回 (None, None)。"""
+    capacity = _match_storage_capacity(task, text)
+    if capacity:
+        return int(capacity.group(1)), "pt"
+    level = _match_storage_data_value(task, text)
+    if level:
+        return int(level.group(1)), "层级"
+    return None, None
+
+
+def _discovery_required(task):
+    return {"pt": int(_get_config_value(task, STORAGE_CAPACITY_KEY, 0) or 0), "层级": _DATA_VALUE_LEVEL}
+
+
 def handle_discovery_select(task: TriggerTask): #忘了按个页面要用
-    """发现选择页面：标题区域内出现「获得法典」文本即为该页面，选择达到配置层级的存储数据，否则取消。"""
+    """获得法典页面：选存档储存上限达到配置值的选项（几个都达标时选上限最高的），都不达标就点「卡厄思合成」重抽。
+    2026-09-30 更新后选项显示「存档资料储存上限 N pt」，底部没有「取消」了，只有一般合成、卡厄思合成和确认。"""
     title_text = _get_region_text(task, (0.313, 0.010, 0.670, 0.193))
     if "获得法典" not in title_text:
         return False
 
     task.log_info(f"检测到发现选择页面，标题区域文本=「{title_text}」")
-    required_level = int(
-        _get_config_value(task, "存储数据价值大于等于多少层级", 12)
-    )
+    required = _discovery_required(task)
     option_regions = [
         (0.058, 0.358, 0.315, 0.800),
         (0.370, 0.356, 0.629, 0.796),
         (0.682, 0.356, 0.940, 0.796),
     ]
+    qualified, seen = [], []
     for index, region in enumerate(option_regions):
         option_text = _get_region_text(task, region)
-        level_match = _match_storage_data_value(task, option_text)
-        if not level_match:
-            task.log_info(
-                f"发现选项{index + 1}未识别到存储数据价值层级，"
-                f"区域文本=「{option_text}」"
-            )
+        value, unit = _discovery_option_value(task, option_text)
+        seen.append(value and f"{value}{unit}")
+        if value is None:
+            task.log_info(f"发现选项{index + 1}没有存档储存上限（无法获得存档资料），区域文本=「{option_text}」")
             continue
+        task.log_info(f"发现选项{index + 1}存档={value}{unit}，要求大于等于{required[unit]}{unit}")
+        if value >= required[unit]:
+            qualified.append((value, -index, index, region))
 
-        data_value_level = int(level_match.group(1))
-        task.log_info(
-            f"发现选项{index + 1}存储数据价值={data_value_level}层级，"
-            f"要求大于等于{required_level}层级"
-        )
-        if data_value_level < required_level:
-            continue
-
-        click_x = (region[0] + region[2]) / 2
-        click_y = (region[1] + region[3]) / 2
-        task.log_info(f"发现选项{index + 1}满足层级要求，点击该选项")
-        _move_and_click(task, click_x, click_y)
+    if qualified:
+        value, _, index, region = max(qualified)
+        task.log_info(f"发现选项{index + 1}满足要求（{value}），点击该选项")
+        battle_log.record(task, "获得法典", options=seen, chosen=index + 1, required=required)
+        _move_and_click(task, (region[0] + region[2]) / 2, (region[1] + region[3]) / 2)
         task.sleep(1)
         return True
 
-    task.log_info("没有发现选项满足存储数据价值层级要求，点击取消")
-    _move_and_click(task, 0.663, 0.924)
+    task.log_info("没有发现选项满足存档储存上限要求，点击「卡厄思合成」重抽")
+    battle_log.reroll(task, "获得法典", options=seen, required=required)
+    _move_and_click(task, *_CHAOS_SYNTH_POINT)
     task.sleep(1)
     return True
+
+
+# 本函数已按「存档资料储存上限」判断：speedup 看到这个标记就不再用自己的修正包装它
+handle_zero_system_initial_page.handles_storage_capacity = True
 
 
 def handle_zero_system_home(task: TriggerTask):
@@ -496,6 +528,13 @@ def handle_conquer_difficulty(task: TriggerTask):
 
 # ------------------------- 卡厄思模式独有页面处理函数（续） -------------------------
 
+def _log_engraving(task, choice, desc, wanted, **fields):
+    """详细日志：面具卡牌刻印页的一次操作（确认 / 刷新 / 跳过）；「确认」这页会停好几帧，每轮只记一次。"""
+    if choice == "确认" and not battle_log.once(task, f"面具刻印确认:{desc}"):
+        return
+    battle_log.record(task, "面具刻印", choice=choice, description=desc, wanted=wanted, **fields)
+
+
 def handle_chaos_mask_engraving(task: TriggerTask):
     """面具卡牌刻印获取页面: 如果0.499,0.126处文本包含"面具卡牌刻印"，则为该页面。
     如果0.921,0.931处_clean_match"确认"后，检测0.495,0.221处是否包含"替换"：
@@ -536,6 +575,7 @@ def handle_chaos_mask_engraving(task: TriggerTask):
             task.log_info(f"新刻印描述: {new_desc}")
             if specify_text in new_desc:
                 task.log_info(f"新刻印命中「{specify_text}」，交给确认按钮")
+                _log_engraving(task, "确认", new_desc, specify_text)
                 return False
             # 检查刷新
             refresh_box = find_box_at_point(task, 0.916, 0.810)
@@ -546,11 +586,13 @@ def handle_chaos_mask_engraving(task: TriggerTask):
                     task.log_info(f"刻印1未命中，剩余刷新次数: {remaining}")
                     if remaining > 0:
                         task.log_info(f"点击刷新")
+                        _log_engraving(task, "刷新", None, specify_text, remaining=remaining)
                         _move_and_click(task, 0.916, 0.810)
                         task.sleep(1)
                         return True
             # 无法刷新，点击跳过
             task.log_info("无法刷新，点击跳过")
+            _log_engraving(task, "跳过", None, specify_text)
             _move_and_click(task, 0.747, 0.932)
             task.sleep(1)
             return True
@@ -566,6 +608,7 @@ def handle_chaos_mask_engraving(task: TriggerTask):
         if specify_text in slot2_desc:
             # 刻印2也命中，点击跳过
             task.log_info("刻印2也命中配置，点击跳过")
+            _log_engraving(task, "跳过", slot2_desc, specify_text, reason="两个刻印都已是指定刻印")
             _move_and_click(task, 0.747, 0.932)
             task.sleep(1)
             return True
@@ -575,6 +618,7 @@ def handle_chaos_mask_engraving(task: TriggerTask):
         task.log_info(f"新刻印描述: {new_desc}")
         if specify_text in new_desc:
             task.log_info(f"新刻印命中「{specify_text}」，交给确认按钮")
+            _log_engraving(task, "确认", new_desc, specify_text)
             return False
 
         # 检查刷新
@@ -586,12 +630,14 @@ def handle_chaos_mask_engraving(task: TriggerTask):
                 task.log_info(f"刻印2未命中，剩余刷新次数: {remaining}")
                 if remaining > 0:
                     task.log_info(f"点击刷新")
+                    _log_engraving(task, "刷新", None, specify_text, remaining=remaining)
                     _move_and_click(task, 0.916, 0.810)
                     task.sleep(1)
                     return True
 
         # 无法刷新，点击跳过
         task.log_info("无法刷新，点击跳过")
+        _log_engraving(task, "跳过", None, specify_text)
         _move_and_click(task, 0.747, 0.932)
         task.sleep(1)
         return True
@@ -603,6 +649,7 @@ def handle_chaos_mask_engraving(task: TriggerTask):
 
     if specify_text in desc_text:
         task.log_info(f"刻印描述包含「{specify_text}」，交给确认按钮处理")
+        _log_engraving(task, "确认", desc_text, specify_text)
         return False
 
     # 未命中，检查可刷新次数
@@ -614,6 +661,7 @@ def handle_chaos_mask_engraving(task: TriggerTask):
             task.log_info(f"未命中指定刻印，剩余刷新次数: {remaining}")
             if remaining > 0:
                 task.log_info(f"剩余刷新次数{remaining}>0，点击刷新")
+                _log_engraving(task, "刷新", desc_text, specify_text, remaining=remaining)
                 _move_and_click(task, 0.913, 0.667)
                 task.sleep(1)
                 return True
@@ -1094,4 +1142,5 @@ PAGE_HANDLERS = [
     handle_held_cards_page,
     handle_escape,
     handle_stage_end_data_details, #关卡结束数据详情页面，低优先级
+    log_unhandled_page, #放最后：连续 10 秒没有处理函数认领画面时记「未识别页面」
 ]

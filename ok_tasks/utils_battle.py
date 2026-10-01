@@ -64,12 +64,18 @@ _DEFENSE_WORDS = _SHIELD_WORDS + ("治", "愈", "疗", "恢复", "回复", "再�
 _EXTRA_WAIT_CARDS = ("极光", "万众英雄")  # 打出后动画较长，沿用原逻辑额外等 2 秒
 _STUCK_LIMIT = 3            # 同一张牌连续这么多次还在手里（又没提示 AP不足），本回合不再出它
 _BUTTON_GONE_LIMIT = 30     # 「结束回合」按钮消失这么多秒还没回来，就不再当作敌人行动中干等
-_DRAG_FAIL_LIMIT = 2        # 拖动连续这么多次没打出去，改用按键 + 回车打默认目标
+_DRAG_FAIL_LIMIT = 2        # 拖动连续这么多次没打出去，本场改用按键 + 回车打默认目标
 _DRAG_STEPS = 12            # 后台拖动中途发几次鼠标移动
 _DRAG_STEP_INTERVAL = 0.02
 _DRAG_HOVER = 0.3           # 拖到敌人身上停多久再松手（等击杀预览显示出来）
+# 实跑 17:59~18:45：游戏不再理会后台发的按键（数字键出牌、E 都没反应），鼠标拖动、点击照常有效，卡了 45 分钟。
+# 按键出牌没打出去时先拖动再试一次，拖动打出去了就认定本场键盘失效，之后出牌、结束回合都用鼠标
+_FIELD_DROP = (0.5, 0.45)   # 不用选目标的牌拖到场地中间松手
+_END_TURN_POINT = (0.89, 0.867)  # 右下角「结束回合」按钮
+_E_KEY_LIMIT = 2            # 同一回合按了这么多次 E 按钮还在，之后每次再用鼠标点一下按钮
 _PREVIEW_SHOTS = 20         # 每次运行最多存几张击杀预览截图（因为打得死改了目标时），用来核对识别
 _PREVIEW_OTHERS = 2         # 精细化战斗：默认目标之外最多再悬停看几个敌人（加上默认目标共 3 次）
+_LETHAL_MARGIN = 0.7        # 估计伤害不低于敌人血量 + 护盾的这个比例，才去悬停确认能不能打死
 _PREVIEW_FRAMES = 2         # 每次悬停最多取几帧（第一帧读不到数字时再取一帧）
 _PREVIEW_BOX = (-0.08, -0.03, 0.08, 0.07)  # 悬停时读数字的范围，相对拖动前血量数字的位置（拖牌时镜头推近，实测往右下偏约 0.03）
 _WM_MOUSEMOVE, _WM_LBUTTONDOWN, _WM_LBUTTONUP, _MK_LBUTTON = 0x0200, 0x0201, 0x0202, 0x0001
@@ -77,6 +83,7 @@ _RED_SAMPLES = 4            # 读预计扣血时连续取样的帧数（红色�
 _RED_INTERVAL = 0.25
 _HP_GREEN_MIN = 5           # 血条一行里绿色像素少于这个数算没有绿色（剩 5% 血时实测约 40 像素）
 _ZERO_HP_LAST_RATIO = 0.15  # 读不到血量时，本场上一次读到的血量低于上限的这个比例，才可能是打到 0 了
+_COLLAPSED_RATIO = 0.3     # 血条一行里紫色像素超过这个比例算崩溃（血量为 0）
 _EGO_SLOTS = (("F1", 0.714), ("F2", 0.817), ("F3", 0.904))  # 左下角三个 Ego 头像上费用框的中心 y
 _EGO_COST_X = (0.057, 0.070)   # 费用框横向范围（取框内底色，不含边框）
 _EGO_READY = 0.4               # 费用框浅青色像素占比超过这个值：放得起（实测 0.60~0.84；放不起是灰色、空槽是暗的，都为 0）
@@ -84,16 +91,17 @@ _EGO_TRIES = 2                 # 同一个 Ego 每回合最多按几次（按了
 _EP_FULL_POINT = (0.032, 0.947)  # EP 条最下面一格：亮了就是满格
 _AP_ZERO_GRAY = 0.3         # 剩余费用数字区域灰色像素超过这个比例：AP 为 0（灰色空心的「0」，实测 0.42~0.50，白色数字 ≤0.001）
 # 有的牌打出后会把牌移回手牌、抽牌或生成新牌，新牌要过一两秒才到手。以前出牌后读得太早，
-# 按旧的手牌排位按键，按到的是另一张牌或空位（实跑 15:40:27、15:43:09 都是读到的手牌数比实际少）
-_HAND_AREA = (0.159, 0.660, 0.836, 0.995)  # 手牌区连同下方的手牌数、剩余费用
-_HAND_THUMB = (128, 48)
-_HAND_STILL_DIFF = 0.02     # 相邻两次截图变化像素少于这个比例：手牌区没在动
-_HAND_CHANGED_DIFF = 0.10   # 识别用的画面与出牌前的画面差这么多：手牌已经变了（多一张/少一张牌时整排牌都会挪位）
+# 按旧的手牌排位按键，按到的是另一张牌或空位（实跑 15:40:27、15:43:09 都是读到的手牌数比实际少）。
+# 只看手牌数「N/10」：手牌区画面平时一直有动画，比截图判断静止时每张牌都等满上限（实跑 16:02 一局 33 次），
+# 出牌前比截图也常误报变化 10%~26%
+_COUNT_BOX = (0.470, 0.950, 0.560, 0.995)  # 手牌数「N/10」
+_COUNT_TEXT = re.compile(r"(\d+)\s*/\s*1[0O]")
 _SETTLE_MIN = 1.0           # 出牌后至少等这么久（原来固定等 1 秒）
-_SETTLE_STILL = 0.5         # 手牌区连续静止这么久才算停稳
-_SETTLE_MAX = 3.0           # 最多等这么久
-_SETTLE_POLL = 0.1
-_STALE_LIMIT = 2            # 出牌前发现手牌变了，最多连续重读几次，之后照常出牌
+_SETTLE_STABLE = 0.6        # 手牌数连续这么久没变才算停稳
+_SETTLE_MAX = 2.5           # 最多等这么久
+_SETTLE_POLL = 0.15
+_SETTLE_MISSING = 3         # 连续几次读不到手牌数：多半弹出了选择页面，不再等
+_STALE_LIMIT = 2            # 出牌前发现手牌数变了，最多连续重读几次，之后照常出牌
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="出牌识别")  # 几块区域的裁剪识别并行跑
 _OCR_LOCK = threading.Lock()
 
@@ -106,7 +114,7 @@ def install(task):
     task.default_config[DANGER_KEY] = 25
     task.config_description[DEFENSE_KEY] = "保命牌（加护盾、回血）：牌名带「盾」「格挡」「壁」「治」「疗」「恢复」等字的会自动认出，这里只需补充认不出的牌；预计这回合会被打死、或挨打后血量低于「防御血量线」时先出这些牌"
     task.config_description[DANGER_KEY] = "预计敌人这一轮打完后我方血量低于上限的百分之几，就先出保命牌；0 为只在会被打死时才出"
-    task.config_description[FINE_KEY] = "攻击牌拖起后先在其他敌人身上悬停看击杀预览，打得死就打它，否则打默认目标（每张牌最多多花约 1 秒）；关闭时集中打同一个敌人直到它死"
+    task.config_description[FINE_KEY] = "攻击牌拖到目标上时读击杀预览，记下这张牌本场的伤害；估计能一张牌打死别的敌人时，先悬停确认再补刀；关闭时直接打目标"
     task.config_description[COLLECT_KEY] = "前期收集数据用：遇到没见过的意图图标时点开怪物信息面板读出意图并记下图标，会变慢；图标收集够后关闭"
     config_io.UI_ONLY_CONFIG_KEYS.add(COLLECT_KEY)
 
@@ -246,14 +254,29 @@ def hp_bar_empty(frame):
     return True
 
 
+def hp_bar_collapsed(frame):
+    """我方血条变成紫色乱码（血量为 0 的崩溃状态）：至少两行大半是紫色。实测崩溃时每行紫色占 75% 以上，其余截图不到 5%。"""
+    h, w = frame.shape[:2]
+    x0, x1 = int(_HP_BAR_X[0] * w), int(_HP_BAR_X[1] * w)
+    rows = 0
+    for row_y in _HP_BAR_ROWS:
+        row = cv2.cvtColor(frame[int(row_y * h):int(row_y * h) + 1, x0:x1], cv2.COLOR_BGR2HSV)[0]
+        purple = (row[:, 0] >= 130) & (row[:, 0] <= 165) & (row[:, 1] > 100) & (row[:, 2] > 120)
+        rows += purple.sum() >= _COLLAPSED_RATIO * (x1 - x0)
+    return rows >= 2
+
+
 def is_zero_hp(hp, last_hp, frame):
     """我方血量是否为 0：读到 0 就是；实跑中血量打到 0 后血量文字读不出来（记录里 hp 为 null），
-    这时要本场上一次读到的血量已经很低、且血条上没有绿色，才当成 0（文字被别的界面挡住时不误判）。"""
+    这时要本场上一次读到的血量已经很低、且血条上没有绿色，才当成 0（文字被别的界面挡住时不误判）。
+    带着 0 血进入下一场战斗时本场没有读到过血量（实跑 17:48 战斗 4），血条变紫也算 0。"""
     if hp:
         return hp[0] == 0
-    if not last_hp or last_hp[0] > last_hp[1] * _ZERO_HP_LAST_RATIO or frame is None:
+    if frame is None or not hp_bar_empty(frame):
         return False
-    return hp_bar_empty(frame)
+    if last_hp and last_hp[0] <= last_hp[1] * _ZERO_HP_LAST_RATIO:
+        return True
+    return hp_bar_collapsed(frame)
 
 
 def incoming_lethal(task):
@@ -482,13 +505,15 @@ def read_enemies(task, frame):
         diamond = (left - 0.021, bar_y + 0.006)
         diamond_region = (diamond[0] - 0.026, diamond[1] - 0.036, diamond[0] + 0.024, diamond[1] + 0.036)
         countdown = _read_digit(task, frame, diamond_region)
-        if countdown == 8 and _looks_like_infinity(_crop(frame, diamond_region)):
+        infinite = countdown == 8 and _looks_like_infinity(_crop(frame, diamond_region))
+        if infinite:
             countdown = None  # ∞（常见于 Boss）会被 OCR 读成 8：看字形宽高比区分
         icon_region = (diamond[0] - 0.02, diamond[1] + 0.028, diamond[0] + 0.02, diamond[1] + 0.085)
         enemies.append({
             "x": round(left, 3), "y": round(bar_y, 3), "hp": hp[2],
             "shield": shields[0][2] if shields else 0,
             "countdown": countdown,
+            "infinite": infinite,
             "icon_region": icon_region,
             "intent": match_intent(_crop(frame, icon_region)),
             "drop": (min(0.97, hp[0]), min(0.62, bar_y + 0.2)),
@@ -582,7 +607,8 @@ def classify_intent_panel(lines):
 
 
 def collect_intent(task, enemy):
-    """意图采集：点开怪物信息面板读出意图，把图标存进图标库，再关掉面板。"""
+    """意图采集：点开怪物信息面板读出意图，把图标存进图标库，再关掉面板。
+    返回 True 表示这个怪物本回合已行动（面板上没有意图）。"""
     frame = task.frame
     crop = _crop(frame, enemy["icon_region"]).copy()
     _move_and_click(task, *enemy["drop"])
@@ -594,7 +620,8 @@ def collect_intent(task, enemy):
         lines.append((_normalize_text(box.name), (box.y + box.height / 2) / task.height))
     lines.sort(key=lambda item: item[1])
     result = classify_intent_panel(lines)
-    if result is None and any("已行动" in text or "行动完成" in text for text, _ in lines):
+    acted = result is None and any("已行动" in text or "行动完成" in text for text, _ in lines)
+    if acted:
         task.log_info("意图采集：该怪物本回合已行动，面板上没有意图，跳过")
     elif result is None:
         battle_log.anomaly(task, "意图采集失败", f"点开敌人后没读到意图：{[t for t, _ in lines]}")
@@ -608,13 +635,14 @@ def collect_intent(task, enemy):
     # 面板没打开就不点「关闭」：大 Boss 的身体会伸到关闭位置，点下去反而把面板点开（实跑中因此卡了两个小时）。
     # 关完再看一眼，还开着就换 ESC；剩下的交给 handle_weakness_info 轮流用两种办法关
     if not any(_WEAKNESS.search(text) for text, _ in lines):
-        return
+        return acted
     for tries in range(2):
         close_monster_panel(task, tries)
         task.sleep(0.5)
         task.next_frame()
         if not any(_WEAKNESS.search(box.name) for box in task.ocr(*_WEAKNESS_REGION)):
-            return
+            break
+    return acted
 
 
 # ======================================================================
@@ -643,11 +671,28 @@ def _blocked(card, unplayable):
     return not name.startswith("未识别") and _matches(name, [u for u in unplayable if len(u) >= 2 and "/" not in u])
 
 
+def _one_char_off(a, b):
+    """两个牌名是否只差一个字（同一位置读错，或多读/少读一个字）。"""
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) == 1
+    short, long_ = sorted((a, b), key=len)
+    return any(long_[:i] + long_[i + 1:] == short for i in range(len(long_)))
+
+
 def _priority_rank(card, priority):
-    """在「出牌优先级」里的位置，越小越先出；不在列表里排最后。"""
+    """在「出牌优先级」里的位置，越小越先出；不在列表里排最后。
+    先按互相包含比对；都不中再允许错一个字（实跑中「苍白流星」读成「奢白流星」，被强化牌抢先），
+    只对 3 个字以上的牌名放宽，免得短名误配。"""
+    name_read = card["name"]
     for rank, name in enumerate(priority):
-        if name and (name in card["name"] or card["name"] in name):
+        if name and (name in name_read or name_read in name):
             return rank, name
+    if not name_read.startswith("未识别"):
+        for rank, name in enumerate(priority):
+            if name and min(len(name), len(name_read)) >= 3 and _one_char_off(name, name_read):
+                return rank, name
     return len(priority), None
 
 
@@ -716,46 +761,77 @@ def choose_play(cards, remaining, priority, defense, danger, unplayable, zero_hp
 
 
 def update_head(state, enemies):
-    """精英/Boss 战记住头目的位置（头目不移动）：头目被打残后血量可能比新召唤的小怪还少，只看血量会转去打小怪。
-    以见过的最多血量为准：开场第一帧没识别到头目、先记成了小怪，等真正的头目出现（血更多）再改过来。"""
+    """Boss 战记住 Boss 的位置（Boss 不移动，打残后血量可能比新召唤的小怪还少，只看血量会转去打小怪）。
+    认准行动倒计时是 ∞ 的那个；还没认出 ∞ 时先记见过血最多的，之后认出 ∞ 或出现血更多的再改过来。
+    认出 ∞ 以后不再按血量改认：精英战几个敌人血量相近时，曾按血量在几个敌人之间来回换目标。"""
     if not enemies:
+        return
+    boss = [e for e in enemies if e.get("infinite")]
+    if boss:
+        top = max(boss, key=lambda e: e["hp"])
+        state.update(head=(top["x"], top["y"]), head_hp=top["hp"], head_sure=True)
+        return
+    if state.get("head_sure"):
         return
     top = max(enemies, key=lambda e: e["hp"])
     if state.get("head") is None or top["hp"] > state.get("head_hp", 0):
         state["head"], state["head_hp"] = (top["x"], top["y"]), top["hp"]
 
 
-def choose_target(enemies, boss_battle, sticky, head=None):
-    """攻击牌的目标：精英/Boss 战打头目（血量最多的敌人）；否则优先沿用上一个目标，
-    没有时按攻击意图（认不出按攻击算）、行动倒计时、血量挑。返回 (敌人, 理由)。"""
+def choose_target(enemies, boss_battle, sticky, head=None, urgent=False):
+    """攻击牌的目标，返回 (敌人, 理由)。
+    Boss 战打 Boss；否则集火：沿用上一个目标直到它死，没有时挑有攻击意图（认不出按攻击算）的敌人里血量 + 护盾最少的，
+    少打死一个就少挨一个的打。urgent（我方血量为 0）：先打有攻击意图、行动倒计时小的。"""
     if not enemies:
         return None, "没有识别到敌人"
+    if urgent:
+        return min(enemies, key=_threat_rank), "攻击意图、行动倒计时小、血少的优先"
     if boss_battle:
         if head is not None:
             same = [e for e in enemies if abs(e["x"] - head[0]) < 0.04 and abs(e["y"] - head[1]) < 0.04]
             if same:
-                return same[0], "精英/Boss 战继续打头目"
-        return max(enemies, key=lambda e: e["hp"]), "精英/Boss 战优先打血量最多的头目"
+                return same[0], "Boss 战继续打 Boss"
+        return max(enemies, key=lambda e: e["hp"]), "Boss 战优先打血量最多的 Boss"
     if sticky is not None:
         same = [e for e in enemies if abs(e["x"] - sticky[0]) < 0.04 and abs(e["y"] - sticky[1]) < 0.04]
         if same:
             return same[0], "继续打同一个敌人"
+    return min(enemies, key=_focus_rank), "集火：攻击意图、血量加护盾最少的优先"
 
-    return min(enemies, key=_threat_rank), "攻击意图、行动倒计时小、血少的优先"
+
+def _attacking(e):
+    return e["intent"] in (None, INTENT_ATTACK)
+
+
+def _toughness(e):
+    return e["hp"] + (e.get("shield") or 0)
 
 
 def _threat_rank(e):
-    attacking = e["intent"] in (None, INTENT_ATTACK)
     countdown = e["countdown"] if e["countdown"] is not None else 99
-    return (0 if attacking else 1, countdown, e["hp"])
+    return (0 if _attacking(e) else 1, countdown, e["hp"])
 
 
-def preview_candidates(enemies, target, boss_battle):
-    """精细化战斗：默认目标之外值得悬停看击杀预览的敌人，按威胁排序。Boss 战只看有攻击意图（或认不出意图）的小怪，
-    都打不死时仍然打 Boss。"""
-    others = [e for e in enemies if e is not target
-              and not (boss_battle and e["intent"] not in (None, INTENT_ATTACK))]
-    return sorted(others, key=_threat_rank)[:_PREVIEW_OTHERS]
+def _focus_rank(e):
+    countdown = e["countdown"] if e["countdown"] is not None else 99
+    return (0 if _attacking(e) else 1, _toughness(e), countdown)
+
+
+def preview_candidates(enemies, target, damage):
+    """精细化战斗：默认目标之外值得悬停确认能不能打死的敌人（补刀）。damage 是这张牌本场战斗读到的伤害，
+    没读到过时不看别的敌人。只看估计伤害不低于血量 + 护盾 _LETHAL_MARGIN 的：装备、增益会让实际伤害偏高，留点余量，
+    打不打得死以击杀预览为准。"""
+    if not damage:
+        return []
+    others = [e for e in enemies if e is not target and damage >= _LETHAL_MARGIN * _toughness(e)]
+    return sorted(others, key=_focus_rank)[:_PREVIEW_OTHERS]
+
+
+def hit_damage(enemy, after):
+    """悬停时读到的剩余血量 → 这张牌的伤害（先扣护盾再扣血）。护盾没打穿（血量不变）或读不到时算不出，返回 None。"""
+    if after is None or after >= enemy["hp"]:
+        return None
+    return enemy["hp"] - after + (enemy.get("shield") or 0)
 
 
 def read_preview_hp(task, frame, enemy):
@@ -811,8 +887,10 @@ def _state(task):
 
 def _new_turn(state):
     # collected：本回合已经点开看过意图的敌人（意图每回合会变，所以每回合每个敌人最多采集一次）
-    # ego_tries：本回合每个 Ego 按过几次
-    state.update(unplayable=set(), attempts={}, costs={}, last=None, collected=set(), ego_tries={})
+    # ego_tries：本回合每个 Ego 按过几次；collect_off：本回合不再采集意图
+    # key_retry：本回合按键没打出去、改用拖动再试的牌位；e_presses：本回合按了几次 E
+    state.update(unplayable=set(), attempts={}, costs={}, last=None, collected=set(), ego_tries={},
+                 collect_off=False, key_retry=set(), e_presses=0)
 
 
 def _start_turn_if_new(state):
@@ -840,7 +918,9 @@ def node_type(task):
 
 
 def _session(task):
-    """跨战斗保留的状态：这台机器上拖动出牌是否有效。后台拖动（PostMessage）可能不被游戏当成出牌。"""
+    """跨战斗保留的状态：本次运行拖动出牌成功过几次等。后台拖动（PostMessage）可能不被游戏当成出牌；
+    drag_disabled 只管当前这场战斗，每场开始时清掉重新试（实跑 19:30 窗口在前台时开头两次拖动失败，
+    之后十几分钟、两场精英战都只能按键打默认目标；窗口切到后台时按键又失效，两头都没了）。"""
     session = getattr(task, "_battle_session", None)
     if session is None:
         # zero_cost：本次运行读到过 0 费的牌名，见 _read_costs
@@ -853,9 +933,11 @@ def start_battle(task):
     state = _state(task)
     state.clear()
     _new_turn(state)
-    state.update(sticky=None, drag_fail={}, last_remaining=None, last_seen=time.time(), zero_frames=0)
-    battle_log.new_battle(task)
-    battle_log.record(task, "战斗开始")
+    # damage：本场战斗每张攻击牌悬停时读到的伤害（装备、增益让伤害在局内一直变，只在本场用）
+    state.update(sticky=None, drag_fail={}, last_remaining=None, last_seen=time.time(), zero_frames=0, damage={})
+    session = _session(task)
+    session.update(drag_disabled=False, drag_fail=0)
+    # 战斗编号和「战斗开始」记录由 battle_log.battle_frame 统一写（两个模式相同）
 
 
 def _slot(card, hand_count):
@@ -863,10 +945,19 @@ def _slot(card, hand_count):
     return f"{card['key']}/{hand_count}"
 
 
-def _mark_unplayable(state, last):
+def _mark_unplayable(state, last, by_name=True):
+    """by_name 为 False 时只记这个位置：同名的其他牌（比如击破后从墓地召回的）照样可以出。"""
     state["unplayable"].add(last["slot"])
-    if not last["name"].startswith("未识别"):
+    if by_name and not last["name"].startswith("未识别"):
         state["unplayable"].add(last["name"])
+
+
+def _short_of_ap(last):
+    """没打出去可能是 AP 不够吗：费用读不到、剩余 AP 读不到、或费用确实比剩余 AP 多。
+    0 费牌、费用明明够的牌没打出去，多半是打出去了但没看出来（实跑中定位雷射击破后回到手牌，手牌数、AP 都没变），
+    不能按牌名封掉：同名牌本回合全出不了，击破后召回的定位雷射都留在手里就结束了回合。"""
+    cost, remaining = last.get("cost"), last.get("remaining")
+    return cost is None or remaining is None or cost > remaining
 
 
 def _check_last_play(task, state, hand_count, remaining):
@@ -876,10 +967,15 @@ def _check_last_play(task, state, hand_count, remaining):
     if not last or hand_count is None:
         return
     state["last"] = None
-    # 0 费又抽牌的牌（如逆转之刃）打出后手牌数、AP 都不变：看左侧有没有出现这张牌的牌名横幅
-    played = hand_count < last["hand"] or (
+    # 0 费又抽牌的牌（如逆转之刃）打出后手牌数、AP 都不变：看左侧有没有出现这张牌的牌名横幅。
+    # 手牌数变多也算打出去了：我方回合只有出牌的效果会加牌（击破后从墓地召回、抽牌）
+    played = hand_count != last["hand"] or (
         remaining is not None and last.get("remaining") is not None and remaining < last["remaining"]) \
         or _played_banner(task, last["name"])
+    if not played:
+        # 出牌动画慢时这一帧手牌数还没变（实跑 20:01:59 读到 6、紧接着重读是 5）：再截一帧看看
+        fresh = _fresh_hand_count(task)
+        played = fresh is not None and fresh != last["hand"]
     fails = state["attempts"]
     fails[last["slot"]] = 0 if played else fails.get(last["slot"], 0) + 1
     if last["method"] == "拖动":
@@ -893,16 +989,30 @@ def _check_last_play(task, state, hand_count, remaining):
             if drag_fail[last["name"]] >= _DRAG_FAIL_LIMIT:
                 fails[last["slot"]] = 0  # 改用按键后重新计数，不让拖动的失败次数算到按键头上
             if not session["drag_ok"] and session["drag_fail"] >= _DRAG_FAIL_LIMIT and not session["drag_disabled"]:
+                # 本次运行还没拖成功过、这场又连着失败：本场改用按键，下一场重新试
                 session["drag_disabled"] = True
                 fails[last["slot"]] = 0
                 battle_log.anomaly(task, "拖动出牌无效",
-                                   f"拖动出牌连续 {session['drag_fail']} 次都没打出去，本次运行改用按键打默认目标")
+                                   f"拖动出牌连续 {session['drag_fail']} 次都没打出去，本场战斗改用按键打默认目标")
+    if last.get("key_retry") and played and not state.get("keys_dead"):
+        state["keys_dead"] = True
+        battle_log.anomaly(task, "按键无效", f"「{last['name']}」按键没打出去、拖动打出去了，本场战斗改用鼠标出牌和结束回合")
+    if last["method"] == "按键" and not played and remaining != 0 and last["slot"] not in state["key_retry"] \
+            and not _session(task)["drag_disabled"]:
+        # 键盘可能失效了：先不记出不起，下一帧拖动再试一次（AP 确实不够时多花一次拖动）
+        state["key_retry"].add(last["slot"])
+        fails[last["slot"]] = 0
+        task.log_info(f"「{last['name']}」按键没打出去，改用拖动再试一次")
+        return
     # 按键出的牌没打出去多半是 AP 不够（「AP不足」提示一闪而过常常读不到）：失败一次本回合就不再出它，
-    # 不再每张试 3 次（实跑中回合末尾每张牌白按 3 遍，每场战斗浪费 20~30 秒）
-    limit = 1 if last["method"] == "按键" else _STUCK_LIMIT
+    # 不再每张试 3 次（实跑中回合末尾每张牌白按 3 遍，每场战斗浪费 20~30 秒）。
+    # 拖到场地中间的牌、按键失败后改拖动重试的牌同样只试一次
+    limit = 1 if last["method"] == "按键" or last.get("once") else _STUCK_LIMIT
     if not played and fails[last["slot"]] >= limit:
-        _mark_unplayable(state, last)
-        battle_log.anomaly(task, "出不掉牌", f"「{last['name']}」{last['method']}出牌 {limit} 次没打出去，本回合不再出它")
+        by_name = _short_of_ap(last)
+        _mark_unplayable(state, last, by_name=by_name)
+        battle_log.anomaly(task, "出不掉牌", f"「{last['name']}」{last['method']}出牌 {limit} 次没打出去，"
+                           + ("本回合不再出它" if by_name else "费用够，只跳过这个位置，同名牌照样出"))
 
 
 def _played_banner(task, name):
@@ -961,41 +1071,42 @@ def _raw_capture(task):
     return getattr(executor, "_speedup_original_next_frame", None) or getattr(task, "next_frame", None)
 
 
-def _hand_thumb(frame):
-    height, width = frame.shape[:2]
-    x1, y1, x2, y2 = _HAND_AREA
-    area = frame[int(y1 * height):int(y2 * height), int(x1 * width):int(x2 * width)]
-    return cv2.cvtColor(cv2.resize(area, _HAND_THUMB, interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
-
-
-def _hand_diff(a, b):
-    return np.count_nonzero(cv2.absdiff(a, b) > 12) / a.size
+def read_hand_count(task, frame):
+    """读手牌数「N/10」；OCR 常把前面的图标读成 1（「106」），只取后两位。读不到返回 None。"""
+    crop = _crop(frame, _COUNT_BOX)
+    if crop.size == 0:
+        return None
+    for text in _ocr_texts(task, cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)):
+        match = _COUNT_TEXT.search(text.replace(" ", ""))
+        if match:
+            count = int(match.group(1)[-2:])
+            return count if count <= 10 else count % 10
+    return None
 
 
 def _wait_hand_settled(task):
-    """出牌后等手牌区停稳：至少 _SETTLE_MIN 秒，且连续 _SETTLE_STILL 秒没在动，最多 _SETTLE_MAX 秒。
-    移回手牌、抽牌、生成新牌都要等出牌动画和效果结算完才到手，中间手牌区会静一下，所以要静够一段时间。"""
+    """出牌后等手牌数停稳：至少 _SETTLE_MIN 秒，且连续 _SETTLE_STABLE 秒没变，最多 _SETTLE_MAX 秒。
+    移回手牌、抽牌、生成新牌都要等出牌动画和效果结算完才到手，手牌数会先少一张再变多。"""
     capture = _raw_capture(task)
     if capture is None:
         task.sleep(1)
         return
     start = time.time()
-    previous, still_since = None, None
+    value, since, missing = None, None, 0
     while True:
         frame = capture()
-        now = time.time()
         if frame is None:
             break
-        thumb = _hand_thumb(frame)
-        if previous is not None and _hand_diff(thumb, previous) < _HAND_STILL_DIFF:
-            still_since = still_since or now
-        else:
-            still_since = None
-        previous = thumb
-        if now - start >= _SETTLE_MIN and still_since and now - still_since >= _SETTLE_STILL:
+        count = read_hand_count(task, frame)
+        now = time.time()
+        missing = missing + 1 if count is None else 0
+        if missing >= _SETTLE_MISSING:
+            break  # 手牌数被盖住：多半弹出了选择页面，交给下一轮处理
+        if count is None or count != value:
+            value, since = count, now
+        elif now - start >= _SETTLE_MIN and now - since >= _SETTLE_STABLE:
             break
         if now - start >= _SETTLE_MAX:
-            task.log_info(f"出牌后手牌区 {_SETTLE_MAX:g} 秒还没停稳，照常继续")
             break
         time.sleep(_SETTLE_POLL)
     speed = getattr(task, "_speedup", None)
@@ -1004,20 +1115,22 @@ def _wait_hand_settled(task):
         speed.update(owed_until=0.0, pay_hook=None)
 
 
-def _hand_changed(task, state, frame):
-    """识别完手牌、准备出牌前再截一帧：手牌区和识别用的画面差很多，说明手牌变了（新牌刚到手），
-    按旧的排位出牌会按错，这一帧放弃，下一帧重新识别。连续 _STALE_LIMIT 次都这样就照常出牌，免得卡住。"""
+def _fresh_hand_count(task):
     capture = _raw_capture(task)
-    now = capture() if capture is not None else None
-    if now is None or frame is None:
-        return False
-    diff = _hand_diff(_hand_thumb(now), _hand_thumb(frame))
-    if diff < _HAND_CHANGED_DIFF or state.get("stale", 0) >= _STALE_LIMIT:
+    frame = capture() if capture is not None else None
+    return read_hand_count(task, frame) if frame is not None else None
+
+
+def _hand_changed(task, state, hand_count):
+    """识别完手牌、准备出牌前再读一次手牌数：和识别时不一样，说明新牌刚到手，
+    按旧的排位出牌会按错，这一帧放弃，下一帧重新识别。连续 _STALE_LIMIT 次都这样就照常出牌，免得卡住。"""
+    count = _fresh_hand_count(task)
+    if count is None or count == hand_count or state.get("stale", 0) >= _STALE_LIMIT:
         state["stale"] = 0
         return False
     state["stale"] = state.get("stale", 0) + 1
-    task.log_info(f"识别完手牌后手牌区又变了（变化 {diff:.0%}，可能刚到手新牌），重新识别")
-    battle_log.record(task, "手牌变化重读", diff=round(diff, 3))
+    task.log_info(f"识别完手牌后手牌数从 {hand_count} 变成了 {count}（新牌刚到手），重新识别")
+    battle_log.record(task, "手牌变化重读", before=hand_count, after=count)
     return True
 
 
@@ -1080,15 +1193,18 @@ def play_turn(task, hand_count, finish_turn_visible):
         if unnamed and remaining != 0:  # AP 用完时手牌变暗，牌名本来就读不全，不算异常
             battle_log.anomaly(task, "牌名没读到", f"按键 {unnamed} 位置上的牌名没读到，仍按位置出牌")
 
-    # 精英、Boss 战先打血量最多的头目：它们大多会不断召唤小怪，小怪打不完，头目死了就过关
-    boss_battle = node_type(task) in ("boss", "精英")
-    if _get_config_value(task, COLLECT_KEY, False):
+    # Boss 战始终打 Boss：它大多会不断召唤小怪，小怪打不完，Boss 死了就过关。精英战按普通战斗集火
+    boss_battle = node_type(task) == "boss"
+    if _get_config_value(task, COLLECT_KEY, False) and not state.get("collect_off"):
         # 每回合每个敌人最多点开一次：读不出意图（比如没见过的写法）也不会反复点，卡在同一个画面
         unknown = next((e for e in enemies if e["intent"] is None
                         and (round(e["x"] * 20), round(e["y"] * 20)) not in state["collected"]), None)
         if unknown is not None:
             state["collected"].add((round(unknown["x"] * 20), round(unknown["y"] * 20)))
-            collect_intent(task, unknown)
+            if collect_intent(task, unknown):
+                # 实跑 16:38:14：击杀后连点 4 个敌人都是「本回合已行动」，白花 10 秒。
+                # 看到一个已行动，其余多半也行动过了，这回合不再点
+                state["collect_off"] = True
             return True
 
     priority = _get_config_value(task, "出牌优先级", [])
@@ -1114,35 +1230,43 @@ def play_turn(task, hand_count, finish_turn_visible):
     if card is None:
         # AP 确实用完（读到 0 或手牌沉下去）且没有 0 费牌可出：加速模式不必再等 3 秒、再确认一轮
         return _end_turn(task, reason, sure=remaining == 0, observed=observed)
-    if _hand_changed(task, state, frame):
+    if _hand_changed(task, state, hand_count):
         return True
 
     target, target_reason, others = None, None, []
     use_drag = _use_drag(task, state, card)
+    fine = _get_config_value(task, FINE_KEY, True)
     if use_drag:
         if zero_hp:
             # 不再优先打 Boss、也不沿用上一个目标：先打有攻击意图、行动倒计时小、血少的
-            boss_battle = False
-            target, target_reason = choose_target(enemies, False, None)
+            target, target_reason = choose_target(enemies, False, None, urgent=True)
             target_reason = target_reason and "血量为 0，" + target_reason
         else:
             if boss_battle:
                 update_head(state, enemies)
             target, target_reason = choose_target(enemies, boss_battle, state["sticky"], state.get("head"))
         use_drag = target is not None
-        if use_drag and _get_config_value(task, FINE_KEY, True):
-            others = preview_candidates(enemies, target, boss_battle)
-    method = "拖动" if use_drag else "按键"
+        if use_drag and fine:
+            others = preview_candidates(enemies, target, state.get("damage", {}).get(card["name"]))
+    retry = card["slot"] in state["key_retry"]
+    # 本场键盘失效、或这张牌按键没打出去：不用选目标（或没找到目标）的牌也拖到场地中间打出
+    field = not use_drag and (state.get("keys_dead") or retry) and not _session(task)["drag_disabled"]
+    if field:
+        target_reason = "按键无效，拖到场地中间" if state.get("keys_dead") else "按键没打出去，改用拖动再试"
+    method = "拖动" if use_drag or field else "按键"
     battle_log.record(task, "出牌", card=card["name"], key=card["key"], cost=card["cost"], card_type=card["type"],
                       reason=reason, target=target and {k: target[k] for k in ("x", "y", "hp", "countdown", "intent")},
                       target_reason=target_reason, method=method, **observed)
     task.log_info(f"出牌「{card['name']}」（{reason}）"
-                  + (f" → 拖到敌人 hp={target['hp']}（{target_reason}）" if use_drag else f" → 按键 {card['key']}"))
+                  + (f" → 拖到敌人 hp={target['hp']}（{target_reason}）" if use_drag
+                     else f" → {target_reason}" if field else f" → 按键 {card['key']}"))
     state["last"] = {"name": card["name"], "slot": card["slot"], "hand": hand_count, "method": method,
-                     "remaining": remaining}
+                     "remaining": remaining, "cost": card["cost"], "key_retry": retry, "once": retry or field}
     if use_drag:
-        _drag_card(task, card, target, others)
+        _drag_card(task, card, target, others, preview=fine)
         state["sticky"] = (target["x"], target["y"])
+    elif field:
+        _drag_card(task, card, {"drop": _FIELD_DROP})
     else:
         task.send_key(card["key"])
         task.sleep(0.5)
@@ -1222,6 +1346,7 @@ def _hover_reading(task, enemy):
 
 def _preview_hover(task, card, target, others):
     """精细化战斗的悬停：依次停在其他候选敌人身上，打得死就在那里松手；都打不死最后停到默认目标上松手。
+    每次读到的剩余血量都换算成这张牌的伤害记下来（见 hit_damage），下一张同名牌据此判断要不要看别的敌人。
     群攻牌不另外识别：它打谁都一样，只是多悬停几次。"""
     visits = list(others) + [target]
     seen = []
@@ -1244,22 +1369,27 @@ def _preview_hover(task, card, target, others):
         enemy = visits[step["i"]]
         frame, value = _hover_reading(task, enemy)
         seen.append({"hp": enemy["hp"], "after": value})
+        damage = hit_damage(enemy, value)
+        if damage:
+            _state(task).setdefault("damage", {})[card["name"]] = damage
         if enemy is not target and is_lethal(enemy, value):
             return finish(frame, enemy, "打得死")
         step["i"] += 1
         if step["i"] < len(visits):
             return visits[step["i"]]["drop"]
-        return finish(frame, target, "都打不死，打默认目标")
+        return finish(frame, target, "都打不死，打默认目标" if others else "打默认目标")
     return hover
 
 
-def _drag_card(task, card, target, others=()):
-    """others 非空（精细化战斗）时先拖到它们身上看击杀预览，见 _preview_hover。"""
+def _drag_card(task, card, target, others=(), preview=False):
+    """preview（精细化战斗）时在落点读击杀预览、记下这张牌的伤害；others 非空时先拖到它们身上看能不能打死，
+    见 _preview_hover。"""
     # 从牌身中部拖起；牌名没读到时没有 y，用手牌区牌身的大致高度
     start = (card["x"] + 0.035, min(0.93, card["y"] + 0.07) if card.get("y") is not None else 0.86)
     first, on_hover = target["drop"], None
-    if others:
-        first, on_hover = others[0]["drop"], _preview_hover(task, card, target, others)
+    if others or preview:
+        first = (others[0] if others else target)["drop"]
+        on_hover = _preview_hover(task, card, target, others)
     if not _post_drag(task, start, first, on_hover=on_hover):
         task.swipe_relative(start[0], start[1], target["drop"][0], target["drop"][1], duration=0.35)
     speed = getattr(task, "_speedup", None)
@@ -1353,8 +1483,17 @@ def _end_turn(task, reason, sure=False, observed=None):
         speed["end_turn_sure"] = sure
         speed["end_turn_deferred"] = False
     task.send_key("e")
+    pressed = not (speed is not None and speed.get("end_turn_deferred"))
+    if pressed:
+        state = _state(task)
+        state["e_presses"] = state.get("e_presses", 0) + 1
+        if state.get("keys_dead") or state["e_presses"] > _E_KEY_LIMIT:
+            # E 可能没反应（见 _FIELD_DROP 上方的说明）：再用鼠标点一下按钮
+            if state["e_presses"] == _E_KEY_LIMIT + 1 and not state.get("keys_dead"):
+                battle_log.anomaly(task, "按 E 无效", f"本回合按了 {_E_KEY_LIMIT} 次 E 还没结束回合，改用鼠标点按钮")
+            _move_and_click(task, *_END_TURN_POINT)
     # 加速模式可能这一轮先不按 E（刚出过牌等手牌刷新）：只在真正按下时记一条，免得战斗记录里每回合结束两次
-    if observed is not None and not (speed is not None and speed.get("end_turn_deferred")):
+    if observed is not None and pressed:
         battle_log.record(task, "结束回合", reason=reason, **observed)
     task.sleep(1)
     return True

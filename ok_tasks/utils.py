@@ -259,6 +259,15 @@ def _parse_discounted_price(price_text):
     return int(price_text)
 
 
+def _get_current_hp(task: TriggerTask):
+    """读取当前生命值 (当前, 上限)，读不到返回 None。"""
+    hp_box = find_box_at_point(task, 0.209, 0.040)
+    hp_match = hp_box and re.search(r'(\d+)/(\d+)', hp_box.name)
+    if not hp_match or int(hp_match.group(2)) <= 0:
+        return None
+    return int(hp_match.group(1)), int(hp_match.group(2))
+
+
 def _get_current_hp_percent(task: TriggerTask):
     """读取当前生命值百分比，无法识别时返回 False。"""
     hp_box = find_box_at_point(task, 0.209, 0.040)
@@ -340,6 +349,10 @@ def find_target_card(task: TriggerTask):
     return target_boxes, click_positions
 
 
+# 牌名框里如果读到的只是类型字，说明没框到牌名
+_CARD_TYPE_WORDS = {"攻击", "技能", "强化", "异能", "诅咒", "状态"}
+
+
 def _recognize_cards_by_features(
     task: TriggerTask,
     region,
@@ -410,6 +423,21 @@ def _recognize_cards_by_features(
             min(1.0, center_y + description_offsets[3]),
         )
         card_name = _get_region_text(task, name_region).strip()
+        if not card_name:
+            # 强化图标模板有时匹配在牌名那一行（获得卡牌页实测置信度约 0.80，真正的类型图标在下面一行），
+            # 牌名框就落到了卡面图上、牌名掉进了类型框。按“特征在牌名行”下移再框一次
+            shift = -(name_offsets[1] + name_offsets[3]) / 2
+            shifted = [
+                (max(0.0, center_x + o[0]), max(0.0, center_y + shift + o[1]),
+                 min(1.0, center_x + o[2]), min(1.0, center_y + shift + o[3]))
+                for o in (name_offsets, type_offsets, description_offsets)
+            ]
+            shifted_name = _get_region_text(task, shifted[0]).strip()
+            if shifted_name and re.sub(r'[^一-鿿]', '', shifted_name) not in _CARD_TYPE_WORDS:
+                task.log_info(f"{log_prefix}卡牌识别调试: 特征={feature_name} 的牌名框为空，"
+                              f"下移 {shift:.4f} 后读到牌名「{shifted_name}」")
+                card_name = shifted_name
+                name_region, type_region, desc_region = shifted
         task.log_info(
             f"{log_prefix}卡牌识别调试: 特征={feature_name}，"
             f"特征中心=({center_x:.4f},{center_y:.4f})，"
@@ -1343,6 +1371,10 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
     sortie_flash = action in ("闪光", "灵光") and task.name == "自动出击模式"
     seen_cards = {}
 
+    def log_pick(card, reason):
+        battle_log.record(task, "选牌", action=action or "选择", card=card["name"], reason=reason,
+                          description=card.get("description"), wanted=list(card_names or [])[:20])
+
     def record_pending_removal():
         if action == "移除":
             task._pending_removed_card_count = (
@@ -1387,6 +1419,7 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
             if card["selected"] or not predicate(card):
                 continue
             task.log_info(f"{page}: {reason}「{card['name']}」")
+            log_pick(card, reason)
             _move_and_click(task, card["x"], card["y"])
             task.sleep(0.3)
             card["selected"] = True
@@ -1415,6 +1448,7 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
                 task.log_info(
                     f"{page}: 命中优先级「{target}」，点击目标卡牌「{card['name']}」"
                 )
+                log_pick(card, f"命中优先级「{target}」")
                 _move_and_click(task, card["x"], card["y"])
                 task.sleep(0.3)
                 card["selected"] = True
@@ -1877,8 +1911,8 @@ def handle_stuck_log(task: TriggerTask):
             f"画面卡住兜底: 随机点击卡牌「{chosen_card['name']}」"
         )
         _move_and_click(task, chosen_card["x"], chosen_card["y"])
-    else:
-        handle_unknown_page(task)
+    elif not handle_unknown_page(task) and stuck_seconds >= _ESC_FALLBACK_AFTER:
+        _esc_fallback(task, f"画面卡住已持续{stuck_seconds}秒")
     # 普通随机点屏幕兜底暂时停用。
     # click_x = random.uniform(0.059, 0.985)
     # click_y = random.uniform(0.129, 0.981)
@@ -1922,7 +1956,9 @@ def log_credit(task: TriggerTask):
 
 
 def log_node_status(task: TriggerTask):
-    """记录当前胜率（仅记录, 不拦截后续处理）。"""
+    """记录当前胜率（仅记录, 不拦截后续处理）；顺带告诉详细日志这一帧是不是战斗画面（记战斗开始/结束）。"""
+    hand = find_box_at_point(task, 0.512, 0.969)
+    battle_log.battle_frame(task, bool(hand and re.search(r'\d+/10', hand.name)))
     ns = getattr(task, 'node_status', None)
     if ns:
         try:
@@ -1970,6 +2006,33 @@ def log_node_status(task: TriggerTask):
         else:
             task.info_set("当前胜率",f"{ns['success_rounds']}/{total} NaN")
         task.log_info("")
+    return False
+
+
+_ESC_FALLBACK_AFTER = 20  # 没有处理函数认领画面 / 画面卡住且别的兜底都没动作，持续这么多秒就按 ESC
+_ESC_FALLBACK_GAP = 10    # 两次 ESC 兜底至少间隔这么久，给页面留出响应时间
+
+
+def _esc_fallback(task: TriggerTask, reason: str) -> bool:
+    """没见过的页面、卡住的页面最后按 ESC 兜底（多数弹窗/子页面 ESC 就能关掉或返回）。"""
+    now = time.time()
+    if now - getattr(task, "_esc_fallback_at", 0) < _ESC_FALLBACK_GAP:
+        return False
+    task._esc_fallback_at = now
+    task.log_info(f"{reason}，按 ESC 兜底")
+    battle_log.record(task, "ESC兜底", reason=reason)
+    task.send_key("esc")
+    task.sleep(1)
+    return True
+
+
+def log_unhandled_page(task: TriggerTask):
+    """放在 PAGE_HANDLERS 最后：走到这里说明这一帧没有处理函数认领，连续 10 秒就记一次「未识别页面」（截图 + 全部文字），
+    连续 20 秒按 ESC 兜底。"""
+    battle_log.unhandled_frame(task)
+    seconds = battle_log.unhandled_seconds(task)
+    if seconds >= _ESC_FALLBACK_AFTER:
+        return _esc_fallback(task, f"已 {seconds:.0f} 秒没有页面处理函数认领画面")
     return False
 
 
@@ -2185,6 +2248,7 @@ def handle_card_reward(task: TriggerTask):
         task.log_info(
             f"卡牌奖励页面: 检测到target卡牌，点击位置{click_position}"
         )
+        battle_log.record(task, "卡牌奖励", cards=[c["name"] for c in cards], chosen="target", reason="target 卡牌特征")
         _move_and_click(task, *click_position)
         return True
 
@@ -2206,12 +2270,15 @@ def handle_card_reward(task: TriggerTask):
             task.log_info(
                 f"刷初始卡牌命中「{initial_card_name}」，点击该卡牌"
             )
+            battle_log.record(task, "卡牌奖励", cards=[c["name"] for c in cards], chosen=initial_card["name"],
+                              reason=f"刷初始卡牌「{initial_card_name}」")
             _move_and_click(task, initial_card["x"], initial_card["y"])
             task.sleep(1)
             return True
         task.log_info(
             f"刷初始卡牌未找到「{initial_card_name}」，点击ESC重新开始"
         )
+        battle_log.reroll(task, f"刷初始卡牌「{initial_card_name}」", cards=[c["name"] for c in cards])
         _move_and_click(task, 0.960, 0.053)
         task.sleep(1)
         return True
@@ -2252,11 +2319,15 @@ def handle_card_reward(task: TriggerTask):
                     f"卡牌奖励页面未命中优先级卡牌，"
                     f"点击刷新次数「{remaining}/{maximum}」刷新卡牌"
                 )
+                battle_log.record(task, "卡牌奖励", cards=[c["name"] for c in cards], chosen="刷新",
+                                  reason=f"未命中优先级 {priority}，剩余刷新 {remaining}/{maximum}")
                 task.click_box(refresh_box)
             return True
 
     if chosen_card is None and cards:
         task.log_info("未命中优先级卡牌，跳过非优先级卡牌")
+        battle_log.record(task, "卡牌奖励", cards=[c["name"] for c in cards], chosen="跳过",
+                          reason=f"未命中优先级 {priority}，没有刷新次数")
         # 在区域(0.620,0.883,0.990,0.983)内查找包含"跳过"的box并点击
         skip_box = next((b for b in task.all_texts
                          if 0.620 <= (b.x + b.width / 2) / task.width <= 0.990
@@ -2273,6 +2344,8 @@ def handle_card_reward(task: TriggerTask):
 
     if chosen_card:
         task.log_info(f"卡牌奖励页面触发选卡事件，点击「{chosen_card['name']}」")
+        battle_log.record(task, "卡牌奖励", cards=[c["name"] for c in cards], chosen=chosen_card["name"],
+                          reason="卡牌奖励优先级")
         _move_and_click(task, chosen_card["x"], chosen_card["y"])
         task.sleep(1)
         return True
@@ -2448,24 +2521,55 @@ def _equipment_quality_at(task: TriggerTask, point, allow_empty=False):
     return "传说", rgb
 
 
+def _slot_quality(task: TriggerTask, center):
+    """主战员装备格的品质：取格子右上角一小块的平均色（左上角是类型徽章、中间是装备图、底部是星星，
+    右上角只有底色）。蓝底普通、橙底史诗，灰暗没有颜色是空槽（空格半透明，底下可能透出立绘），其余算传说。"""
+    if task.frame is None:
+        return None, None
+    h, w = task.frame.shape[:2]
+    x1, x2 = int((center[0] + 0.012) * w), int((center[0] + 0.026) * w)
+    y1, y2 = int((center[1] - 0.050) * h), int((center[1] - 0.038) * h)
+    patch = task.frame[max(0, y1):max(1, y2), max(0, x1):max(1, x2), :3]
+    if patch.size == 0:
+        return None, None
+    blue, green, red = (int(v) for v in patch.reshape(-1, 3).mean(axis=0))
+    rgb = (red, green, blue)
+    if max(rgb) - min(rgb) < 30:
+        return "", rgb
+    if blue > red + 30:
+        return "普通", rgb
+    if red > blue + 40 and red >= green:
+        return "史诗", rgb
+    return "传说", rgb
+
+
 def _member_equipment_qualities(task: TriggerTask, level_box):
     """根据等级文本的相对位置读取该主战员三个装备槽的品质。"""
     level_center_x = (level_box.x + level_box.width / 2) / task.width
     level_center_y = (level_box.y + level_box.height / 2) / task.height
+    # 按 2145×1207 实跑截图量的装备格中心：与「等级」标签同高（原来往上偏了 0.0655，取到了格子上方的卡片背景）
     relative_offsets = (
-        (0.130, -0.0655),
-        (0.201, -0.0665),
-        (0.270, -0.0655),
+        (0.130, 0.0),
+        (0.200, 0.0),
+        (0.270, 0.0),
     )
-    qualities = []
+    qualities, readings = [], []
     for slot, (offset_x, offset_y) in enumerate(relative_offsets):
         point = (level_center_x + offset_x, level_center_y + offset_y)
-        quality, rgb = _equipment_quality_at(task, point, allow_empty=True)
+        quality, rgb = _slot_quality(task, point)
         qualities.append(quality)
+        readings.append(f"{'未知' if quality is None else quality or '空'}{rgb}")
         task.log_info(
             f"第{slot + 1}号装备位颜色RGB={rgb}，"
-            f"识别品质={quality or '未安装'}"
+            f"识别品质={'未知' if quality is None else quality or '未安装'}"
         )
+    task._slot_readings = readings  # 详细日志：装备分配时一起记下，方便核对取色
+    # 实跑中 138 次读数全是「传说」（空槽也是），取色点多半没落在装备格上：每次运行存一张安装装备页截图用来校准
+    if not getattr(task, "_equipment_page_shot", False):
+        task._equipment_page_shot = True
+        shot = battle_log.save_shot(task, "安装装备页", task.frame, force=True)
+        if shot:
+            task.log_info(f"安装装备页截图：{shot}")
     return qualities
 
 
@@ -2599,6 +2703,19 @@ def _find_target_member_index(
     return target_member_index
 
 
+def _log_equipment(task, new_equipment, member, member_index, reason, current_name, current_quality,
+                   purchase, price):
+    """详细日志：装备分配。target_slots 是刷存档主战员三个装备格的取色读数（品质 + RGB）。"""
+    battle_log.record(
+        task, "装备分配", equipment=new_equipment["name"], slot=new_equipment["slot"] + 1,
+        quality=new_equipment.get("quality"), rank=new_equipment.get("rank"),
+        member=member, member_index=None if member_index is None else member_index + 1, reason=reason,
+        current=current_name, current_quality=current_quality,
+        target_slots=getattr(task, "_slot_readings", None), purchase=purchase, price=price,
+    )
+    task._slot_readings = None
+
+
 def handle_equipment(task: TriggerTask):
     """装备选择/安装界面: 按装备位优先级选择，并维护目标主战员的装备状态。"""
     title = find_box_at_point(task, 0.499, 0.126)
@@ -2672,6 +2789,8 @@ def handle_equipment(task: TriggerTask):
         )
         if not new_equipment:
             task.log_info("未能识别待安装装备的名称或类型")
+            if battle_log.once(task, "装备页读不到装备"):
+                battle_log.anomaly(task, "装备页读不到装备", "未能识别待安装装备的名称或类型")
             if is_purchase_page:
                 task.log_info("购买装备无法识别装备信息，点击「取消」")
                 task.click_box(cancel_box)
@@ -2756,6 +2875,8 @@ def handle_equipment(task: TriggerTask):
                 f"原因={install_reason}，"
                 f"安装给{member_label}"
             )
+            _log_equipment(task, new_equipment, member_label, preferred_member_index, install_reason,
+                           current_name, current_quality, is_purchase_page, equipment_price)
             _move_and_click(task, 0.756, (chosen.y + chosen.height / 2) / task.height)
             task.sleep(1)
             if is_purchase_page:
@@ -2774,6 +2895,9 @@ def handle_equipment(task: TriggerTask):
         ]
         if other_members:
             chosen = random.choice(other_members)
+            _log_equipment(task, new_equipment, "其他主战员", lv_texts.index(chosen),
+                           "未识别到刷存档主战员" if tracks_target_member and target_member_index is None
+                           else install_reason, current_name, current_quality, is_purchase_page, equipment_price)
             if tracks_target_member and target_member_index is None:
                 task.log_info("未识别到刷存档主战员，随机安装给其他主战员")
             else:
@@ -2809,6 +2933,8 @@ def handle_equipment(task: TriggerTask):
         )
         if refine_box:
             task.log_info(f"{slot + 1}号位无需替换且没有其他主战员可选，点击提炼")
+            _log_equipment(task, new_equipment, "提炼", None, install_reason, current_name, current_quality,
+                           is_purchase_page, equipment_price)
             task.click_box(refine_box)
             task.sleep(1)
             return True
@@ -3062,14 +3188,15 @@ def handle_negotiation(task: TriggerTask):
 
 
 def handle_continue(task: TriggerTask):
-    """通用"继续"按钮。"""
+    """通用"继续"按钮。零式系统「雪上凝结的约定」的结算页上这个按钮写的是「为记忆的尽头」。"""
     continue_region = (0.459, 0.858, 0.992, 0.988)
     continue_text = _get_game_text(task, '继续')
     box = next(
         (
             text_box
             for text_box in task.all_texts
-            if _clean_match(text_box.name, continue_text)
+            if (_clean_match(text_box.name, continue_text)
+                or any(word in text_box.name for word in ("记忆的尽头", "記憶的盡頭")))
             and continue_region[0]
             <= (text_box.x + text_box.width / 2) / task.width
             <= continue_region[2]
@@ -3175,10 +3302,15 @@ def handle_three_choice_card_remove(task: TriggerTask):
     task._pending_removed_card_count = 0
     return True
 
+def _without_yi(text):
+    """去掉「一」和横线：国际服「赋予灵光一闪」按钮亮起后，OCR 常把「一」读丢（实测读成「赋豫灵光闪」）。"""
+    return re.sub(r'[一\-—_－]', '', text)
+
+
 def handle_flash(task: TriggerTask):
     """通用"闪光"按钮。"""
     box = find_box_at_point(task, 0.945, 0.918)
-    if box and _get_game_text(task, '闪光') in box.name:
+    if box and _without_yi(_get_game_text(task, '闪光')) in _without_yi(box.name):
         if is_button_active(task, box):
             task.log_info("检测到闪光操作，点击闪光")
             task.click_box(box)
@@ -3267,6 +3399,39 @@ def handle_equipment_recast(task: TriggerTask):
     return False
 
 
+_TREASURE_LABEL_REGION = (0.45, 0.33, 0.95, 0.45)  # 宝箱房里宝箱上方「F1」「F2」按键标记所在区域
+_TREASURE_LABEL_TRIES = 2
+
+
+def _click_labeled_treasure(task: TriggerTask):
+    """宝箱房（「传送门的另一侧是个堆满宝物的华丽空间」）有三个宝箱：中间那个靠 treasure 模板点开，
+    两边的宝箱上方带「F1」「F2」按键标记，模板匹配不上，以前开完中间的就直接选「离开」。
+    这里在宝箱区域找这些标记，点标记下方的箭头图标。同一节点每个标记最多点 2 次，打不开就不再管。"""
+    x1, y1, x2, y2 = _TREASURE_LABEL_REGION
+    labels = [
+        b for b in task.all_texts
+        if re.fullmatch(r'F[1-3]', b.name.strip().upper())
+        and x1 <= (b.x + b.width / 2) / task.width <= x2
+        and y1 <= (b.y + b.height / 2) / task.height <= y2
+    ]
+    node = getattr(task, "node_status", {}).get("node_count", 0)
+    tried = getattr(task, "_treasure_label_tries", None)
+    if not tried or tried.get("node") != node:
+        tried = task._treasure_label_tries = {"node": node}
+    for label in sorted(labels, key=lambda b: b.x):
+        key = label.name.strip().upper()
+        if tried.get(key, 0) >= _TREASURE_LABEL_TRIES:
+            continue
+        tried[key] = tried.get(key, 0) + 1
+        x = (label.x + label.width / 2) / task.width
+        y = (label.y + label.height / 2) / task.height + 0.04  # 标记正下方的箭头图标
+        task.log_info(f"宝箱房：点击带「{key}」标记的宝箱（第{tried[key]}次）")
+        _move_and_click(task, x, y)
+        task.sleep(2)
+        return True
+    return False
+
+
 def handle_event_task(task: TriggerTask):
     """事件任务页面: 识别事件选项特征和描述，按任务优先级选择推进。"""
     bottom_box = find_box_at_point(task, 0.516, 0.971)
@@ -3308,6 +3473,7 @@ def handle_event_task(task: TriggerTask):
             )
             continue
         selectable_tasks.append(task_info)
+    all_options = tasks_info
     tasks_info = selectable_tasks
     if not tasks_info:
         task.log_info("事件任务页面的所有选项均被禁止，跳过本次选择")
@@ -3332,7 +3498,9 @@ def handle_event_task(task: TriggerTask):
         task.sleep(1)
         return True
 
-    def click_event_option(event_task):
+    def click_event_option(event_task, reason):
+        battle_log.record(task, "事件选项", options=[t["description"] for t in all_options],
+                          chosen=event_task["description"], reason=reason)
         left, top, right, bottom = event_task["description_region"]
         description_x = (left + right) / 2
         description_y = (top + bottom) / 2
@@ -3352,12 +3520,13 @@ def handle_event_task(task: TriggerTask):
             task.log_info(
                 f"{purpose}：选择包含“{description_keyword}”的事件任务"
             )
-            click_event_option(matched_task)
+            click_event_option(matched_task, f"{purpose}：包含「{description_keyword}」")
         else:
             task.log_info(
                 f"{purpose}：未找到包含“{description_keyword}”的事件任务，"
                 "点击ESC重新开始"
             )
+            battle_log.reroll(task, purpose, options=[t["description"] for t in tasks_info])
             _open_escape_menu(task, 0.053)
         task.sleep(1)
         return True
@@ -3370,7 +3539,7 @@ def handle_event_task(task: TriggerTask):
         task.log_info(
             f"检测到Y坐标小于0.925的任务，立即选择: {upper_event_task['description']}"
         )
-        click_event_option(upper_event_task)
+        click_event_option(upper_event_task, "Y坐标小于0.925的任务，立即选择")
         task.sleep(1)
         return True
 
@@ -3405,8 +3574,12 @@ def handle_event_task(task: TriggerTask):
     )
     if treasure_features:
         task.log_info("检测到事件任务区域中有treasure特征，优先点击")
+        battle_log.record(task, "事件选项", options=[t["description"] for t in all_options], chosen="宝箱",
+                          reason="treasure 特征")
         task.click_box(treasure_features[0])
         task.sleep(2)
+        return True
+    if _click_labeled_treasure(task):
         return True
 
     # 读取拉黑任务列表
@@ -3438,11 +3611,11 @@ def handle_event_task(task: TriggerTask):
         *equipment_priority,
         *_get_card_list(task, "任务优先级"),
     ]
-    chosen = None
+    chosen, chosen_reason = None, None
     for keyword in priority:
         for t in tasks_info:
             if is_subsequence(keyword, t['description']):
-                chosen = t
+                chosen, chosen_reason = t, f"任务/装备优先级「{keyword}」"
                 task.log_info(f"优先选择「{keyword}」-> 描述: {t['description']}")
                 break
         if chosen is not None:
@@ -3462,20 +3635,38 @@ def handle_event_task(task: TriggerTask):
                 f"未命中任务优先级，检测到attack_event特征，"
                 f"相似度={attack_event.confidence:.4f}，点击进入战斗任务"
             )
+            battle_log.record(task, "事件选项", options=[t["description"] for t in all_options], chosen="战斗任务",
+                              reason="未命中任务优先级，attack_event 特征")
             task.click_box(attack_event)
             task.sleep(1)
             return True
 
     if chosen is None:
-        chosen = random.choice(tasks_info)
+        chosen, chosen_reason = random.choice(tasks_info), f"未命中优先级，随机（拉黑 {blacklist}）"
         task.log_info(
             f"未命中优先级描述，从{len(tasks_info)}个可选任务中随机选择: "
             f"{chosen['description']}"
         )
 
-    click_event_option(chosen)
+    click_event_option(chosen, chosen_reason)
     task.sleep(1)
     return True
+
+
+def _log_route_choice(task, node_type, nodes, reason, **fields):
+    """详细日志：路线选择（决定）+ 进入节点（状态快照：生命值、信用点、目标主战员装备、本局已移除/中立牌数）。"""
+    battle_log.record(task, "路线选择", nodes=nodes, chosen=node_type, reason=reason, **fields)
+    ns = getattr(task, "node_status", None) or {}
+    equipment = _equipment_state(task)
+    battle_log.node_entered(
+        task, hp=_get_current_hp(task), credit=_get_current_credit(task),
+        next_node=ns.get("node_count", 0) + 1, next_node_type=node_type,
+        equipment=[f"{name or '空'}/{quality or '?'}" for name, quality
+                   in zip(equipment.get("names", []), equipment.get("qualities", []))],
+        removed_cards=ns.get("removed_card_count", 0), neutral_cards=ns.get("neutral_card_count", 0),
+        flash_done=ns.get("flash_done_cards", []),
+        meditation=_member_deck_state(task).get("冥想", {}),
+    )
 
 
 def handle_route_selection(task: TriggerTask):
@@ -3561,6 +3752,7 @@ def handle_route_selection(task: TriggerTask):
                 and task.node_status.get('pass_final_boss_count', 0) == 0):
             return _retreat_before_boss(task)
 
+        _log_route_choice(task, "boss", [], "找不到普通节点：boss 节点")
         _move_and_click(task, 0.815, 0.492)
         task.sleep(2)
         return True
@@ -3660,8 +3852,10 @@ def handle_route_selection(task: TriggerTask):
     else:
         task.log_info("小地图路线规划失败，改用当前节点的路线优先级兜底")
 
+    reason = "小地图规划"
     if node is None:
         node = sorted(nodes, key=sort_key)[0]
+        reason = f"路线优先级 {priority}"
 
     # 更新 node_type 为最优先的节点类型
     if hasattr(task, 'node_status'):
@@ -3675,6 +3869,9 @@ def handle_route_selection(task: TriggerTask):
         f"点击{node['node_type']}节点"
         f"（特殊特征: {node['special_features']}，位置: {click_x:.3f}, {click_y:.3f}）"
     )
+    _log_route_choice(task, node["node_type"], [(n["node_type"], n["special_features"]) for n in visible_nodes],
+                      reason, chosen_specials=node["special_features"],
+                      plan=route_plan["route"] if route_plan else None)
     _move_and_click(task, click_x, click_y)
     task._route_node_click_time = time.time()
 
@@ -3865,8 +4062,11 @@ def handle_rest(task: TriggerTask):
     else:
         choose_rest = can_rest
 
+    rest_fields = dict(hp=_get_current_hp(task), credit=current_credit, can_rest=bool(can_rest),
+                       can_meditate=can_meditate, meditation_cost=meditation_cost)
     if choose_rest:
         task.log_info("检测到休息界面，点击休息")
+        battle_log.record(task, "休息区", choice="休息", **rest_fields)
         task.move_relative(
             (rest_feature.x + rest_feature.width / 2) / task.width,
             (rest_feature.y + rest_feature.height / 2) / task.height,
@@ -3885,6 +4085,7 @@ def handle_rest(task: TriggerTask):
             f"检测到可冥想卡牌{pending_cards}，当前信用点={current_credit}，"
             f"冥想费用={meditation_cost}，点击冥想"
         )
+        battle_log.record(task, "休息区", choice="冥想", cards=pending_cards, **rest_fields)
         task.click_box(meditate_feature)
         if not _wait_for_rest_confirm(task):
             return True
@@ -3928,6 +4129,7 @@ def handle_shop(task: TriggerTask):
                     )
                 elif cost <= current_credit and task.node_status['shop'] is True:
                     task.log_info(f"德朗商店: 移除卡牌需{cost}信用点，当前{current_credit}，足够，点击移除")
+                    battle_log.record(task, "商店", item="移除卡牌", price=cost, credit=current_credit)
                     task.click_box(box)
                     task.sleep(1)
                     task.node_status['shop'] = False
@@ -4028,6 +4230,8 @@ def handle_shop(task: TriggerTask):
             f"德朗商店: {item_type}「{item_name}」命中配置「{matched_name}」，"
             f"价格{price}小于当前信用点{current_credit}，点击信用点图标"
             )
+            battle_log.record(task, "商店", item=item_name, item_type=item_type, matched=matched_name,
+                              price=price, credit=current_credit)
             task.click_box(credit_icon)
             task.sleep(1)
             return True
@@ -4041,6 +4245,7 @@ def handle_shop(task: TriggerTask):
         )
         if free_box:
             task.log_info("德朗商店没有符合要求的商品，点击「免费」刷新")
+            battle_log.record(task, "商店", item="免费刷新", credit=current_credit)
             task.click_box(free_box)
             task.sleep(1)
             return True
@@ -4234,12 +4439,14 @@ def handle_expedition_result(task: TriggerTask):
     task.log_info(f"探险完成，成功次数/总次数={task.node_status['success_rounds']}/{task.node_status['total_rounds']}")
     if hasattr(task, 'node_status'):
         success = task.node_status.get('round_success_counted', False)
-        battle_log.record(task, "一轮出击结束", success=success,
-                          reached_boss=task.node_status.get('reach_final_boss', False),
-                          passed_boss=task.node_status.get('pass_final_boss_count', 0),
-                          rounds=f"{task.node_status['success_rounds']}/{task.node_status['total_rounds']}")
-        if not success:
-            battle_log.anomaly(task, "一轮出击失败", "探险结果：失败")
+        # 失败不截图：结算页看不出原因，要从这一轮的「进入节点」「战斗结束」等记录往回查
+        battle_log.end_round(task, success=success,
+                             result=complete_box.name if complete_box else None,
+                             escaped=task.node_status.get('is_escaped', False),
+                             reached_boss=task.node_status.get('reach_final_boss', False),
+                             passed_boss=task.node_status.get('pass_final_boss_count', 0),
+                             nodes=task.node_status.get('node_count', 0),
+                             rounds=f"{task.node_status['success_rounds']}/{task.node_status['total_rounds']}")
         reset_mission_status(task)
     return False
 
@@ -4482,10 +4689,13 @@ def handle_card_assign(task: TriggerTask):
             and refresh_count[0] > 0
         ):
             task.log_info(f"剩余刷新次数: {refresh_count[0]}/{refresh_count[1]}，点击刷新")
+            battle_log.record(task, "卡牌分配", card=card_name, chosen="刷新", reason="未命中卡牌奖励优先级",
+                              refresh=list(refresh_count))
             task.click_box(refresh_box)
             return True
         if skip_box:
             task.log_info("无可用刷新或刷新次数，点击跳过非优先级卡牌")
+            battle_log.record(task, "卡牌分配", card=card_name, chosen="跳过", reason="未命中卡牌奖励优先级，没有刷新次数")
             task.click_box(skip_box)
             return True
 
@@ -4565,6 +4775,10 @@ def handle_card_assign(task: TriggerTask):
     ):
         deck = _member_deck_state(task)
         deck[matched_card_name or card_name] = card_desc
+    battle_log.record(task, "卡牌分配", card=card_name, matched=matched_card_name, member_index=chosen_idx + 1,
+                      member="刷存档主战员" if target_available else "其他主战员",
+                      available=[index + 1 for index, _ in available_members],
+                      purchase=is_purchase_page, price=card_price if is_purchase_page else None)
     _move_and_click(task, 0.756, (chosen_lv.y + chosen_lv.height / 2) / task.height)
     task.sleep(1)
     if is_purchase_page:

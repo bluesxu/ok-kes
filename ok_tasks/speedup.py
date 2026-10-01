@@ -67,6 +67,7 @@ from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 
+import battle_log
 import config_io
 import utils
 
@@ -75,6 +76,8 @@ HOVER_KEY = "点击前悬停等待(秒)"
 INTERVAL_KEY = "非战斗检测间隔(秒)"
 SHOP_REFRESH_KEY = "刷新商店"
 STORAGE_CAPACITY_KEY = "存档储存上限大于等于多少pt"
+MEMORY_PRIORITY_KEY = "记忆卡牌优先级"
+MEMORY_DEFAULT_KEY = "记忆卡牌默认选择"
 
 _GRID = 10              # 文字中心按 10x10 网格量化后比较页面
 _SAME_PAGE = 0.6        # 与点击前文字布局相似度 >= 0.6 视为页面还没响应
@@ -155,6 +158,13 @@ _LEFT_BATTLE_POLLS = 3  # 回车后连续几次读不到手牌数：多半弹出
 _PUNCTUATION = re.compile(r"[^一-鿿\w]")  # 与 utils._clean_match 相同的清理规则
 _PARTIAL_RETRY_SECONDS = 10     # 保留部分选择后这段时间内再次进入选卡，视为“移除”没点成
 _STORAGE_READ_RETRIES = 3       # 零式系统页连续几帧读不到存档价值/上限，就不再重新合成，直接进入
+# 「选择刻印的记忆」页（零式系统「雪上凝结的约定」）：标题区域，三张记忆卡的区域（牌名 + 描述）
+_MEMORY_TITLE = (0.35, 0.03, 0.65, 0.20)
+_MEMORY_CARDS = ((0.138, 0.20, 0.360, 0.76), (0.389, 0.20, 0.611, 0.76), (0.640, 0.20, 0.862, 0.76))
+_MEMORY_CARD_Y = 0.48
+_MEMORY_CONFIRM = (0.80, 0.86, 0.99, 0.99)
+_MEMORY_REFRESH_Y = (0.79, 0.86)   # 每张记忆卡下方的「重新搜索 3/3」，只换掉这一张
+_MEMORY_DEFAULT_PRIORITY = ["触发韧性伤害"]
 
 
 def install(task):
@@ -170,6 +180,7 @@ def install(task):
     # 加速选项只影响本机，不写进导出的配置码和上传的统计
     config_io.UI_ONLY_CONFIG_KEYS.update({ENABLE_KEY, HOVER_KEY, INTERVAL_KEY})
     if getattr(task, "name", None) == _CHAOS_MODE:
+        battle_log.install(task)  # 详细日志：出击模式在 SortieMode 里装，卡厄思模式在这里装（官方版 ChaosMode 也能用上）
         task.default_config[SHOP_REFRESH_KEY] = False
         task.config_description[SHOP_REFRESH_KEY] = "关闭后商店不再点击「免费」刷新，没货就离开；开启后恢复原版刷新"
         config_io.UI_ONLY_CONFIG_KEYS.add(SHOP_REFRESH_KEY)
@@ -182,6 +193,14 @@ def install(task):
         config_type = getattr(task, "config_type", None)
         if isinstance(config_type, dict):
             config_type.setdefault(STORAGE_CAPACITY_KEY, {"min": 0, "max": 999})
+            config_type.setdefault(MEMORY_DEFAULT_KEY, {"type": "drop_down", "options": ["1", "2", "3", "随机"]})
+        task.default_config.setdefault(MEMORY_PRIORITY_KEY, list(_MEMORY_DEFAULT_PRIORITY))
+        task.default_config.setdefault(MEMORY_DEFAULT_KEY, "1")
+        task.config_description[MEMORY_PRIORITY_KEY] = (
+            "「选择刻印的记忆」页按列表顺序选第一张包含该关键词的记忆卡（牌名或描述，如「贪婪」「全体攻击」），"
+            "三张都不含时先用卡下方的「重新搜索」刷新"
+        )
+        task.config_description[MEMORY_DEFAULT_KEY] = "记忆卡牌优先级都没匹配上时选第几张"
 
     orig = {
         name: getattr(task, name)
@@ -348,6 +367,7 @@ def install(task):
     _patch_shop_exit()
     _patch_decompose_checkbox()
     _patch_storage_capacity()
+    _patch_memory_imprint()
 
 
 def _handlers_module(task):
@@ -774,6 +794,7 @@ def _boss_selection_wrapper(original):
             return False
         name, x, y = random.choice(bosses)
         task.log_info(f"首领选择: 随机选择「{name}」")
+        battle_log.record(task, "BOSS选择", bosses=[b[0] for b in bosses], chosen=name, reason="随机")
         utils._move_and_click(task, x, y)
         task.sleep(1)
         return True
@@ -1257,7 +1278,9 @@ def _patch_storage_capacity():
     """零式系统法典卡片：游戏更新后「存储数据价值 N」换成了「存档资料储存上限 N pt」。
     原版读不到存储数据价值就点重新合成，改版后会一直重新合成下去。与“加速模式”开关无关。"""
     utils_chaos = _import("utils_chaos")
-    if utils_chaos is not None:
+    current = getattr(utils_chaos, "handle_zero_system_initial_page", None)
+    # 本仓库的 utils_chaos 已经按存档储存上限判断（并写详细日志），只有官方原版才需要这层修正
+    if current is not None and not getattr(current, "handles_storage_capacity", False):
         _replace_function(utils_chaos, "handle_zero_system_initial_page", _storage_capacity_wrapper)
 
 
@@ -1289,6 +1312,7 @@ def _storage_capacity_wrapper(original):
             if misses >= _STORAGE_READ_RETRIES:
                 task._storage_read_misses = 0
                 task.log_info("连续读不到存档价值，不再重新合成，直接进入")
+                battle_log.anomaly(task, "零式系统读不到存档价值", f"区域文本=「{value_text}」")
                 return False
             task.sleep(1)
             return True
@@ -1301,10 +1325,89 @@ def _storage_capacity_wrapper(original):
             required = 0
         task.log_info(f"零式系统当前存档储存上限={value}pt，要求大于等于{required}pt")
         if value >= required:
+            if battle_log.once(task, "零式系统进入"):
+                battle_log.record(task, "零式系统", value=value, unit="pt", required=required, decision="进入")
             return False
         task.log_info("存档储存上限未达要求，点击进入重新合成")
+        battle_log.reroll(task, "零式系统", value=value, unit="pt", required=required)
         utils._move_and_click(task, 0.968, 0.153)
         task.sleep(1)
         return True
 
     return handle_zero_system_initial_page
+
+
+def _patch_memory_imprint():
+    """「选择刻印的记忆」页（游戏更新后零式系统「雪上凝结的约定」出现）：原版没有处理函数，
+    三张记忆卡都没选时「确认」是灰的，页面一直停着。插在卡厄思模式「确认」按钮之前。"""
+    utils_chaos = _import("utils_chaos")
+    handlers = getattr(utils_chaos, "PAGE_HANDLERS", None)
+    if not isinstance(handlers, list) or any(h.__name__ == "handle_memory_imprint" for h in handlers):
+        return
+    index = next((i for i, h in enumerate(handlers) if h.__name__ == "handle_confirm"), len(handlers))
+    handlers.insert(index, handle_memory_imprint)
+
+
+def match_memory(texts, priority):
+    """texts 为三张记忆卡的文字。按优先级顺序找第一个有卡包含的关键词，返回 (第几张 0~2, 理由)，都没有返回 None。"""
+    cleaned = [_PUNCTUATION.sub("", t) for t in texts]
+    for word in priority:
+        key = _PUNCTUATION.sub("", str(word))
+        if not key:
+            continue
+        for index, text in enumerate(cleaned):
+            if key in text:
+                return index, f"记忆卡牌优先级「{word}」"
+    return None
+
+
+def choose_memory(texts, priority, default):
+    """返回 (第几张 0~2, 理由)。按优先级匹配；都没有时按默认选择（「1」~「3」或「随机」）。"""
+    matched = match_memory(texts, priority)
+    if matched is not None:
+        return matched
+    if default == "随机":
+        return random.randrange(len(texts)), "没有匹配的记忆卡，随机选"
+    try:
+        index = min(max(int(default), 1), len(texts)) - 1
+    except (TypeError, ValueError):
+        index = 0
+    return index, f"没有匹配的记忆卡，按默认选第{index + 1}张"
+
+
+def handle_memory_imprint(task):
+    title = utils._get_region_text(task, _MEMORY_TITLE)
+    if "刻印的记" not in title and "刻印的記" not in title:
+        return False
+    x1, y1, x2, y2 = _MEMORY_CONFIRM
+    confirm = next((b for b in task.all_texts
+                    if (utils._clean_match(b.name, "确认") or "確認" in b.name)
+                    and x1 <= (b.x + b.width / 2) / task.width <= x2
+                    and y1 <= (b.y + b.height / 2) / task.height <= y2), None)
+    if confirm is not None and utils.is_button_active(task, confirm):
+        return False  # 已经选好：交给 handle_confirm 点确认
+    texts = [utils._get_region_text(task, region) for region in _MEMORY_CARDS]
+    priority = utils._get_config_value(task, MEMORY_PRIORITY_KEY, [])
+    if isinstance(priority, str):
+        priority = [priority]
+    default = utils._get_config_value(task, MEMORY_DEFAULT_KEY, "1")
+    if priority and any(texts) and match_memory(texts, priority) is None:
+        for slot, region in enumerate(_MEMORY_CARDS, 1):
+            refresh = utils._get_region_text(task, (region[0], _MEMORY_REFRESH_Y[0], region[2], _MEMORY_REFRESH_Y[1]))
+            count = re.search(r"(\d+)\s*/\s*\d+", refresh)
+            if count and int(count.group(1)) > 0:
+                task.log_info(f"选择刻印的记忆：三张都不含优先级关键词，重新搜索第{slot}张（剩 {count.group(1)} 次），"
+                              f"三张=「{'」「'.join(texts)}」")
+                battle_log.record(task, "记忆卡刷新", options=texts, slot=slot, remaining=int(count.group(1)))
+                utils._move_and_click(task, (region[0] + region[2]) / 2, sum(_MEMORY_REFRESH_Y) / 2)
+                task.sleep(1)
+                return True
+    index, reason = choose_memory(texts, priority, default)
+    task.log_info(f"选择刻印的记忆：选第{index + 1}张（{reason}），三张=「{'」「'.join(texts)}」")
+    if not any(texts):
+        battle_log.anomaly(task, "记忆卡读不到文字", "三张记忆卡区域都没有文字，按默认选择")
+    battle_log.record(task, "记忆卡选择", options=texts, chosen=index + 1, reason=reason)
+    region = _MEMORY_CARDS[index]
+    utils._move_and_click(task, (region[0] + region[2]) / 2, _MEMORY_CARD_Y)
+    task.sleep(1)
+    return True

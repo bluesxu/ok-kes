@@ -2,6 +2,7 @@
 import os
 import sys
 import unittest
+import unittest.mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "ok_tasks"))
@@ -106,6 +107,56 @@ class TestRestConfirm(unittest.TestCase):
         task = PageTask([])
         self.assertFalse(utils._wait_for_rest_confirm(task))
         self.assertIn("等待休息确认按钮超时", task.logs)
+
+
+class TestFlashButton(unittest.TestCase):
+
+    def test_grant_flash_button_without_yi(self):
+        # 实跑 19:20：选中卡牌后按钮亮起，OCR 读成「赋豫灵光闪」，没人点按钮，卡在选牌页
+        task = PageTask([("賦豫靈光閃", 0.945, 0.918, 0.10)])
+        task.config["游戏语言"] = "繁体中文"
+        with unittest.mock.patch.object(utils, "is_button_active", lambda task, box: True):
+            self.assertTrue(utils.handle_flash(task))
+        self.assertEqual(1, len(task.clicked))
+
+    def test_other_button_is_ignored(self):
+        self.assertFalse(utils.handle_flash(PageTask([("跳過", 0.945, 0.918)])))
+
+
+class TestGetCardEnhance(unittest.TestCase):
+
+    def test_enhance_feature_on_name_row(self):
+        # 实跑 19:35：强化图标模板匹配在牌名那一行（0.311），牌名框落空，三张强化牌全被排除，
+        # 交给未知页面随机点击，拿到了意料之外的卡
+        task = PageTask([("閃耀核心", 0.2135, 0.311), ("強化", 0.165, 0.350), ("獲得AP1", 0.16, 0.55)])
+        enhance = text("enhance", 0.1159, 0.311, 0.012, 0.028)
+        enhance.confidence = 0.80
+        task.find_feature = lambda feature_name=None, **kwargs: [enhance] if feature_name == "enhance" else []
+        cards = utils.recognize_cards(task, page="获得卡牌页面")
+        self.assertEqual(["闪耀核心"], [c["name"] for c in cards])
+        self.assertEqual("强化", cards[0]["type"])
+
+    def test_shift_ignores_type_word(self):
+        task = PageTask([("強化", 0.2135, 0.311)])
+        enhance = text("enhance", 0.1159, 0.311, 0.012, 0.028)
+        task.find_feature = lambda feature_name=None, **kwargs: [enhance] if feature_name == "enhance" else []
+        self.assertEqual([], utils.recognize_cards(task))
+
+
+class TestTreasureRoom(unittest.TestCase):
+
+    def test_clicks_labeled_chests_then_gives_up(self):
+        # 实跑 19:40：中间宝箱点开后，两边带 F1/F2 标记的宝箱没点就选了「离开」
+        task = PageTask([("F1", 0.523, 0.387, 0.02), ("F2", 0.797, 0.392, 0.02), ("F", 0.20, 0.40, 0.02)])
+        task.node_status["node_count"] = 5
+        clicks = []
+        with unittest.mock.patch.object(utils, "_move_and_click", lambda t, x, y: clicks.append((round(x, 3), round(y, 3)))):
+            results = [utils._click_labeled_treasure(task) for _ in range(5)]
+        self.assertEqual([True, True, True, True, False], results)
+        self.assertEqual([(0.523, 0.427), (0.523, 0.427), (0.797, 0.432), (0.797, 0.432)], clicks)
+        task.node_status["node_count"] = 6  # 换了节点重新计数
+        with unittest.mock.patch.object(utils, "_move_and_click", lambda t, x, y: None):
+            self.assertTrue(utils._click_labeled_treasure(task))
 
 
 class TestSortieRest(unittest.TestCase):
@@ -220,7 +271,6 @@ class TestZeroSystemCapacity(unittest.TestCase):
 
     def test_old_value_format_still_uses_level(self):
         task = self.page(("存檔資料價值11", 0.800, 0.558, 0.20))
-        task.config["存储数据价值大于等于多少层级"] = 12
         self.assertTrue(utils_chaos.handle_zero_system_initial_page(task))
         self.assertEqual([REROLL], task.clicked)
 
@@ -265,6 +315,216 @@ class TestZeroSystemCapacityPatch(unittest.TestCase):
         self.assertEqual([True] * (speedup._STORAGE_READ_RETRIES - 1) + [False], results)
         self.assertEqual([], task.clicked)
         self.assertEqual(0, self.original_calls)
+
+
+# 会合选主战员页面（国际服截图 2560x1440）：三张卡的等级、职能标签、名字、重新探索按钮
+MEMBER_X = (0.130, 0.402, 0.674)          # 「等級」的位置；名字在它右边 0.188、下面 0.042
+MEMBER_PROMPT = ("請選擇第2位加入的戰鬥員。", 0.49, 0.931, 0.25)
+
+
+def member_page(*members):
+    """members：每张卡的 (名字, 职能)。"""
+    texts = [MEMBER_PROMPT]
+    for x, (name, role) in zip(MEMBER_X, members):
+        texts += [("等級", x, 0.683, 0.02), (role, x + 0.192, 0.675, 0.04), (name, x + 0.19, 0.722, 0.08),
+                  ("重新探索", x + 0.04, 0.806, 0.07)]
+    return texts
+
+
+class TestMemberSelection(unittest.TestCase):
+    """会合选主战员：优先级里的角色没有时，刷新留一个治疗/保护角色；刷新后仍没有就先选保护、再选治疗。"""
+
+    def run_page(self, before, after=None, config=None):
+        task = PageTask(member_page(*before))
+        task.config.update({"主战员优先级": ["蕾伊"], "拉黑主战员": ["黛安娜"], **(config or {})})
+        task.ocr = lambda *a, **k: [text(*t, raw=True) for t in member_page(*(after or before))]
+        self.assertTrue(utils_sortie.handle_member_selection(task))
+        return task.clicked
+
+    @staticmethod
+    def pick(index):
+        return f"({MEMBER_X[index] + 0.188:.3f}, {0.683 + 0.042:.3f})"
+
+    def test_keeps_one_survival_member_when_refreshing(self):
+        # 截图：核心「菲」、支援「妮雅」、保护「瑪莉貝爾」，都不在优先级里：只刷新前两个，刷新后仍没有就选保护
+        clicks = self.run_page([("菲", "核心"), ("妮雅", "支援"), ("瑪莉貝爾", "保護")],
+                               [("凛", "核心"), ("海德瑪麗", "核心"), ("瑪莉貝爾", "保護")])
+        self.assertEqual(3, len(clicks))  # 刷新 2 次 + 选人
+        self.assertEqual(self.pick(2), clicks[-1])
+
+    def test_protector_before_healer(self):
+        clicks = self.run_page([("菲", "核心"), ("凛", "核心"), ("九", "核心")],
+                               [("米卡", "治療"), ("凛", "核心"), ("麥格納", "保護")])
+        self.assertEqual(4, len(clicks))  # 没有治疗/保护：三个都刷新
+        self.assertEqual(self.pick(2), clicks[-1])
+
+    def test_blacklisted_survival_member_skipped(self):
+        clicks = self.run_page([("菲", "核心"), ("凛", "核心"), ("麥格納", "保護")],
+                               [("米卡", "治療"), ("凛", "核心"), ("麥格納", "保護")], {"拉黑主战员": ["麦格纳"]})
+        self.assertEqual(self.pick(0), clicks[-1])  # 保护角色被拉黑：选治疗
+
+    def test_priority_still_first(self):
+        clicks = self.run_page([("米卡", "治療"), ("蕾伊", "支援"), ("凛", "核心")])
+        self.assertEqual([self.pick(1)], clicks)
+
+
+# 事件剧情对话（截图 20260930-164914）：自动对话被关掉时停在同一句
+DIALOG = [("1078/1193", 0.165, 0.030), ("CTRD", 0.880, 0.063), ("ALT", 0.950, 0.063),
+          ("稍微往肉塊後方一瞧，地板上掉了一個小皮袋。", 0.483, 0.835, 0.40),
+          ("似乎是某人急著躲藏時掉落的。", 0.483, 0.880, 0.25), ("SPACE", 0.935, 0.910)]
+
+
+class TestEventDialog(unittest.TestCase):
+    def run_frames(self, texts, times):
+        task = PageTask(texts)
+        task.keys = []
+        task.send_key = task.keys.append
+        now = [0]
+        original = utils_sortie.time.time
+        utils_sortie.time.time = lambda: now[0]
+        try:
+            handled = []
+            for t in times:
+                now[0] = t
+                handled.append(utils_sortie.handle_event_dialog(task))
+        finally:
+            utils_sortie.time.time = original
+        return task, handled
+
+    def test_stalled_dialog_presses_space(self):
+        task, handled = self.run_frames(DIALOG, [0, 1, 2.6, 3])
+        self.assertEqual([False, False, True, False], handled)
+        self.assertEqual(["space"], task.keys)
+
+    def test_other_pages_ignored(self):
+        texts = [t for t in DIALOG if t[0] != "SPACE"]
+        task, handled = self.run_frames(texts, [0, 3, 6])
+        self.assertEqual([False] * 3, handled)
+        self.assertEqual([], task.keys)
+
+
+# 获得法典页（2026-09-30 更新后）：选项 1、2 无法获得存档资料，选项 3 显示存档资料储存上限
+def discovery(*capacities):
+    texts = [("獲得法典", 0.50, 0.10, 0.08)]
+    for cx, value in zip((0.19, 0.50, 0.81), capacities):
+        texts.append((f"存檔資料儲存上限{value}pt" if value else "無法獲得存檔資料", cx, 0.59, 0.14))
+    return texts
+
+
+class TestDiscoverySelect(unittest.TestCase):
+
+    def run_page(self, *capacities, required=140):
+        task = PageTask(discovery(*capacities))
+        task.config[utils_chaos.STORAGE_CAPACITY_KEY] = required
+        with unittest.mock.patch.object(utils_chaos, "_move_and_click",
+                                        lambda t, x, y: task.clicked.append((round(x, 2), round(y, 2)))):
+            self.assertTrue(utils_chaos.handle_discovery_select(task))
+        return task.clicked
+
+    def test_picks_qualified_capacity(self):
+        self.assertEqual([(0.81, 0.58)], self.run_page(None, None, 150))
+
+    def test_picks_highest_when_several_qualify(self):
+        self.assertEqual([(0.5, 0.58)], self.run_page(145, 170, 150))
+
+    def test_rerolls_with_chaos_synthesis_when_none_qualify(self):
+        self.assertEqual([(0.46, 0.92)], self.run_page(None, 120, 130))  # 「卡厄思合成」
+
+
+# 「选择刻印的记忆」页（2145×1207 实跑截图）：标题被切成两行，三张记忆卡，确认按钮在右下角
+MEMORY_PAGE = [("選擇刻印的記", 0.50, 0.09, 0.14), ("憶", 0.50, 0.14, 0.03),
+               ("記憶：壓抑", 0.25, 0.24, 0.10), ("持續1回合觸發2次打擊次數為3次以上的攻擊卡牌時", 0.25, 0.60, 0.16),
+               ("記憶：貪婪", 0.50, 0.24, 0.10), ("持續1回合觸發3次全體攻擊卡牌時", 0.50, 0.62, 0.16),
+               ("記憶：女子", 0.75, 0.24, 0.10), ("持續1回合觸發3次快速攻擊卡牌時", 0.75, 0.62, 0.16),
+               ("確認", 0.92, 0.93)]
+
+
+# 实跑截图：第二张「渴望」的描述是「触发韧性伤害增加的攻击卡牌时…」，每张卡下方有「重新搜索 3/3」
+MEMORY_PAGE_2 = [("選擇刻印的記", 0.50, 0.09, 0.14), ("憶", 0.50, 0.14, 0.03),
+                 ("記憶：萬花筒", 0.25, 0.24, 0.10), ("持續1回合觸發3次持續傷害效果時，自身攻擊力", 0.25, 0.63, 0.16),
+                 ("記憶：渴望", 0.50, 0.24, 0.10), ("觸發韌性傷害增加的攻擊卡牌時，自身攻擊力", 0.50, 0.63, 0.16),
+                 ("記憶：女子", 0.75, 0.24, 0.10), ("持續1回合觸發3次快速攻擊卡牌時，自身攻擊力", 0.75, 0.63, 0.16),
+                 ("重新搜索", 0.20, 0.824), ("3/3", 0.333, 0.824), ("重新搜索", 0.45, 0.824), ("3/3", 0.584, 0.824),
+                 ("重新搜索", 0.70, 0.824), ("3/3", 0.835, 0.824), ("確認", 0.92, 0.93)]
+
+
+class TestMemoryImprint(unittest.TestCase):
+
+    def run_page(self, priority=(), default="1", active=False, page=MEMORY_PAGE):
+        task = PageTask(page)
+        task.config.update({speedup.MEMORY_PRIORITY_KEY: list(priority), speedup.MEMORY_DEFAULT_KEY: default})
+        with unittest.mock.patch.object(utils, "is_button_active", lambda t, b: active), \
+                unittest.mock.patch.object(utils, "_move_and_click", lambda t, x, y: task.clicked.append(
+                    round(x, 2) if y == speedup._MEMORY_CARD_Y else ("重新搜索", round(x, 2)))):
+            handled = speedup.handle_memory_imprint(task)
+        return handled, task.clicked
+
+    def test_priority_keyword_in_description(self):
+        self.assertEqual((True, [0.5]), self.run_page(["全体攻击", "打击次数"]))
+
+    def test_priority_by_name(self):
+        self.assertEqual((True, [0.75]), self.run_page(["女子"]))
+
+    def test_default_when_nothing_matches(self):
+        self.assertEqual((True, [0.25]), self.run_page(["不存在"]))
+        self.assertEqual((True, [0.75]), self.run_page([], default="3"))
+
+    def test_default_priority_is_toughness_damage(self):
+        speedup_default = list(speedup._MEMORY_DEFAULT_PRIORITY)
+        self.assertEqual(["触发韧性伤害"], speedup_default)
+        self.assertEqual((True, [0.5]), self.run_page(speedup_default, page=MEMORY_PAGE_2))
+
+    def test_refresh_when_nothing_matches(self):
+        self.assertEqual((True, [("重新搜索", 0.25)]), self.run_page(["贪婪"], page=MEMORY_PAGE_2))
+        used_up = [t if t[0] != "3/3" or t[1] != 0.333 else ("0/3", 0.333, 0.824) for t in MEMORY_PAGE_2]
+        self.assertEqual((True, [("重新搜索", 0.5)]), self.run_page(["贪婪"], page=used_up))
+
+    def test_default_after_refreshes_used_up(self):
+        used_up = [("0/3",) + t[1:] if t[0] == "3/3" else t for t in MEMORY_PAGE_2]
+        self.assertEqual((True, [0.75]), self.run_page(["贪婪"], default="3", page=used_up))
+
+    def test_selected_leaves_confirm_to_handle_confirm(self):
+        self.assertEqual((False, []), self.run_page(["女子"], active=True))
+
+    def test_other_page_ignored(self):
+        self.assertFalse(speedup.handle_memory_imprint(PageTask([("裝備", 0.50, 0.13)])))
+
+    def test_inserted_before_confirm(self):
+        import utils_chaos
+        handlers = list(utils_chaos.PAGE_HANDLERS)
+        try:
+            speedup._patch_memory_imprint()
+            speedup._patch_memory_imprint()
+            names = [h.__name__ for h in utils_chaos.PAGE_HANDLERS]
+            self.assertEqual(1, names.count("handle_memory_imprint"))
+            self.assertEqual(names.index("handle_confirm") - 1, names.index("handle_memory_imprint"))
+        finally:
+            utils_chaos.PAGE_HANDLERS[:] = handlers
+
+
+class TestEquipmentSlotColor(unittest.TestCase):
+    """主战员装备格取格子右上角的底色（实跑中取色点在格子上方的卡片背景上，杂色全被算成传说，装备全给了别人）。"""
+
+    def quality(self, rgb):
+        import numpy as np
+        frame = np.zeros((1207, 2145, 3), np.uint8)
+        frame[:, :] = rgb[::-1]  # BGR
+        task = unittest.mock.Mock(frame=frame, width=2145, height=1207)
+        return utils._slot_quality(task, (0.759, 0.320))[0]
+
+    def test_colors(self):
+        self.assertEqual("", self.quality((30, 33, 36)))       # 空槽：暗灰
+        self.assertEqual("", self.quality((90, 92, 96)))       # 空槽透出立绘：灰
+        self.assertEqual("普通", self.quality((61, 76, 138)))
+        self.assertEqual("史诗", self.quality((160, 88, 69)))
+
+    def test_slots_level_with_level_tag(self):
+        points = []
+        with unittest.mock.patch.object(utils, "_slot_quality", lambda task, p: points.append(p) or ("", None)):
+            task = unittest.mock.Mock(width=2145, height=1207, _equipment_page_shot=True)
+            utils._member_equipment_qualities(task, Box(1330, 377, 40, 20))
+        self.assertAlmostEqual(0.321, points[0][1], places=2)
+        self.assertEqual([0.759, 0.829, 0.899], [round(p[0], 3) for p in points])
 
 
 if __name__ == '__main__':

@@ -1,9 +1,10 @@
 """
-出击模式的详细战斗日志：结构化战斗记录 + 异常截图 + 自动清理。
+详细日志（出击模式、卡厄思模式共用）：结构化记录 + 异常截图 + 自动清理。事件表见 CONTEXT.md「日志事件表」。
 
-- 战斗记录写到 battle_logs/战斗记录_YYYY-MM-DD.jsonl，每行一条 JSON（事件名、时间、所处节点、观测到的内容、做出的决策和理由）；
-  主日志只写一行摘要，避免把大段观测数据刷进 ok-script.log。
-- 异常截图存到 battle_logs/截图/，JPG 质量 80；同一种异常每场战斗最多截 1 张。
+- 记录写到 battle_logs/战斗记录_YYYY-MM-DD.jsonl，每行一条 JSON（事件名、时间、第几轮、第几场战斗、所处节点、
+  观测到的内容、做出的决策和理由）；主日志只写一行摘要，避免把大段观测数据刷进 ok-script.log。
+- 只在真正点下去的那一刻记一条决定，没点的帧不记。
+- 异常截图存到 battle_logs/截图/，JPG 质量 80；同一种异常每场战斗（卡厄思模式为每轮）最多截 1 张。
 - 清理：超过保留天数的文件删除；总大小超过上限时从最旧的删起。任务启动时清一次，运行中每小时清一次。
 
 注意：本文件不能定义顶层类，框架会把 ok_tasks 下含类的 .py 当作任务加载。
@@ -26,6 +27,9 @@ LOG_DIR = "battle_logs"
 SHOT_DIR = os.path.join(LOG_DIR, "截图")
 _CLEANUP_EVERY = 3600
 _JPG_QUALITY = 80
+_BATTLE_GONE = 8        # 离开战斗画面这么多秒才算战斗结束（出击模式战斗中会弹出选择页面）
+_UNHANDLED_AFTER = 10   # 连续这么多秒没有页面处理函数认领画面，记一次「未识别页面」
+_UNHANDLED_GAP = 3      # 兜底函数两次调用间隔超过这么久，说明中间有帧被别的处理函数认领了，重新计时
 
 
 def install(task):
@@ -34,8 +38,8 @@ def install(task):
     task.default_config[SHOT_KEY] = True
     task.default_config[KEEP_DAYS_KEY] = 7
     task.default_config[MAX_MB_KEY] = 500
-    task.config_description[LOG_KEY] = "把每次出牌看到了什么、为什么这样出写进 battle_logs 目录，便于统计和排查"
-    task.config_description[SHOT_KEY] = "出现异常（AP不足、出不掉牌、识别失败、战斗失败等）时截图，同一种异常每场战斗最多 1 张"
+    task.config_description[LOG_KEY] = "把每个决定（出牌、装备、选卡、路线等）看到了什么、为什么这样做写进 battle_logs 目录，便于统计和排查"
+    task.config_description[SHOT_KEY] = "出现异常（识别失败、画面卡住、未识别页面等）时截图，同一种异常每场战斗最多 1 张"
     task.config_description[KEEP_DAYS_KEY] = "battle_logs 里的记录和截图保留多少天"
     task.config_description[MAX_MB_KEY] = "battle_logs 总大小超过这个值时从最旧的文件删起"
     config_io.UI_ONLY_CONFIG_KEYS.update({LOG_KEY, SHOT_KEY, KEEP_DAYS_KEY, MAX_MB_KEY})
@@ -45,13 +49,16 @@ def _config(task, key):
     config = getattr(task, "config", None)
     if config is not None and key in config:
         return config[key]
-    return task.default_config.get(key)
+    return (getattr(task, "default_config", None) or {}).get(key)
 
 
 def _state(task):
     state = getattr(task, "_battle_log", None)
     if state is None:
-        state = {"battle_id": 0, "shots": set(), "last_cleanup": 0.0}
+        # round_id：本次运行第几轮；in_battle/battle_start/battle_last：战斗画面起止；last_hp：上次进入节点时的生命值
+        state = {"battle_id": 0, "round_id": 1, "round_start": time.time(), "shots": set(), "last_cleanup": 0.0,
+                 "in_battle": False, "battle_start": 0.0, "battle_last": 0.0, "last_hp": None,
+                 "rerolls": 0, "once": set(), "unhandled_since": None, "unhandled_last": 0.0, "unhandled_reported": False}
         task._battle_log = state
     return state
 
@@ -73,6 +80,7 @@ def _node(task):
     return {
         "node": status.get("node_count"),
         "node_type": status.get("node_type"),
+        "layer": (status.get("pass_final_boss_count") or 0) + 1,
         "boss_battle": bool(status.get("final_boss_battle")),
     }
 
@@ -83,7 +91,8 @@ def record(task, event, **fields):
         return
     state = _state(task)
     entry = {"time": datetime.datetime.now().isoformat(timespec="milliseconds"),
-             "task": getattr(task, "name", ""), "battle": state["battle_id"], "event": event}
+             "task": getattr(task, "name", ""), "round": state["round_id"], "battle": state["battle_id"],
+             "event": event}
     entry.update(_node(task))
     entry.update(fields)
     try:
@@ -108,9 +117,82 @@ def anomaly(task, kind, detail, frame=None, **fields):
     record(task, "异常", kind=kind, detail=detail, screenshot=shot, **fields)
 
 
-def save_shot(task, kind, frame):
-    """开启截图时把 frame 存进截图目录，返回路径；没开或保存失败返回 None。"""
-    if not (enabled(task) and _config(task, SHOT_KEY)) or frame is None or not getattr(frame, "size", 0):
+def end_round(task, **fields):
+    """一轮结束：记一条带用时的「一轮结束」，之后的记录算下一轮。"""
+    state = _state(task)
+    record(task, "一轮结束", seconds=round(time.time() - state["round_start"]), rerolls=state["rerolls"], **fields)
+    state.update(round_id=state["round_id"] + 1, round_start=time.time(), shots=set(), last_hp=None, rerolls=0, once=set())
+
+
+def once(task, key):
+    """本轮第一次遇到 key 时返回 True。用于「看了没点」的决定（比如达标后交给「进入」按钮），
+    页面会停好几帧，只记第一帧。"""
+    seen = _state(task)["once"]
+    if key in seen:
+        return False
+    seen.add(key)
+    return True
+
+
+def reroll(task, page, **fields):
+    """刷存档类的重来（零式系统重新合成、获得法典卡厄思合成、赛季再次观测等）：记一条「重开」，计入本轮 rerolls。"""
+    _state(task)["rerolls"] += 1
+    record(task, "重开", page=page, **fields)
+
+
+def node_entered(task, hp=None, **fields):
+    """进入一个新节点时的状态；hp 为 (当前, 上限)，hp_change 是与上一个节点相比的变化（中间打过的战斗掉的血）。"""
+    state = _state(task)
+    change = hp[0] - state["last_hp"][0] if hp and state["last_hp"] else None
+    if hp:
+        state["last_hp"] = hp
+    record(task, "进入节点", hp=hp and list(hp), hp_change=change, **fields)
+
+
+def battle_frame(task, in_battle):
+    """每帧告诉日志当前是不是战斗画面：第一次看到记「战斗开始」，离开超过 _BATTLE_GONE 秒记「战斗结束」。"""
+    state = _state(task)
+    now = time.time()
+    if in_battle:
+        if not state["in_battle"]:
+            new_battle(task)
+            state.update(in_battle=True, battle_start=now)
+            record(task, "战斗开始")
+        state["battle_last"] = now
+    elif state["in_battle"] and now - state["battle_last"] >= _BATTLE_GONE:
+        state["in_battle"] = False
+        record(task, "战斗结束", seconds=round(state["battle_last"] - state["battle_start"]))
+
+
+def unhandled_frame(task):
+    """PAGE_HANDLERS 末尾的兜底：这一帧没有任何处理函数认领。连续 _UNHANDLED_AFTER 秒都这样，
+    记一次「未识别页面」异常（截图 + 画面上的全部文字），同一个页面只记一次。"""
+    state = _state(task)
+    now = time.time()
+    if state["in_battle"]:
+        return False  # 卡厄思模式自动战斗时处理函数每帧都不认领，不算未识别页面
+    if state["unhandled_since"] is None or now - state["unhandled_last"] > _UNHANDLED_GAP:
+        state.update(unhandled_since=now, unhandled_reported=False)
+    state["unhandled_last"] = now
+    if not state["unhandled_reported"] and now - state["unhandled_since"] >= _UNHANDLED_AFTER:
+        state["unhandled_reported"] = True
+        anomaly(task, "未识别页面", f"已 {now - state['unhandled_since']:.0f} 秒没有页面处理函数认领画面",
+                texts=[b.name for b in getattr(task, "all_texts", [])][:150])
+    return False
+
+
+def unhandled_seconds(task):
+    """当前这段「没有处理函数认领画面」已持续多少秒；战斗中或刚被认领过返回 0。"""
+    state = _state(task)
+    if state["in_battle"] or state["unhandled_since"] is None or time.time() - state["unhandled_last"] > _UNHANDLED_GAP:
+        return 0
+    return state["unhandled_last"] - state["unhandled_since"]
+
+
+def save_shot(task, kind, frame, force=False):
+    """开启截图时把 frame 存进截图目录，返回路径；没开或保存失败返回 None。
+    force：不看开关（卡厄思模式没有战斗记录的配置项，校准用的截图照样要存）。"""
+    if not (force or enabled(task) and _config(task, SHOT_KEY)) or frame is None or not getattr(frame, "size", 0):
         return None
     try:
         os.makedirs(SHOT_DIR, exist_ok=True)

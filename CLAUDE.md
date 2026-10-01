@@ -54,7 +54,7 @@ python real_bugfix_check.py                           # 用官方安装目录里
 - 敌人以洋红色血条为锚点（`enemy_bars`），血量/护盾/行动倒计时/意图图标都相对血条定位；Boss 的倒计时 ∞ 会被 OCR 读成 8，用字形宽高比区分。
 - 费用、倒计时这类压在彩色背景上的数字用 `_read_digit` 对裁剪区域试几种预处理；单张牌费用要两种预处理读数一致才采信，读不到的靠「AP不足」提示兜底。
 - `choose_play` / `choose_target` 是纯函数，`tests/TestBattle.py` 用 `tests/images/battle` 的真实截图 + 真实 OCR 测识别，改坐标或阈值后要跑它。
-- `battle_log.py` 写结构化战斗记录（`battle_logs/*.jsonl`）和异常截图，并按保留天数/总大小清理。
+- `battle_log.py` 写结构化记录（`battle_logs/*.jsonl`）和异常截图，并按保留天数/总大小清理。两个模式共用：出击模式在 `SortieMode` 里装开关，卡厄思模式由 `speedup.install` 装。事件名和字段见 `CONTEXT.md`「详细日志」，查日志时按那张表过滤；新增决定时在点击处记一行，同一种决定两个模式用同一个事件名。
 
 **加速模式 `ok_tasks/speedup.py`**：`ChaosMode` / `SortieMode` 在 `__init__` 末尾调用 `speedup.install(self)`，它通过猴子补丁接管任务的 `sleep`/`click*`/`run` 等方法，以及 `utils*` 里的部分处理函数：
 - 延迟支付处理函数里的 sleep；点击后用“文字闸门”判断页面已响应就继续，最长不超过原时长。
@@ -63,7 +63,7 @@ python real_bugfix_check.py                           # 用官方安装目录里
 - `_EXPECTED_RUN_SOURCE` / `_handlers_module` 通过读 `run()` 源码来确认结构没变。**修改 `ChaosMode.run` / `SortieMode.run` 时要同步 `speedup._gated_run`**，`TestSpeedup` 里的 `test_real_*_run_matches_gated_run` 会检查这一点。
 - 其中几项与速度无关的修正（按钮文字被 OCR 切成两个框、国际服 BOSS 页/休息区、分解存档确认框、零式系统法典卡片改为按存档储存上限 pt 判断）在源码里也已修好。补丁里保留同样的逻辑，是为了用 `speedup_patch/install_speedup.py` 装进未修改的官方版时同样生效；两边同时存在不冲突。
 
-**`speedup_patch/`**：`install_speedup.py` 把本仓库的改动装进官方安装目录（默认 `D:\Program Files\ok-kes\data\apps\ok-kes\working`），需要先关闭 ok-kes，官方版自动更新后要重新安装。安装目录里的 `utils.py`、`utils_sortie.py`、`ChaosMode.py`、`SortieMode.py` 和翻译文件与 v1.4.3 原版哈希（`BASE_SHA`）一致时整份替换，并复制 `speedup.py`、`utils_battle.py`、`battle_log.py`；对不上（官方已更新）时只往原版 `ChaosMode`/`SortieMode` 插入加速补丁调用。另给 `src/config.py` 追加 OpenVINO f32 补丁。**改了这些被整份替换的文件后，仓库要先合并对应的上游版本，再更新 `BASE_SHA`。**
+**`speedup_patch/`**：`install_speedup.py` 把本仓库的改动装进官方安装目录（默认 `D:\Program Files\ok-kes\data\apps\ok-kes\working`），需要先关闭 ok-kes，官方版自动更新后要重新安装。安装目录里的 `utils.py`、`utils_sortie.py`、`utils_chaos.py`、`ChaosMode.py`、`SortieMode.py` 和翻译文件与 v1.4.3 原版哈希（`BASE_SHA`）一致时整份替换，并复制 `speedup.py`、`utils_battle.py`、`battle_log.py`；对不上（官方已更新）时只复制 `speedup.py`、`battle_log.py`，往原版 `ChaosMode`/`SortieMode` 插入加速补丁调用。另给 `src/config.py` 追加 OpenVINO f32 补丁。**改了这些被整份替换的文件后，仓库要先合并对应的上游版本，再更新 `BASE_SHA`。**
 
 ## 仓库内的代理技能
 

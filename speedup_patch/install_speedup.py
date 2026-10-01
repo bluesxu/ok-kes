@@ -8,7 +8,7 @@ ok-kes 自动更新到新版本后会覆盖改动，重新运行一次安装即�
 
 安装内容：
 - 加速补丁：复制 ok_tasks/speedup.py，让卡厄思/出击模式调用它；src/config.py 追加 OpenVINO f32 补丁。
-- 出牌策略与战斗日志：用本仓库的 utils.py、utils_sortie.py、ChaosMode.py、SortieMode.py 和翻译文件整份替换，
+- 出牌策略与详细日志：用本仓库的 utils.py、utils_sortie.py、utils_chaos.py、ChaosMode.py、SortieMode.py 和翻译文件整份替换，
   并新增 utils_battle.py、battle_log.py。只有安装目录里这些文件是 v1.4.3 原版时才替换；
   官方更新到新版本后对不上，就只装加速补丁并列出对不上的文件，需要先把本仓库合并到新版本。
 """
@@ -33,6 +33,7 @@ BASE_VERSION = "v1.4.3"
 BASE_SHA = {
     "ok_tasks/utils.py": "b910c8090c923972",
     "ok_tasks/utils_sortie.py": "c3673261f61fddaf",
+    "ok_tasks/utils_chaos.py": "9d43515da98a42f9",
     "ok_tasks/SortieMode.py": "c28d4e488b03f7a0",
     "ok_tasks/ChaosMode.py": "c963711be1635940",
     "i18n/en_US/LC_MESSAGES/ok.po": "37081adbb099b6a1",
@@ -42,6 +43,7 @@ BASE_SHA = {
 }
 REPLACE = tuple(BASE_SHA)
 ADD = ("ok_tasks/speedup.py", "ok_tasks/utils_battle.py", "ok_tasks/battle_log.py")
+ADD_ALWAYS = ("ok_tasks/speedup.py", "ok_tasks/battle_log.py")  # 官方版对不上、只装加速补丁时也复制
 BACKUP_TARGETS = TARGETS + tuple(rel for rel in REPLACE if rel not in TARGETS)
 
 MODE_SNIPPET = f"""        {MARK_BEGIN}
@@ -236,7 +238,7 @@ def install(working):
         print(f"以下文件不是 {BASE_VERSION} 原版，不安装出牌策略与战斗日志（需要先把本仓库合并到新版本）：")
         for rel in mismatched:
             print(f"  {rel}")
-        added = ADD[:1]
+        added = ADD_ALWAYS  # speedup 会写详细日志，battle_log 也要带上
         for rel, class_name in MODES:
             if is_ours(working, rel) and not has_mark(working, rel):
                 shutil.copy2(backup_path(working, rel), os.path.join(working, rel))  # 先还原成原版再插入
