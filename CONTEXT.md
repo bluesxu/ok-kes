@@ -108,6 +108,10 @@ _Avoid_: 局号
 刷存档类的重来：零式系统重新合成、获得法典卡厄思合成、赛季再次观测、刷初始卡牌/刷空档时 ESC 重开。每次记一行「重开」，一轮结束时汇总成 `rerolls`。
 _Avoid_: 重刷、reroll
 
+**疑似循环**:
+几个处理函数来回动作、画面一直在变，60 秒内轮次、战斗、重开、节点、通过的 boss 都没变（战斗中不判断）。第 1 次记一条异常（带截图和画面文字），卡厄思模式顺带重新获取刷存档主战员头像；之后每 30 秒按一次 ESC。只在加速补丁接管 run() 时生效。
+_Avoid_: 卡住（画面不动是「画面卡住」）
+
 **未识别页面**:
 连续 10 秒没有任何页面处理函数认领画面（战斗画面除外）。记一条异常，带截图和画面上的全部文字，用来发现新页面。
 _Avoid_: 卡住（那是画面不动，另记「画面卡住」）
@@ -123,8 +127,11 @@ _Avoid_: 卡住（那是画面不动，另记「画面卡住」）
 | 重开 | 卡厄思 | `page` 以及当时读到的值和门槛 |
 | 零式系统 / 赛季初始页 / 获得法典 | 卡厄思 | `value`/`options`、`unit`（pt 或层级）、`required`、`decision`/`chosen` |
 | 记忆卡选择 / 记忆卡刷新 | 卡厄思 | `options`（三张卡的文字）、`chosen`、`reason`；刷新带 `slot`、`remaining` |
+| 掷骰 | 两者 | 掷骰失败页：`choice`（重新掷骰/下一步）、`cost`（重掷费用）、`owned`（右上角持有数） |
+| 重新获取主战员头像 / 放弃购买 | 卡厄思 | 购买页连续认不出刷存档主战员时的兜底：`equipment`、`misses`；放弃后本轮商店不再点这件 |
+| 记忆雕琢 | 卡厄思 | `choice`（雕琢/离开）、`rate`（当时的雕琢成功机率） |
 | 面具刻印 | 卡厄思 | `choice`（确认/刷新/跳过）、`description`、`wanted`、`remaining` |
-| 装备分配 | 两者 | `equipment`、`slot`、`quality`、`member`、`member_index`、`reason`、`current`、`target_slots`（刷存档主战员三个装备格的品质+RGB） |
+| 装备分配 | 两者 | `equipment`、`slot`、`quality`（稀有/传说/独特）、`member`（刷存档主战员/第一主战员/其他主战员/提炼/取消）、`member_index`、`reason`、`current`、`target_slots`（刷存档主战员三个装备格的品质+RGB）、`other_slots`（其他主战员的装备格读数） |
 | 选牌 | 两者 | `action`（移除/复制/闪光…）、`card`、`reason`、`description` |
 | 闪光选择 | 两者 | `card`、`reason`、`chosen`、`options` |
 | 卡牌奖励 / 卡牌分配 | 两者 | `cards`/`card`、`chosen`（牌名/刷新/跳过）、`reason`、`member_index` |

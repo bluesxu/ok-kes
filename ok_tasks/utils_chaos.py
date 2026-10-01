@@ -8,7 +8,7 @@ from utils import (
     find_box_at_point, find_text, recognize_cards,
     _card_has_type_below, select_card,
     log_credit, log_node_status, handle_battle_crash, handle_close_page, handle_refine_equipment_credit,
-    handle_center_confirm, handle_settlement, handle_skip,
+    handle_center_confirm, handle_dont_show_again, handle_settlement, handle_skip,
     handle_destiny_choice, handle_main_member_flash,
     handle_card_reward, handle_equipment,
     handle_select_card, handle_copy_card_choice, handle_copy_member,
@@ -420,7 +420,7 @@ def _discovery_required(task):
 
 
 def handle_discovery_select(task: TriggerTask): #忘了按个页面要用
-    """获得法典页面：选存档储存上限达到配置值的选项（几个都达标时选上限最高的），都不达标就点「卡厄思合成」重抽。
+    """获得法典页面：选存档储存上限达到配置值的选项（几个都达标时选上限最低的），都不达标就点「卡厄思合成」重抽。
     2026-09-30 更新后选项显示「存档资料储存上限 N pt」，底部没有「取消」了，只有一般合成、卡厄思合成和确认。"""
     title_text = _get_region_text(task, (0.313, 0.010, 0.670, 0.193))
     if "获得法典" not in title_text:
@@ -446,7 +446,8 @@ def handle_discovery_select(task: TriggerTask): #忘了按个页面要用
             qualified.append((value, -index, index, region))
 
     if qualified:
-        value, _, index, region = max(qualified)
+        # 达标的选项里选上限最低的（只要达到门槛就够，上限越高越难拿满）；一样时选靠左的
+        value, _, index, region = min(qualified, key=lambda option: (option[0], option[2]))
         task.log_info(f"发现选项{index + 1}满足要求（{value}），点击该选项")
         battle_log.record(task, "获得法典", options=seen, chosen=index + 1, required=required)
         _move_and_click(task, (region[0] + region[2]) / 2, (region[1] + region[3]) / 2)
@@ -506,6 +507,55 @@ def handle_threat_detection(task: TriggerTask):
     task.send_key("esc")
     task.sleep(1)
     return True
+
+
+_CARVE_BUTTON_COLOR = (0.86, 0.795)   # 右下「记忆雕琢」按钮上文字和水晶之间的底色：橙色可点，灰色不可点
+
+
+def _carve_button_active(task: TriggerTask):
+    frame = getattr(task, "frame", None)
+    if frame is None:
+        return None
+    height, width = frame.shape[:2]
+    x, y = int(_CARVE_BUTTON_COLOR[0] * width), int(_CARVE_BUTTON_COLOR[1] * height)
+    blue, _, red = (float(v) for v in frame[y - 6:y + 6, x - 6:x + 6, :3].reshape(-1, 3).mean(axis=0))
+    return red > blue + 60
+
+
+def handle_memory_carving(task: TriggerTask):
+    """「记忆雕琢」页（零式系统 boss 后选「雕琢记忆」进来）：一直点右边的「记忆雕琢」，按钮变灰（水晶不够）后点「离开」。
+    左边的「记忆加工」不点。"""
+    title = find_box_at_point(task, 0.501, 0.128)
+    if not (title and "记忆雕琢" in title.name):
+        return False
+    button = next((box for box in task.all_texts if "记忆雕琢" in box.name
+                   and (box.x + box.width / 2) / task.width > 0.6 and (box.y + box.height / 2) / task.height > 0.7), None)
+    rate = next((box.name for box in task.all_texts if "成功机率" in box.name), "")
+    active = _carve_button_active(task)
+    if button and active:
+        task.log_info(f"记忆雕琢：点击「记忆雕琢」（{rate}）")
+        battle_log.record(task, "记忆雕琢", choice="雕琢", rate=rate)
+        task.click_box(button)
+        task.sleep(2)
+        return True
+    if active is None:
+        return False
+    leave = next((box for box in task.all_texts if _clean_match(box.name, "离开")
+                  and (box.y + box.height / 2) / task.height > 0.85), None)
+    if leave is None:
+        return False
+    task.log_info("记忆雕琢：按钮已变灰，点击离开")
+    battle_log.record(task, "记忆雕琢", choice="离开", rate=rate)
+    task.click_box(leave)
+    task.sleep(1)
+    return True
+
+
+def handle_event_dialog(task: TriggerTask):
+    """剧情对话停住时按空格翻页，与出击模式共用 utils_sortie 里的实现
+    （utils_sortie 在模块开头就导入本模块，这里放到调用时再导入，避免循环导入）。"""
+    from utils_sortie import handle_event_dialog as handle
+    return handle(task)
 
 
 def handle_chaos_craft(task: TriggerTask):
@@ -1013,65 +1063,6 @@ def handle_chaos_reward_settlement(task: TriggerTask):
     return True
 
 
-def _decompose_checkbox_checked(task, x, y):
-    """勾选框填的是橙色，中间对勾是白的。周围橙色够多才算已勾上；读不到画面返回 None。"""
-    frame = getattr(task, "frame", None)
-    if frame is None or getattr(frame, "size", 0) == 0:
-        return None
-    height, width = frame.shape[:2]
-    px, py = int(x * width), int(y * height)
-    half = max(4, int(0.012 * width))
-    x1, y1 = max(0, px - half), max(0, py - half)
-    x2, y2 = min(width, px + half), min(height, py + half)
-    region = frame[y1:y2, x1:x2, :3]
-    if region.size == 0:
-        return None
-    blue = region[:, :, 0]
-    red = region[:, :, 2]
-    orange = (red > 170) & (blue < 100) & (red.astype(int) > blue.astype(int) + 60)
-    return float(orange.mean()) >= 0.2
-
-
-def handle_decompose_archive_confirm(task: TriggerTask):
-    """分解存档资料确认框：没勾上「下次登入前不再显示」就先勾上，再点确认。
-    已勾上再点会取消，所以先看框是不是橙色。"""
-    if not any("分解存档" in box.name or "分解存檔" in box.name for box in task.all_texts):
-        return False
-    label = next(
-        (
-            box for box in task.all_texts
-            if any(needle in box.name for needle in ("不再显示", "不再顯示", "不再显", "不再顯"))
-        ),
-        None,
-    )
-    if label is None:
-        return False
-    x = label.x / task.width - 0.029
-    y = (label.y + label.height / 2) / task.height
-    checked = _decompose_checkbox_checked(task, x, y)
-    if checked:
-        task.log_info("分解存档资料：下次登入前不再显示已勾选")
-    elif checked is None:
-        task.log_info("分解存档资料：读不到勾选框颜色，不点击，避免把已勾选取消")
-    else:
-        task.log_info("分解存档资料：勾选下次登入前不再显示")
-        _move_and_click(task, x, y)
-        task.sleep(0.4)
-    confirm = next(
-        (
-            box for box in task.all_texts
-            if _clean_match(box.name, "确认") or "確認" in box.name
-        ),
-        None,
-    )
-    if confirm is None:
-        return True
-    task.log_info("分解存档资料：点击确认")
-    task.click_box(confirm)
-    task.sleep(1)
-    return True
-
-
 # 卡厄思模式 PAGE_HANDLERS
 PAGE_HANDLERS = [
     handle_auto_stop,
@@ -1083,12 +1074,14 @@ PAGE_HANDLERS = [
     handle_stuck_log, #画面卡住检测及兜底处理
     handle_close_page, #点击屏幕关闭页面，优先于其他普通页面处理
     handle_threat_detection, #威胁侦测过场页，按 ESC 关闭
+    handle_event_dialog, #剧情对话停住时按空格翻页（实跑 10/01 11:47 停了 2 分半，ESC 没用）
 
     handle_refine_equipment_credit, #提炼装备信用点页面，优先于确认按钮
-    handle_decompose_archive_confirm, #分解存档资料：先勾选下次登入前不再显示，再确认
+    handle_dont_show_again, #带「今天不再显示 / 下次登入前不再显示」的确认框：先勾上再确认
     handle_center_confirm, #页面中央确认按钮
     handle_archive_target_member, #信息统计页面，记录刷存档目标主战员
     handle_chaos_mask_engraving, #面具卡牌刻印获取页面
+    handle_memory_carving, #记忆雕琢页：一直雕琢到按钮变灰再离开，优先于离开按钮
     handle_equipment, #装备选择
     handle_card_assign,
     handle_confirm, #确认按钮

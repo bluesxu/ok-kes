@@ -187,8 +187,8 @@ def install(task):
         # 刷存档的门槛，跟着配置码导出
         task.default_config.setdefault(STORAGE_CAPACITY_KEY, 0)
         task.config_description[STORAGE_CAPACITY_KEY] = (
-            "零式系统法典卡片上「存档资料储存上限」低于这个值就重新合成，0 为不限制。"
-            "游戏更新后卡片不再显示存储数据价值层级，改看这一项"
+            "零式系统法典卡片、获得法典选项上「存档资料储存上限」低于这个值就重新合成；"
+            "几个选项都达标时选上限最低的。0 为不限制"
         )
         config_type = getattr(task, "config_type", None)
         if isinstance(config_type, dict):
@@ -394,6 +394,9 @@ def _gated_run(task, st):
     for handle_page in st["handlers"].PAGE_HANDLERS:
         if handle_page(task):
             st["hit"] = handle_page.__name__
+            check_loop = getattr(utils, "check_loop", None)  # 官方原版 utils 没有通用循环检测
+            if check_loop is not None:
+                check_loop(task, st["hit"])
             return
     task._check_upload_if_needed()
 

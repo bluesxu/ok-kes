@@ -5,7 +5,7 @@ from utils import (
     find_box_at_point, find_text, recognize_cards,
     _card_has_type_below, select_card, calculate_dominant_hue,
     log_credit, log_node_status, handle_battle_crash, handle_close_page, handle_refine_equipment_credit,
-    handle_center_confirm, handle_settlement, handle_skip,
+    handle_center_confirm, handle_dont_show_again, handle_settlement, handle_skip,
     handle_destiny_choice, handle_main_member_flash,
     handle_card_reward, handle_equipment,
     handle_select_card, handle_copy_member,
@@ -1031,6 +1031,7 @@ PAGE_HANDLERS = [
 
     handle_ether_supply,
     handle_refine_equipment_credit, #提炼装备信用点页面，优先于确认按钮
+    handle_dont_show_again, #带「今天不再显示」的确认框：先勾上再确认，优先于页面中央确认
     handle_center_confirm,
     handle_archive_target_member, #信息统计页面，避免出击模式卡住
     handle_equipment, #装备选择

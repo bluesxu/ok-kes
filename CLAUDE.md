@@ -9,6 +9,7 @@ ok-kes：基于 [ok-script](https://github.com/ok-oldking/ok-script)（PyPI 包 
 
 ## 常用命令
 
+2026-10 起本仓库从官方版独立出来，直接用仓库 `.venv` 运行 `main.py`（配置、日志都在仓库的 `configs/`、`battle_logs/`、`logs/` 下，均被 git 忽略），不再装进官方安装目录；`speedup_patch/` 只作备用，不往原作者的热门配置库上传（`config_sync.AUTO_UPLOAD`）。
 `ok` 框架来自 `requirements.txt` 里的 `ok-script-kes`，不在仓库中（`.gitignore` 忽略了 `ok/`）。优先用仓库 `.venv`；没有时可借用已安装的 ok-kes：
 解释器 `D:\Program Files\ok-kes\data\apps\ok-kes\python\python.exe`，并把 `PYTHONPATH` 设为 `D:\Program Files\ok-kes\data\apps\ok-kes\working`（里面有 `ok/`）。
 
@@ -39,7 +40,7 @@ python real_bugfix_check.py                           # 用官方安装目录里
 - 跨帧状态存在任务实例上（`task.node_status`、`task.member_status` 等），由 `utils.reset_all_status` 复位。
 - 坐标一律是相对屏幕的 0~1 值（基准 2560×1440，16:9）。国服简体、国际服繁体都要支持：匹配文字时考虑两种写法，或依赖 `_simplify_texts` 统一成简体。注意 `wait_ocr` 等框架方法返回的文字不经过 `_simplify_texts`。
 
-**配置**：配置键就是中文显示名，会持久化到 `configs/*.json`。`config_io.py` 负责配置码导入/导出、本地多套配置、旧配置迁移（在 `load_config` 里调用），`UI_ONLY_CONFIG_KEYS` 里的键不进配置码也不上传；`config_sync.py` 负责匿名上传配置/胜率和“热门配置”。`config_description` 等界面文字要同步 `i18n/<locale>/LC_MESSAGES/ok.po`，并重新编译 `ok.mo`（`msgid` 必须与代码字符串完全一致）。
+**配置**：配置键就是中文显示名，会持久化到 `configs/*.json`。`config_io.py` 负责配置码导入/导出、本地多套配置、旧配置迁移（在 `load_config` 里调用），`UI_ONLY_CONFIG_KEYS` 里的键不进配置码也不上传；`config_sync.py` 负责匿名上传配置/胜率和“热门配置”。界面顺序、隐藏项、子选项和缺省说明统一在 `config_layout.py`（两个模式 `__init__` 末尾调用 `apply`），新增配置项要排进 `CHAOS_ORDER` / `SORTIE_ORDER`，否则 `TestConfigLayout` 会失败。`config_description` 等界面文字要同步 `i18n/<locale>/LC_MESSAGES/ok.po`，并重新编译 `ok.mo`（`msgid` 必须与代码字符串完全一致）。
 
 **给某个角色写配置（查构筑资料 → 出配置码）**：产出是配置码（配置 JSON 的 base64，格式同 `config_io._export_config_to_text`），不改仓库文件。
 - 资料来源，按可信度排：
@@ -63,7 +64,7 @@ python real_bugfix_check.py                           # 用官方安装目录里
 - `_EXPECTED_RUN_SOURCE` / `_handlers_module` 通过读 `run()` 源码来确认结构没变。**修改 `ChaosMode.run` / `SortieMode.run` 时要同步 `speedup._gated_run`**，`TestSpeedup` 里的 `test_real_*_run_matches_gated_run` 会检查这一点。
 - 其中几项与速度无关的修正（按钮文字被 OCR 切成两个框、国际服 BOSS 页/休息区、分解存档确认框、零式系统法典卡片改为按存档储存上限 pt 判断）在源码里也已修好。补丁里保留同样的逻辑，是为了用 `speedup_patch/install_speedup.py` 装进未修改的官方版时同样生效；两边同时存在不冲突。
 
-**`speedup_patch/`**：`install_speedup.py` 把本仓库的改动装进官方安装目录（默认 `D:\Program Files\ok-kes\data\apps\ok-kes\working`），需要先关闭 ok-kes，官方版自动更新后要重新安装。安装目录里的 `utils.py`、`utils_sortie.py`、`utils_chaos.py`、`ChaosMode.py`、`SortieMode.py` 和翻译文件与 v1.4.3 原版哈希（`BASE_SHA`）一致时整份替换，并复制 `speedup.py`、`utils_battle.py`、`battle_log.py`；对不上（官方已更新）时只复制 `speedup.py`、`battle_log.py`，往原版 `ChaosMode`/`SortieMode` 插入加速补丁调用。另给 `src/config.py` 追加 OpenVINO f32 补丁。**改了这些被整份替换的文件后，仓库要先合并对应的上游版本，再更新 `BASE_SHA`。**
+**`speedup_patch/`**：`install_speedup.py` 把本仓库的改动装进官方安装目录（默认 `D:\Program Files\ok-kes\data\apps\ok-kes\working`），需要先关闭 ok-kes，官方版自动更新后要重新安装。安装目录里的 `utils.py`、`utils_sortie.py`、`utils_chaos.py`、`ChaosMode.py`、`SortieMode.py` 和翻译文件与 v1.4.3 原版哈希（`BASE_SHA`）一致时整份替换，并复制 `speedup.py`、`utils_battle.py`、`battle_log.py`、`config_layout.py`；对不上（官方已更新）时只复制 `speedup.py`、`battle_log.py`，往原版 `ChaosMode`/`SortieMode` 插入加速补丁调用。另给 `src/config.py` 追加 OpenVINO f32 补丁。**改了这些被整份替换的文件后，仓库要先合并对应的上游版本，再更新 `BASE_SHA`。**
 
 ## 仓库内的代理技能
 

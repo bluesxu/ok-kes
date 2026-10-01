@@ -30,6 +30,11 @@ _JPG_QUALITY = 80
 _BATTLE_GONE = 8        # 离开战斗画面这么多秒才算战斗结束（出击模式战斗中会弹出选择页面）
 _UNHANDLED_AFTER = 10   # 连续这么多秒没有页面处理函数认领画面，记一次「未识别页面」
 _UNHANDLED_GAP = 3      # 兜底函数两次调用间隔超过这么久，说明中间有帧被别的处理函数认领了，重新计时
+# 通用循环检测：几个处理函数轮流动作、画面一直在变，「画面卡住」「未识别页面」两种兜底都不会触发
+_LOOP_WINDOW = 60       # 这么久没有推进（轮次、战斗、重开、节点、通过的 boss 都没变）
+_LOOP_MIN_ACTIONS = 12  # 期间处理函数至少动作了这么多次
+_LOOP_MAX_KINDS = 3     # 最近这些动作只来自这么几个处理函数，才算循环
+_LOOP_STEP_GAP = 30     # 判定为循环后，下一级处理至少再等这么久
 
 
 def install(task):
@@ -166,6 +171,34 @@ def battle_frame(task, in_battle):
     elif state["in_battle"] and now - state["battle_last"] >= _BATTLE_GONE:
         state["in_battle"] = False
         record(task, "战斗结束", seconds=round(state["battle_last"] - state["battle_start"]))
+
+
+def loop_frame(task, handler):
+    """有处理函数动作的一帧。判定为循环时返回 (第几次判定, 涉及的处理函数)，否则返回 None。
+    轮次、战斗编号、重开次数、节点数、通过的 boss 数任何一个变了就算有推进，重新计时；战斗中不判断。"""
+    state = _state(task)
+    node_status = getattr(task, "node_status", None) or {}
+    sig = (state["round_id"], state["battle_id"], state["rerolls"],
+           node_status.get("node_count"), node_status.get("pass_final_boss_count"))
+    now = time.time()
+    if state["in_battle"] or sig != state.get("loop_sig"):
+        state.update(loop_sig=sig, loop_since=now, loop_actions=[], loop_level=0, loop_last=0.0)
+        return None
+    actions = state["loop_actions"]
+    actions.append(handler)
+    del actions[:-50]
+    if now - state["loop_since"] < _LOOP_WINDOW or len(actions) < _LOOP_MIN_ACTIONS:
+        return None
+    kinds = sorted(set(actions[-_LOOP_MIN_ACTIONS:]))
+    if len(kinds) > _LOOP_MAX_KINDS or now - state["loop_last"] < _LOOP_STEP_GAP:
+        return None
+    state["loop_last"] = now
+    state["loop_level"] += 1
+    return state["loop_level"], kinds
+
+
+def loop_seconds(task):
+    return time.time() - _state(task).get("loop_since", time.time())
 
 
 def unhandled_frame(task):

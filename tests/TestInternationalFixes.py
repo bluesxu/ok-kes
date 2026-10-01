@@ -427,8 +427,11 @@ class TestDiscoverySelect(unittest.TestCase):
     def test_picks_qualified_capacity(self):
         self.assertEqual([(0.81, 0.58)], self.run_page(None, None, 150))
 
-    def test_picks_highest_when_several_qualify(self):
-        self.assertEqual([(0.5, 0.58)], self.run_page(145, 170, 150))
+    def test_picks_lowest_when_several_qualify(self):
+        # 门槛 140，选项 160 / 150 / 170：只要达标就够，选最低的 150
+        self.assertEqual([(0.5, 0.58)], self.run_page(160, 150, 170))
+        self.assertEqual([(0.19, 0.58)], self.run_page(145, 170, 150))
+        self.assertEqual([(0.81, 0.58)], self.run_page(120, 160, 150))   # 不达标的不算
 
     def test_rerolls_with_chaos_synthesis_when_none_qualify(self):
         self.assertEqual([(0.46, 0.92)], self.run_page(None, 120, 130))  # 「卡厄思合成」
@@ -530,8 +533,11 @@ class TestEquipmentSlotColor(unittest.TestCase):
     def test_colors(self):
         self.assertEqual("", self.quality((30, 33, 36)))       # 空槽：暗灰
         self.assertEqual("", self.quality((90, 92, 96)))       # 空槽透出立绘：灰
-        self.assertEqual("普通", self.quality((61, 76, 138)))
-        self.assertEqual("史诗", self.quality((160, 88, 69)))
+        self.assertEqual("稀有", self.quality((61, 76, 138)))
+        self.assertEqual("传说", self.quality((160, 88, 69)))
+        self.assertEqual("独特", self.quality((136, 96, 184)))  # 紫底，实跑读数
+        self.assertEqual("独特", self.quality((103, 77, 144)))
+        self.assertIsNone(self.quality((40, 160, 60)))          # 认不出的颜色不再算成最高品质
 
     def test_slots_level_with_level_tag(self):
         points = []
@@ -540,6 +546,306 @@ class TestEquipmentSlotColor(unittest.TestCase):
             utils._member_equipment_qualities(task, Box(1330, 377, 40, 20))
         self.assertAlmostEqual(0.321, points[0][1], places=2)
         self.assertEqual([0.759, 0.829, 0.899], [round(p[0], 3) for p in points])
+
+
+
+QUALITY_RGB = {"": (20, 22, 21), "稀有": (72, 89, 160), "传说": (165, 110, 86), "独特": (136, 96, 184)}
+MEMBER_Y = (0.33, 0.55, 0.77)   # 三个主战员「等级」标签的纵坐标
+LEVEL_X = 0.63
+EMPTY = ("", "", "")
+
+
+class EquipmentTask(PageTask):
+    """安装装备页：画面按 slots（三个主战员各三格的品质）和新装备品质上色，刷存档主战员默认是第 2 号。"""
+
+    def __init__(self, name, kind, quality, slots, target=1, config=None, extra=(), purchase=False):
+        texts = [("装备", 0.499, 0.126), ("请选择主战员", 0.921, 0.135, 0.10),
+                 (name, 0.30, 0.405, 0.10), (kind, 0.25, 0.466), ("战斗开始时获得护盾", 0.35, 0.55, 0.20),
+                 *extra]
+        if purchase:
+            texts += [("取消", 0.70, 0.94), ("购买", 0.90, 0.94), ("100", 0.80, 0.94)]
+        else:
+            texts += [("提炼", 0.65, 0.94), ("确认", 0.90, 0.94)]
+        super().__init__(texts)
+        self.config = {"游戏语言": "简体中文", "装备1号位优先级": [], "装备2号位优先级": [], "装备3号位优先级": [],
+                       **(config or {})}
+        self.default_config = {"刷存档主战员": True}
+        self._equipment_page_shot = True
+        self.level_tags = [Box(LEVEL_X * WIDTH - 20, y * HEIGHT - 10, 40, 20, confidence=0.9, name="leveltag")
+                           for y in MEMBER_Y]
+        self.target = Box(0.67 * WIDTH, MEMBER_Y[target] * HEIGHT, 30, 30, confidence=0.9, name="target")
+        import numpy as np
+        self.frame = np.zeros((HEIGHT, WIDTH, 3), np.uint8)
+        self.paint(0.117, 0.409, 0.004, 0.004, QUALITY_RGB.get(quality, quality))
+        for member_y, member_slots in zip(MEMBER_Y, slots):
+            for offset, slot_quality in zip((0.130, 0.200, 0.270), member_slots):
+                self.paint(LEVEL_X + offset + 0.019, member_y - 0.044, 0.010, 0.008, QUALITY_RGB[slot_quality])
+
+    def paint(self, cx, cy, half_w, half_h, rgb):
+        self.frame[int((cy - half_h) * HEIGHT):int((cy + half_h) * HEIGHT),
+                   int((cx - half_w) * WIDTH):int((cx + half_w) * WIDTH)] = rgb[::-1]
+
+    def find_feature(self, feature_name=None, **kwargs):
+        return list(self.level_tags) if feature_name == "leveltag" else []
+
+    def feature_exists(self, name):
+        return name == "target_member_tiny"
+
+    def find_one(self, feature_name=None, **kwargs):
+        return self.target if feature_name == "target_member_tiny" else None
+
+    def chosen(self):
+        """点了第几号主战员（1 起），或点的按钮文字。"""
+        members = [f"(0.756, {y:.3f})" for y in MEMBER_Y]
+        return [members.index(c) + 1 if c in members else c for c in self.clicked]
+
+
+class TestEquipmentAssign(unittest.TestCase):
+    """卡厄思模式安装装备页：独特名额、分给别人、提炼、购买、读不出品质、同一页停好几帧。"""
+
+    def setUp(self):
+        self.now = 1000.0
+        patcher = unittest.mock.patch.object(utils.time, "time", lambda: self.now)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_page(self, *args, **kwargs):
+        task = EquipmentTask(*args, **kwargs)
+        return task, utils.handle_equipment(task)
+
+    def test_better_quality_goes_to_target(self):
+        task, _ = self.run_page("战斗服", "防御力", "传说", [EMPTY, ("", "稀有", ""), EMPTY])
+        self.assertEqual([2], task.chosen())
+
+    def test_configured_unique_goes_to_target(self):
+        task, _ = self.run_page("拷问工具箱", "防御力", "独特", [EMPTY, ("", "传说", ""), EMPTY],
+                                config={"装备2号位优先级": ["拷问工具箱"]})
+        self.assertEqual([2], task.chosen())
+
+    def test_unconfigured_unique_kept_for_configured(self):
+        task, _ = self.run_page("深绿桎梏", "生命值", "独特", [("传说", "", ""), EMPTY, ("", "", "传说")],
+                                config={"装备2号位优先级": ["拷问工具箱"]})
+        self.assertEqual([1], task.chosen())   # 刷存档主战员不要；第 1 号这一格空着
+
+    def test_unique_free_for_all_without_config(self):
+        task, _ = self.run_page("深绿桎梏", "生命值", "独特", [EMPTY, EMPTY, EMPTY])
+        self.assertEqual([2], task.chosen())
+
+    def test_second_configured_unique_goes_elsewhere(self):
+        task, _ = self.run_page("异象石碑", "生命值", "独特", [EMPTY, ("独特", "", ""), ("", "", "稀有")],
+                                config={"装备1号位优先级": ["蚀化臂铠"], "装备3号位优先级": ["异象石碑"]})
+        self.assertEqual([1], task.chosen())
+
+    def test_others_get_empty_then_lowest_slot(self):
+        task, _ = self.run_page("短刀", "攻击力", "传说", [("稀有", "", ""), ("传说", "", ""), EMPTY])
+        self.assertEqual([3], task.chosen())   # 第 3 号这一格空着
+        task, _ = self.run_page("短刀", "攻击力", "传说", [("传说", "", ""), ("独特", "", ""), ("稀有", "", "")])
+        self.assertEqual([3], task.chosen())   # 品质比它低的只有第 3 号
+
+    def test_tie_goes_to_recommended(self):
+        task, _ = self.run_page("短刀", "攻击力", "稀有", [EMPTY, ("传说", "", ""), EMPTY],
+                                extra=[("推荐", 0.92, 0.70)])
+        self.assertEqual([3], task.chosen())
+        task, _ = self.run_page("短刀", "攻击力", "稀有", [EMPTY, ("传说", "", ""), EMPTY])
+        self.assertEqual([1], task.chosen())   # 没有「推荐」时给站位靠前的
+
+    def test_nobody_needs_it_refines(self):
+        task, result = self.run_page("短刀", "攻击力", "稀有", [("传说", "", ""), ("传说", "", ""), ("稀有", "", "")])
+        self.assertTrue(result)
+        self.assertEqual(["提炼"], task.chosen())
+
+    def test_unique_not_given_to_member_with_unique(self):
+        task, _ = self.run_page("深绿桎梏", "生命值", "独特", [("独特", "", ""), EMPTY, ("", "独特", "")],
+                                config={"装备2号位优先级": ["拷问工具箱"]})
+        self.assertEqual(["提炼"], task.chosen())
+
+    def test_purchase_only_for_target(self):
+        with unittest.mock.patch.object(utils, "_get_current_credit", lambda task: 300):
+            task, result = self.run_page("短刀", "攻击力", "稀有", [EMPTY, ("传说", "", ""), EMPTY], purchase=True)
+        self.assertTrue(result)
+        self.assertEqual(["取消"], task.chosen())
+        # 实跑 10/01 12:09：认出了主战员、确实不值得买，商店本轮不再点它，免得商店 ↔ 购买页来回
+        self.assertEqual(["短刀"], task.node_status["shop_cancelled"])
+        with unittest.mock.patch.object(utils, "_get_current_credit", lambda task: 300):
+            task, _ = self.run_page("短刀", "攻击力", "传说", [EMPTY, ("稀有", "", ""), EMPTY], purchase=True)
+        self.assertEqual([2, "购买"], task.chosen())
+
+    def test_unknown_target_refetches_then_gives_up(self):
+        # 实跑 10/01 11:02：开局头像没取准，购买页认不出刷存档主战员一直取消，商店又一直去点同一件
+        task = EquipmentTask("短刀", "攻击力", "传说", [EMPTY, EMPTY, EMPTY], purchase=True,
+                             config={"装备1号位优先级": ["短刀"]})
+        task.target = None
+        task.node_status["save_target_member"] = True
+        with unittest.mock.patch.object(utils, "_get_current_credit", lambda task: 300):
+            for _ in range(utils._TARGET_MISS_GIVE_UP):
+                self.assertTrue(utils.handle_equipment(task))
+        self.assertEqual(["取消"] * (utils._TARGET_MISS_GIVE_UP - 1) + ["esc"], task.chosen())
+        self.assertFalse(task.node_status["save_target_member"])     # 中途重新获取过头像
+        self.assertEqual(["短刀"], task.node_status["shop_cancelled"])  # 商店本轮不再点它
+
+    def test_fading_slot_is_read_again(self):
+        # 实跑 10/01 11:53：页面刚出来卡片还在淡入，装着「非典型方块」的格子读成空，记录被清掉
+        task = EquipmentTask("森林三叶草", "生命值", "稀有", [EMPTY, EMPTY, EMPTY])
+        task.member_status = {"equipment": {"names": ["", "", "非典型方块"], "descriptions": ["", "", ""],
+                                            "qualities": ["", "", "稀有"]}, "deck": {}}
+        self.assertTrue(utils.handle_equipment(task))
+        self.assertEqual([], task.chosen())                              # 先不信「空」，等下一帧
+        task.paint(LEVEL_X + 0.270 + 0.019, MEMBER_Y[1] - 0.044, 0.010, 0.008, QUALITY_RGB["稀有"])
+        utils.handle_equipment(task)
+        self.assertEqual("非典型方块", task.member_status["equipment"]["names"][2])
+        self.assertEqual([1], task.chosen())                             # 同品质不换，给 3 号位空着的第 1 号
+
+    def test_unreadable_quality_waits_then_counts_as_rare(self):
+        task = EquipmentTask("短刀", "攻击力", (31, 34, 33), [EMPTY, EMPTY, EMPTY])
+        for _ in range(utils._EQUIPMENT_QUALITY_RETRIES - 1):
+            self.assertTrue(utils.handle_equipment(task))
+            self.assertEqual([], task.chosen())
+        utils.handle_equipment(task)
+        self.assertEqual([2], task.chosen())   # 按稀有，装进空格
+
+    def test_same_page_decided_once(self):
+        # 实跑 10/01 09:22：下一帧拿刚记下的自己比较，又把同一件装备转给了别人
+        task = EquipmentTask("M85军用手榴弹", "攻击力", "稀有", [EMPTY, EMPTY, EMPTY])
+        self.assertFalse(utils.handle_equipment(task))
+        self.now += 1
+        self.assertFalse(utils.handle_equipment(task))
+        self.assertEqual([2], task.chosen())
+        self.now += utils._EQUIPMENT_DECISION_KEEP
+        task.paint(LEVEL_X + 0.130 + 0.019, MEMBER_Y[1] - 0.044, 0.010, 0.008, QUALITY_RGB["稀有"])  # 已装上
+        utils.handle_equipment(task)   # 过了时限：当成新的一件重新判断
+        self.assertEqual(2, len(task.chosen()))
+
+
+
+class TestInfoOption(unittest.TestCase):
+    """实跑 10/01 10:05：「询问方法 / 確認【盜獵者的樂趣】資訊」看过后变灰点不动，
+    「页面中央确认」把切出来的「確認【」当成确认按钮，事件页又一直选它，卡了 5 分钟。"""
+
+    OPTIONS = [("詢問方法", 0.16, 0.80), ("確認【", 0.15, 0.836), ("盜獵者的樂趣】資訊", 0.24, 0.836, 0.12),
+               ("參加打賭", 0.42, 0.80), ("觸發【與盜獵者的打賭】事件", 0.49, 0.836, 0.16),
+               ("用謊言來警告", 0.68, 0.80), ("信用點數80增加", 0.71, 0.836, 0.10)]
+
+    def test_bracket_text_is_not_confirm_button(self):
+        task = PageTask(self.OPTIONS)
+        self.assertFalse(utils.handle_center_confirm(task))
+        self.assertTrue(utils.handle_center_confirm(PageTask([("確認", 0.50, 0.70)])))
+
+    def test_info_option_skipped(self):
+        def option(description, x, y):
+            return {"x": x, "y": y, "description": utils._normalize_text(description),
+                    "description_region": (x - 0.1, 0.78, x + 0.1, 0.86), "feature_name": "event3", "confidence": 0.9}
+        options = [option("詢問方法確認【盜獵者的樂趣】資訊", 0.24, 0.886),   # 灰色选项被当成已选中
+                   option("參加打賭觸發【與盜獵者的打賭】事件", 0.50, 0.947),
+                   option("用謊言來警告信用點數80增加", 0.76, 0.947)]
+        task = PageTask(self.OPTIONS)
+        task.find_feature = lambda *args, **kwargs: []
+        with unittest.mock.patch.object(utils, "recognize_event_options", lambda *args, **kwargs: options):
+            utils.handle_event_task(task)
+        self.assertNotIn("(0.240, 0.820)", task.clicked)
+        self.assertTrue(task.clicked)
+
+
+
+class TestDiceReroll(unittest.TestCase):
+    """掷骰失败：右上角持有数够付重新掷骰的费用就重掷，否则下一步。"""
+
+    def page(self, owned, cost="2"):
+        return PageTask([("擲骰", 0.50, 0.15), ("7", 0.50, 0.22), ("失敗", 0.498, 0.678),
+                         (f"{owned}/20+", 0.92, 0.103, 0.06), ("重新擲骰", 0.267, 0.90, 0.07),
+                         (cost, 0.466, 0.90, 0.01), ("下一步", 0.665, 0.899)])
+
+    def test_rerolls_when_enough(self):
+        task = self.page(20)
+        self.assertTrue(utils.handle_negotiation(task))
+        self.assertEqual(["重新掷骰"], task.clicked)
+
+    def test_next_step_when_not_enough_or_unreadable(self):
+        for task in (self.page(1), self.page(20, cost="")):
+            self.assertTrue(utils.handle_negotiation(task))
+            self.assertEqual(["(0.665, 0.899)"], task.clicked)
+
+
+class TestDontShowAgain(unittest.TestCase):
+    """带「今天不再显示」勾选框的确认框（如获得神之灵光一闪的卡牌）：先勾上，再点确认。"""
+
+    TEXTS = [("獲得被賦予神之靈光一閃的卡牌時，模糊的記憶將增加20pt。", 0.50, 0.352, 0.48),
+             ("今天不再顯示", 0.521, 0.582, 0.095), ("取消", 0.347, 0.689), ("確認", 0.665, 0.689)]
+
+    def run_page(self, box_rgb):
+        import numpy as np
+        task = PageTask(self.TEXTS)
+        task.frame = np.zeros((HEIGHT, WIDTH, 3), np.uint8)
+        x, y = int(0.4445 * WIDTH), int(0.582 * HEIGHT)
+        task.frame[y - 25:y + 25, x - 25:x + 25] = box_rgb[::-1]
+        self.assertTrue(utils.handle_dont_show_again(task))
+        return task.clicked
+
+    def test_unchecked_box_is_ticked_then_confirmed(self):
+        clicked = self.run_page((200, 200, 200))
+        self.assertEqual(2, len(clicked))
+        self.assertAlmostEqual(0.445, float(clicked[0].strip("()").split(",")[0]), places=2)
+        self.assertEqual("确认", clicked[1])
+
+    def test_checked_box_is_left_alone(self):
+        self.assertEqual(["确认"], self.run_page((235, 125, 40)))   # 已勾上是橙色
+
+    def test_other_pages_ignored(self):
+        self.assertFalse(utils.handle_dont_show_again(PageTask([("確認", 0.665, 0.689)])))
+
+    def test_enter_button(self):
+        # 实跑 10/01 10:53：「确认准备战斗说明」的按钮是「進入」，只认「确认」时每帧都占住，卡住后被 ESC 关掉再重开
+        import numpy as np
+        task = PageTask([("確認準備戰鬥說明", 0.50, 0.17, 0.16), ("今天不再顯示", 0.521, 0.722, 0.095),
+                         ("取消", 0.347, 0.83), ("進入", 0.665, 0.83)])
+        task.frame = np.zeros((HEIGHT, WIDTH, 3), np.uint8)
+        x, y = int(0.4445 * WIDTH), int(0.722 * HEIGHT)
+        task.frame[y - 25:y + 25, x - 25:x + 25] = (41, 120, 218)   # 已勾上（BGR）
+        self.assertTrue(utils.handle_dont_show_again(task))
+        self.assertEqual(["进入"], task.clicked)
+
+    def test_no_button_does_not_hold_the_frame(self):
+        import numpy as np
+        task = PageTask([("今天不再顯示", 0.521, 0.722, 0.095)])
+        task.frame = np.zeros((HEIGHT, WIDTH, 3), np.uint8)
+        x, y = int(0.4445 * WIDTH), int(0.722 * HEIGHT)
+        task.frame[y - 25:y + 25, x - 25:x + 25] = (41, 120, 218)
+        self.assertFalse(utils.handle_dont_show_again(task))
+
+
+
+class TestMemoryCarving(unittest.TestCase):
+    """零式系统 boss 后：事件页选「雕琢记忆」，记忆雕琢页一直点「记忆雕琢」，按钮变灰后离开。"""
+
+    PAGE = [("記憶雕琢", 0.501, 0.128), ("記憶加工", 0.14, 0.33), ("記憶雕琢", 0.845, 0.33),
+            ("雕琢成功機率30%", 0.852, 0.392, 0.12), ("記憶加工", 0.10, 0.795), ("1", 0.25, 0.795),
+            ("記憶雕琢", 0.805, 0.795), ("1", 0.955, 0.795), ("離開", 0.95, 0.928)]
+
+    def run_page(self, button_rgb):
+        import numpy as np
+        task = PageTask(self.PAGE)
+        task.frame = np.zeros((HEIGHT, WIDTH, 3), np.uint8)
+        x, y = int(0.86 * WIDTH), int(0.795 * HEIGHT)
+        task.frame[y - 20:y + 20, x - 20:x + 20] = button_rgb[::-1]
+        self.assertTrue(utils_chaos.handle_memory_carving(task))
+        return task.clicked
+
+    def test_carves_while_button_orange(self):
+        self.assertEqual(["记忆雕琢"], self.run_page((235, 140, 50)))
+
+    def test_leaves_when_button_gray(self):
+        self.assertEqual(["离开"], self.run_page((200, 200, 200)))
+
+    def test_event_page_picks_carving(self):
+        def option(description, x, y):
+            return {"x": x, "y": y, "description": description,
+                    "description_region": (x - 0.1, 0.78, x + 0.1, 0.86), "feature_name": "event3", "confidence": 0.9}
+        options = [option("雕琢记忆奉行既定的启示", 0.37, 0.947), option("离开事件结束", 0.63, 0.947)]
+        task = PageTask([])
+        task.config["任务/装备优先级"] = ["结束"]
+        task.find_feature = lambda *args, **kwargs: []
+        with unittest.mock.patch.object(utils, "recognize_event_options", lambda *args, **kwargs: options):
+            self.assertTrue(utils.handle_event_task(task))
+        self.assertEqual(["(0.370, 0.820)"], task.clicked)
 
 
 if __name__ == '__main__':

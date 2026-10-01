@@ -35,6 +35,7 @@ UPLOAD_INTERVAL = 300  # 5分钟
 
 # 有效数据最低场数（后期用户多了可以改大）
 MIN_ROUNDS = 5
+AUTO_UPLOAD = False  # 独立运行后不上传，见 check_upload_if_needed
 SUPPORTED_GAME_LANGUAGES = ("简体中文", "繁体中文")
 
 
@@ -301,7 +302,10 @@ def check_upload_disabled_and_warn(task: TriggerTask) -> bool:
 
 
 def check_upload_if_needed(task: TriggerTask, mode: str):
-    """每 UPLOAD_INTERVAL 秒自动上传一次配置。"""
+    """每 UPLOAD_INTERVAL 秒自动上传一次配置。本仓库已从官方版独立出来运行（配置键、胜率口径都和官方不同），
+    不再往原作者的「热门配置」库上传，免得混进不可比的数据；查看热门配置不受影响。"""
+    if not AUTO_UPLOAD:
+        return
     import time
     now = time.time()
     if now - getattr(task, '_last_upload_time', 0) >= UPLOAD_INTERVAL:

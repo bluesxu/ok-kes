@@ -881,6 +881,41 @@ class TestBattleLogEvents(unittest.TestCase):
             self.now[0] += 1
         self.assertEqual([], self.rows())
 
+    def run_loop(self, seconds, handlers=("handle_shop", "handle_equipment")):
+        keys = []
+        self.task.send_key, self.task.sleep = keys.append, lambda s: None
+        for second in range(seconds):
+            utils.check_loop(self.task, handlers[second % len(handlers)])
+            self.now[0] += 1
+        return keys
+
+    def test_loop_refetches_target_then_presses_esc(self):
+        # 实跑 10/01 11:02：商店 ↔ 购买页来回点，画面一直在变，「画面卡住」「未识别页面」都不触发
+        self.task.default_config["刷存档主战员"] = "米卡"
+        self.task.node_status["save_target_member"] = True
+        keys = self.run_loop(battle_log._LOOP_WINDOW + 1)
+        self.assertFalse(self.task.node_status["save_target_member"])   # 第 1 次：重新获取头像，不按键
+        self.assertEqual([], keys)
+        self.assertEqual(["疑似循环"], [r["kind"] for r in self.rows() if r["event"] == "异常"])
+        keys = self.run_loop(battle_log._LOOP_STEP_GAP + 1)
+        self.assertEqual(["esc"], keys)                                 # 第 2 次：ESC
+
+    def test_progress_or_many_handlers_is_not_a_loop(self):
+        keys = []
+        self.task.send_key, self.task.sleep = keys.append, lambda s: None
+        for second in range(battle_log._LOOP_WINDOW * 2):
+            if second % 30 == 0:
+                self.task.node_status["node_count"] += 1                # 每 30 秒进一个新节点
+            utils.check_loop(self.task, "handle_shop")
+            self.now[0] += 1
+        self.assertEqual([], keys)
+        keys = self.run_loop(battle_log._LOOP_WINDOW * 2, handlers=("a", "b", "c", "d", "e"))
+        self.assertEqual([], keys)                                      # 很多种处理函数轮流：正常推进的页面
+
+    def test_no_loop_check_in_battle(self):
+        battle_log.battle_frame(self.task, True)
+        self.assertEqual([], self.run_loop(battle_log._LOOP_WINDOW * 2, handlers=("handle_battle_auto_check",)))
+
     def test_esc_after_long_unhandled_page(self):
         # 实跑：结算页按钮换成「为记忆的尽头」，没有处理函数认领，一直停着
         keys = []

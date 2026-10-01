@@ -2026,6 +2026,25 @@ def _esc_fallback(task: TriggerTask, reason: str) -> bool:
     return True
 
 
+def check_loop(task: TriggerTask, handler: str):
+    """每帧有处理函数动作后调用（加速补丁的 _gated_run 里）。几个处理函数来回动作、长时间没有推进时分级处理：
+    第 1 次判定先记异常（截图 + 画面文字），卡厄思模式顺带重新获取刷存档主战员头像（循环常因开局头像没取准）；
+    之后每次按 ESC 兜底。实跑中商店 ↔ 购买页、灰色事件选项、「今天不再显示」弹窗都这样循环过。"""
+    hit = battle_log.loop_frame(task, handler)
+    if hit is None:
+        return
+    level, kinds = hit
+    reason = f"疑似循环：已 {battle_log.loop_seconds(task):.0f} 秒没有推进，动作只来自 {'、'.join(kinds)}"
+    if level == 1:
+        battle_log.anomaly(task, "疑似循环", reason, handlers=kinds,
+                           texts=[box.name for box in (getattr(task, "all_texts", None) or [])][:120])
+        if "刷存档主战员" in getattr(task, "default_config", {}) and hasattr(task, "node_status"):
+            task.log_info(f"{reason}，重新获取刷存档主战员头像")
+            task.node_status["save_target_member"] = False
+            return
+    _esc_fallback(task, reason)
+
+
 def log_unhandled_page(task: TriggerTask):
     """放在 PAGE_HANDLERS 最后：走到这里说明这一帧没有处理函数认领，连续 10 秒就记一次「未识别页面」（截图 + 全部文字），
     连续 20 秒按 ESC 兜底。"""
@@ -2069,6 +2088,61 @@ def handle_refine_equipment_credit(task: TriggerTask):
     return False
 
 
+def _is_confirm_text(name):
+    """文字框是不是「确认」按钮。事件选项描述「确认【盗猎者的乐趣】资讯」常被 OCR 切出一个「确认【」框，
+    _clean_match 去掉括号后也等于「确认」（实跑 10/01 10:05 一直点这个灰色选项）：带括号的不算。"""
+    return _clean_match(name, "确认") and not re.search(r"[【】「」『』\[\]]", name)
+
+
+_DONT_SHOW_AGAIN = ("不再显示", "不再顯示", "不再显", "不再顯")
+_CHECKBOX_LEFT = 0.029    # 勾选框中心在「今天不再显示」文字左缘的左侧
+
+
+def _checkbox_checked(task: TriggerTask, x, y):
+    """勾选框勾上后填成橙色，中间对勾是白的。周围橙色够多才算已勾上；读不到画面返回 None。"""
+    frame = getattr(task, "frame", None)
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return None
+    height, width = frame.shape[:2]
+    px, py = int(x * width), int(y * height)
+    half = max(4, int(0.012 * width))
+    region = frame[max(0, py - half):min(height, py + half), max(0, px - half):min(width, px + half), :3]
+    if region.size == 0:
+        return None
+    blue = region[:, :, 0]
+    red = region[:, :, 2]
+    orange = (red > 170) & (blue < 100) & (red.astype(int) > blue.astype(int) + 60)
+    return float(orange.mean()) >= 0.2
+
+
+def handle_dont_show_again(task: TriggerTask):
+    """带「今天不再显示 / 下次登入前不再显示」勾选框的确认框（分解存档资料、获得神之灵光一闪的卡牌、确认准备战斗说明等）：
+    没勾上就先勾上，再点下方的「确认」或「进入」。已勾上再点会取消，所以先看框是不是橙色。"""
+    label = next((box for box in task.all_texts
+                  if any(needle in box.name for needle in _DONT_SHOW_AGAIN)), None)
+    if label is None:
+        return False
+    x = label.x / task.width - _CHECKBOX_LEFT
+    y = (label.y + label.height / 2) / task.height
+    checked = _checkbox_checked(task, x, y)
+    if checked is None:
+        task.log_info(f"「{label.name}」读不到勾选框颜色，不点击，避免把已勾选取消")
+    elif not checked:
+        task.log_info(f"勾选「{label.name}」")
+        _move_and_click(task, x, y)
+        task.sleep(0.4)
+    # 按钮有的写「确认」，有的写「进入」（确认准备战斗说明）。找不到时不占这一帧，交给后面的处理函数
+    # （实跑 10/01 10:53：只认「确认」，每帧都返回 True，画面卡住 20 秒后被 ESC 关掉再重开，一直循环）
+    confirm = next((box for box in task.all_texts if box.y > label.y
+                    and (_is_confirm_text(box.name) or _clean_match(box.name, "进入"))), None)
+    if confirm is None:
+        return checked is False
+    task.log_info(f"「{label.name}」确认框：点击「{confirm.name}」")
+    task.click_box(confirm)
+    task.sleep(1)
+    return True
+
+
 def handle_center_confirm(task: TriggerTask):
     """页面中央的"确认"按钮。"""
     confirm_region = (0.009, 0.168, 0.977, 0.875)
@@ -2076,7 +2150,7 @@ def handle_center_confirm(task: TriggerTask):
         (
             text_box
             for text_box in task.all_texts
-            if _clean_match(text_box.name, "确认")
+            if _is_confirm_text(text_box.name)
             and confirm_region[0]
             <= (text_box.x + text_box.width / 2) / task.width
             <= confirm_region[2]
@@ -2353,11 +2427,10 @@ def handle_card_reward(task: TriggerTask):
 
 
 _EQUIPMENT_TYPE_SLOTS = {"攻击力": 0, "防御力": 1, "生命值": 2}
-_EQUIPMENT_QUALITY_RANKS = {"": 0, "普通": 1, "史诗": 2, "传说": 3}
-_EQUIPMENT_NORMAL_RGB = (61, 76, 138)
-_EQUIPMENT_EPIC_RGB = (160, 88, 69)
-_EQUIPMENT_EMPTY_RGB = (15, 15, 15)
-_EQUIPMENT_RGB_TOLERANCE = 30
+# 游戏里的品质：蓝底稀有、橙底传说、紫底独特（最高品质，每个主战员只能装一件）
+_EQUIPMENT_QUALITY_RANKS = {"": 0, "稀有": 1, "传说": 2, "独特": 3}
+_EQUIPMENT_QUALITY_RETRIES = 3   # 待安装装备读不出品质（卡片还在淡入，读成暗灰）时最多重读几帧，之后按稀有处理
+_EQUIPMENT_DECISION_KEEP = 10    # 同一件装备这么多秒内再看到，沿用上次选的主战员（页面会停好几帧）
 
 
 def _equipment_slot(task: TriggerTask, type_text):
@@ -2499,31 +2572,31 @@ def _pixel_rgb(task: TriggerTask, point):
     return red, green, blue
 
 
-def _rgb_is_close(rgb, target, tolerance=_EQUIPMENT_RGB_TOLERANCE):
-    """判断 RGB 各通道是否均在指定容差内。"""
-    return rgb is not None and all(
-        abs(value - expected) <= tolerance
-        for value, expected in zip(rgb, target)
-    )
+def _quality_from_rgb(rgb):
+    """按底色判断品质：灰暗没有颜色返回 ""，蓝稀有、紫独特、橙传说，其余颜色认不出返回 None。
+    实跑读数：稀有 (72, 89, 160)、传说 (165, 110, 86)、独特 (136, 96, 184)。"""
+    red, green, blue = rgb
+    if max(rgb) - min(rgb) < 30:
+        return ""
+    if blue > red + 30:
+        return "独特" if red > green + 15 else "稀有"
+    if red > blue + 40 and red >= green:
+        return "传说"
+    return None
 
 
-def _equipment_quality_at(task: TriggerTask, point, allow_empty=False):
-    """按指定点颜色识别装备品质；安装槽位可额外识别空槽。"""
+def _equipment_quality_at(task: TriggerTask, point):
+    """按指定点颜色识别待安装装备的品质；读不出（卡片还在淡入时是暗灰）返回 None。"""
     rgb = _pixel_rgb(task, point)
     if rgb is None:
         return None, None
-    if allow_empty and _rgb_is_close(rgb, _EQUIPMENT_EMPTY_RGB):
-        return "", rgb
-    if _rgb_is_close(rgb, _EQUIPMENT_NORMAL_RGB):
-        return "普通", rgb
-    if _rgb_is_close(rgb, _EQUIPMENT_EPIC_RGB):
-        return "史诗", rgb
-    return "传说", rgb
+    return _quality_from_rgb(rgb) or None, rgb
 
 
 def _slot_quality(task: TriggerTask, center):
     """主战员装备格的品质：取格子右上角一小块的平均色（左上角是类型徽章、中间是装备图、底部是星星，
-    右上角只有底色）。蓝底普通、橙底史诗，灰暗没有颜色是空槽（空格半透明，底下可能透出立绘），其余算传说。"""
+    右上角只有底色）。蓝底稀有、橙底传说、紫底独特，灰暗没有颜色是空槽（空格半透明，底下可能透出立绘），
+    认不出的颜色返回 None。"""
     if task.frame is None:
         return None, None
     h, w = task.frame.shape[:2]
@@ -2534,13 +2607,7 @@ def _slot_quality(task: TriggerTask, center):
         return None, None
     blue, green, red = (int(v) for v in patch.reshape(-1, 3).mean(axis=0))
     rgb = (red, green, blue)
-    if max(rgb) - min(rgb) < 30:
-        return "", rgb
-    if blue > red + 30:
-        return "普通", rgb
-    if red > blue + 40 and red >= green:
-        return "史诗", rgb
-    return "传说", rgb
+    return _quality_from_rgb(rgb), rgb
 
 
 def _member_equipment_qualities(task: TriggerTask, level_box):
@@ -2704,16 +2771,92 @@ def _find_target_member_index(
 
 
 def _log_equipment(task, new_equipment, member, member_index, reason, current_name, current_quality,
-                   purchase, price):
+                   purchase, price, **fields):
     """详细日志：装备分配。target_slots 是刷存档主战员三个装备格的取色读数（品质 + RGB）。"""
     battle_log.record(
         task, "装备分配", equipment=new_equipment["name"], slot=new_equipment["slot"] + 1,
         quality=new_equipment.get("quality"), rank=new_equipment.get("rank"),
         member=member, member_index=None if member_index is None else member_index + 1, reason=reason,
         current=current_name, current_quality=current_quality,
-        target_slots=getattr(task, "_slot_readings", None), purchase=purchase, price=price,
+        target_slots=getattr(task, "_slot_readings", None), purchase=purchase, price=price, **fields,
     )
     task._slot_readings = None
+
+
+_TARGET_MISS_REFETCH = 2   # 购买页连续这么多次认不出刷存档主战员：重新获取主战员头像
+_TARGET_MISS_GIVE_UP = 4   # 重新获取后还认不出：按 ESC 退出，这件装备本轮商店不再点
+
+
+def _target_member_missing(task: TriggerTask, new_equipment):
+    """购买页认不出刷存档主战员时的兜底（实跑 10/01 11:02：开局头像没取准，商店和购买页来回点了 1 分多钟）。
+    返回 True 表示放弃这件装备，调用方按 ESC 退出。"""
+    misses = task.node_status.get("target_member_misses", 0) + 1
+    task.node_status["target_member_misses"] = misses
+    if misses == _TARGET_MISS_REFETCH:
+        task.log_info("购买页连续认不出刷存档主战员，重新获取主战员头像")
+        battle_log.record(task, "重新获取主战员头像", equipment=new_equipment["name"], misses=misses)
+        task.node_status["save_target_member"] = False
+    if misses < _TARGET_MISS_GIVE_UP:
+        return False
+    task.log_info(f"重新获取头像后仍认不出刷存档主战员，按 ESC 退出，本轮商店不再点「{new_equipment['name']}」")
+    battle_log.record(task, "放弃购买", equipment=new_equipment["name"], reason="认不出刷存档主战员")
+    task.node_status.setdefault("shop_cancelled", []).append(new_equipment["ocr_name"])
+    task.node_status["target_member_misses"] = 0
+    return True
+
+
+def _reserves_unique(task: TriggerTask):
+    """写了装备优先级配置时，刷存档主战员唯一的独特名额只留给配置里的装备。"""
+    return any(_equipment_priority(task, slot) for slot in range(3))
+
+
+def _has_unique_elsewhere(qualities, slot):
+    return any(quality == "独特" and other != slot for other, quality in enumerate(qualities))
+
+
+def _recommended_member(task: TriggerTask, lv_texts):
+    """游戏在某个主战员卡片右上角标的「推荐」：归给它下方最近的那个主战员。"""
+    tag = next((box for box in task.all_texts
+                if "推荐" in box.name and (box.x + box.width / 2) / task.width > 0.85), None)
+    if not tag:
+        return None
+    tag_y = tag.y + tag.height / 2
+    below = [index for index, box in enumerate(lv_texts) if box.y + box.height / 2 > tag_y]
+    return min(below, key=lambda index: lv_texts[index].y) if below else None
+
+
+def _choose_other_member(task: TriggerTask, lv_texts, others, new_equipment, by_slot):
+    """刷存档主战员不要的装备给谁，返回 (主战员下标或 None, 原因, 各人装备格读数)。
+    by_slot（卡厄思模式）：先给这一格空着的人，再给这一格品质比它低的人里最低的，同样的给「推荐」的人、否则给站位靠前的；
+    谁都比不过就返回 None（提炼）。出击模式维持随机。每人只能装一件独特。"""
+    slot = new_equipment["slot"]
+    new_rank = _EQUIPMENT_QUALITY_RANKS.get(new_equipment["quality"] or "", 0)
+    eligible, readings = [], {}
+    for index in others:
+        qualities = _member_equipment_qualities(task, lv_texts[index])
+        readings[index + 1] = getattr(task, "_slot_readings", None)
+        if new_equipment["quality"] == "独特" and _has_unique_elsewhere(qualities, slot):
+            continue
+        eligible.append((index, qualities[slot]))
+    if not eligible:
+        return None, "其他主战员都已有独特装备", readings
+    if not by_slot:
+        return random.choice(eligible)[0], "随机", readings
+
+    recommended = _recommended_member(task, lv_texts)
+
+    def pick(indexes):
+        return recommended if recommended in indexes else indexes[0]
+
+    empty = [index for index, quality in eligible if quality == ""]
+    if empty:
+        return pick(empty), "这一格是空的", readings
+    lower = [(_EQUIPMENT_QUALITY_RANKS[quality], index) for index, quality in eligible
+             if quality is not None and _EQUIPMENT_QUALITY_RANKS[quality] < new_rank]
+    if lower:
+        lowest = min(rank for rank, _ in lower)
+        return pick([index for rank, index in lower if rank == lowest]), "这一格品质最低", readings
+    return None, "其他主战员这一格都不比它差", readings
 
 
 def handle_equipment(task: TriggerTask):
@@ -2800,6 +2943,25 @@ def handle_equipment(task: TriggerTask):
         equipment_desc = new_equipment["description"]
         task.log_info(f"待安装装备描述: 「{equipment_desc}」")
 
+        if new_equipment["quality"] is None:
+            misses = getattr(task, "_equipment_quality_misses", 0) + 1
+            task._equipment_quality_misses = misses
+            if misses < _EQUIPMENT_QUALITY_RETRIES:
+                task.log_info(f"待安装装备读不出品质（第{misses}次），等下一帧重读")
+                return True
+            task.log_info("待安装装备连续读不出品质，按稀有处理")
+            new_equipment["quality"] = "稀有"
+        task._equipment_quality_misses = 0
+
+        slot = new_equipment["slot"]
+        decision_key = (new_equipment["name"], slot)  # 描述每帧的 OCR 可能不同，不放进来
+        last = getattr(task, "_equipment_decision", None)
+        if last and last["key"] == decision_key and time.time() - last["time"] < _EQUIPMENT_DECISION_KEEP:
+            # 实跑 10/01 09:22：选好主战员后页面还停着，下一帧拿刚记下的自己比较，又转给了别人。
+            # 不续期：连着来两件同名装备时，第二件最多等这么久就重新判断
+            task.log_info(f"「{new_equipment['name']}」已选好第{last['member'] + 1}号主战员，等确认")
+            return False
+
         lv_texts = _find_member_level_tags(
             task,
             (0.609, 0.290, 0.652, 0.789),
@@ -2811,20 +2973,31 @@ def handle_equipment(task: TriggerTask):
             (0.607, 0.192, 0.739, 0.856),
             feature_name="target_member_tiny",
         )
+        if target_member_index is not None:
+            task.node_status["target_member_misses"] = 0
         tracks_target_member = "刷存档主战员" in getattr(task, "default_config", {})
         preferred_member_index = (
             target_member_index if tracks_target_member else (0 if lv_texts else None)
         )
 
-        slot = new_equipment["slot"]
         current_name, _ = _current_equipment_for_slot(task, equipment, slot)
         current_quality = equipment["qualities"][slot]
         should_install_first = False
         install_reason = "未找到目标主战员"
+        task._slot_readings = None
         if preferred_member_index is not None:
             live_qualities = _member_equipment_qualities(
                 task, lv_texts[preferred_member_index]
             )
+            # 页面刚出来时主战员卡片还在淡入，装着的格子也会读成空（实跑 10/01 11:53 把「非典型方块」的记录清掉了）：
+            # 记录里有装备却读成空时，先等下一帧重读
+            vanished = [s for s, q in enumerate(live_qualities) if q == "" and equipment["names"][s]]
+            misses = getattr(task, "_slot_vanish_misses", 0)
+            if vanished and misses < _EQUIPMENT_QUALITY_RETRIES - 1:
+                task._slot_vanish_misses = misses + 1
+                task.log_info(f"第{[s + 1 for s in vanished]}号装备位记录有装备却读成空，等下一帧重读")
+                return True
+            task._slot_vanish_misses = 0
             for equipment_slot, live_quality in enumerate(live_qualities):
                 if live_quality is None:
                     continue
@@ -2845,22 +3018,35 @@ def handle_equipment(task: TriggerTask):
                 current_quality,
                 new_equipment,
             )
-            has_legendary_in_other_slot = any(
-                quality == "传说" and equipment_slot != slot
-                for equipment_slot, quality in enumerate(live_qualities)
-            )
-            if (
-                new_equipment["quality"] == "传说"
-                and has_legendary_in_other_slot
-            ):
-                should_install_first = False
-                install_reason = "该主战员其他装备位已有传说装备"
-                task.log_info(
-                    "目标主战员已安装传说装备，新传说装备改由其他主战员安装"
-                )
+            if new_equipment["quality"] == "独特":
+                if _has_unique_elsewhere(live_qualities, slot):
+                    should_install_first = False
+                    install_reason = "该主战员其他装备位已有独特装备"
+                elif new_equipment["rank"] is None and _reserves_unique(task):
+                    should_install_first = False
+                    install_reason = "独特名额留给优先级配置里的装备"
+        target_readings = getattr(task, "_slot_readings", None)
+        installs_first = should_install_first and preferred_member_index is not None
 
-        if should_install_first and preferred_member_index is not None:
-            chosen = lv_texts[preferred_member_index]
+        if is_purchase_page and not installs_first:
+            # 只给刷存档主战员（出击模式为第一主战员）买：配置里的装备，或比这一格更好的
+            task.log_info(f"购买装备「{new_equipment['name']}」不装给主战员（{install_reason}），点击「取消」")
+            _log_equipment(task, new_equipment, "取消", None, install_reason, current_name, current_quality,
+                           is_purchase_page, equipment_price)
+            if tracks_target_member and target_member_index is None:
+                if _target_member_missing(task, new_equipment):
+                    task.send_key("esc")
+                else:
+                    task.click_box(cancel_box)
+            else:
+                # 认出了主战员、确实不值得买：本轮商店不再点它
+                task.node_status.setdefault("shop_cancelled", []).append(new_equipment["ocr_name"])
+                task.click_box(cancel_box)
+            task.sleep(1)
+            return True
+
+        if installs_first:
+            chosen_index = preferred_member_index
             if not tracks_target_member or target_member_index is not None:
                 equipment["names"][slot] = new_equipment["name"]
                 equipment["descriptions"][slot] = equipment_desc
@@ -2877,69 +3063,52 @@ def handle_equipment(task: TriggerTask):
             )
             _log_equipment(task, new_equipment, member_label, preferred_member_index, install_reason,
                            current_name, current_quality, is_purchase_page, equipment_price)
-            _move_and_click(task, 0.756, (chosen.y + chosen.height / 2) / task.height)
-            task.sleep(1)
-            if is_purchase_page:
-                task.log_info(
-                    f"购买装备分配完成，价格={equipment_price}，"
-                    f"当前信用点={current_credit}，点击「购买」"
-                )
-                task.click_box(purchase_box)
-                task.sleep(1)
-                return True
-            return False
-
-        other_members = [
-            level_box for index, level_box in enumerate(lv_texts)
-            if index != preferred_member_index
-        ]
-        if other_members:
-            chosen = random.choice(other_members)
-            _log_equipment(task, new_equipment, "其他主战员", lv_texts.index(chosen),
-                           "未识别到刷存档主战员" if tracks_target_member and target_member_index is None
-                           else install_reason, current_name, current_quality, is_purchase_page, equipment_price)
+        else:
             if tracks_target_member and target_member_index is None:
-                task.log_info("未识别到刷存档主战员，随机安装给其他主战员")
-            else:
-                task.log_info(
-                    f"{slot + 1}号位无需替换当前装备「{current_name}」，"
-                    f"原因={install_reason}，"
-                    "随机安装给其他主战员"
+                install_reason = "未识别到刷存档主战员"
+            others = [index for index in range(len(lv_texts)) if index != preferred_member_index]
+            chosen_index, other_reason, other_slots = _choose_other_member(
+                task, lv_texts, others, new_equipment, by_slot=tracks_target_member)
+            task._slot_readings = target_readings
+            if chosen_index is None:
+                refine_box = next(
+                    (b for b in task.all_texts
+                     if 0.522 <= (b.x + b.width / 2) / task.width <= 0.999
+                     and 0.879 <= (b.y + b.height / 2) / task.height <= 0.996
+                     and "提炼" in b.name),
+                    None
                 )
-            _move_and_click(task, 0.756, (chosen.y + chosen.height / 2) / task.height)
-            task.sleep(1)
-            if is_purchase_page:
-                task.log_info(
-                    f"购买装备分配给其他主战员，价格={equipment_price}，"
-                    f"当前信用点={current_credit}，点击「购买」"
-                )
-                task.click_box(purchase_box)
+                if not refine_box:
+                    task.log_info("未找到可选择的主战员或提炼按钮")
+                    return False
+                task.log_info(f"{slot + 1}号位装备「{new_equipment['name']}」没有主战员需要"
+                              f"（{install_reason}，{other_reason}），点击提炼")
+                _log_equipment(task, new_equipment, "提炼", None, f"{install_reason}；{other_reason}",
+                               current_name, current_quality, is_purchase_page, equipment_price,
+                               other_slots=other_slots)
+                task.click_box(refine_box)
                 task.sleep(1)
                 return True
-            return False
+            task.log_info(
+                f"{slot + 1}号位无需替换当前装备「{current_name}」，原因={install_reason}，"
+                f"安装给第{chosen_index + 1}号主战员（{other_reason}）"
+            )
+            _log_equipment(task, new_equipment, "其他主战员", chosen_index, f"{install_reason}；{other_reason}",
+                           current_name, current_quality, is_purchase_page, equipment_price,
+                           other_slots=other_slots)
 
+        chosen = lv_texts[chosen_index]
+        _move_and_click(task, 0.756, (chosen.y + chosen.height / 2) / task.height)
+        task.sleep(1)
         if is_purchase_page:
-            task.log_info("购买装备无法分配给任何主战员，点击「取消」")
-            task.click_box(cancel_box)
+            task.log_info(
+                f"购买装备分配完成，价格={equipment_price}，"
+                f"当前信用点={current_credit}，点击「购买」"
+            )
+            task.click_box(purchase_box)
             task.sleep(1)
             return True
-
-        refine_box = next(
-            (b for b in task.all_texts
-             if 0.522 <= (b.x + b.width / 2) / task.width <= 0.999
-             and 0.879 <= (b.y + b.height / 2) / task.height <= 0.996
-             and "提炼" in b.name),
-            None
-        )
-        if refine_box:
-            task.log_info(f"{slot + 1}号位无需替换且没有其他主战员可选，点击提炼")
-            _log_equipment(task, new_equipment, "提炼", None, install_reason, current_name, current_quality,
-                           is_purchase_page, equipment_price)
-            task.click_box(refine_box)
-            task.sleep(1)
-            return True
-
-        task.log_info("未找到可选择的主战员或提炼按钮")
+        task._equipment_decision = {"key": decision_key, "member": chosen_index, "time": time.time()}
         return False
 
     candidates = []
@@ -3177,11 +3346,29 @@ def handle_convert_card(task: TriggerTask):
     return False
 
 
+def _dice_reroll(task: TriggerTask):
+    """掷骰失败页的「重新掷骰」：返回 (按钮文字框, 费用, 右上角持有数)，读不到的为 None。"""
+    button = next((box for box in task.all_texts if "重新掷" in box.name
+                   and (box.y + box.height / 2) / task.height > 0.85), None)
+    cost_text = _get_region_text(task, (0.38, 0.86, 0.49, 0.94))
+    cost = int(cost_text) if cost_text.isdigit() else None
+    owned = re.search(r"(\d+)\s*/\s*\d+", _get_region_text(task, (0.86, 0.06, 0.99, 0.15)))
+    return button, cost, int(owned.group(1)) if owned else None
+
+
 def handle_negotiation(task: TriggerTask):
-    """谈判失败页面: 点击下一步跳过。"""
+    """掷骰失败页面: 右上角持有数够付「重新掷骰」的费用就重掷，不够或读不到就点下一步。"""
     title = find_box_at_point(task, 0.498, 0.683)
     if title and title.name in "失败":
-        task.log_info("检测到掷骰子失败，跳过掷骰子")
+        button, cost, owned = _dice_reroll(task)
+        if button and cost is not None and owned is not None and owned >= cost:
+            task.log_info(f"掷骰失败，持有{owned}，重新掷骰需{cost}，重新掷骰")
+            battle_log.record(task, "掷骰", choice="重新掷骰", cost=cost, owned=owned)
+            task.click_box(button)
+            task.sleep(2)
+            return True
+        task.log_info(f"掷骰失败，持有{owned}，重新掷骰需{cost}，跳过掷骰子")
+        battle_log.record(task, "掷骰", choice="下一步", cost=cost, owned=owned)
         _move_and_click(task, 0.665, 0.899)
         return True
     return False
@@ -3221,7 +3408,7 @@ def handle_confirm(task: TriggerTask):
         (
             text_box
             for text_box in task.all_texts
-            if _clean_match(text_box.name, "确认")
+            if _is_confirm_text(text_box.name)
             and confirm_region[0]
             <= (text_box.x + text_box.width / 2) / task.width
             <= confirm_region[2]
@@ -3432,6 +3619,11 @@ def _click_labeled_treasure(task: TriggerTask):
     return False
 
 
+def _is_info_option(description):
+    """事件选项是不是只看说明（效果写成「确认【…】资讯」），不推进事件。"""
+    return re.search(r"确认.{0,2}【.*资讯", description) is not None
+
+
 def handle_event_task(task: TriggerTask):
     """事件任务页面: 识别事件选项特征和描述，按任务优先级选择推进。"""
     bottom_box = find_box_at_point(task, 0.516, 0.971)
@@ -3478,6 +3670,12 @@ def handle_event_task(task: TriggerTask):
     if not tasks_info:
         task.log_info("事件任务页面的所有选项均被禁止，跳过本次选择")
         return False
+    # 「询问方法 / 确认【盗猎者的乐趣】资讯」这类选项只是看一段说明，看过一次就变灰、点不动，
+    # 但仍会被当成已选中（Y 坐标小于 0.925）一直点（实跑 10/01 10:05）：有别的选项时不选它
+    advancing = [t for t in tasks_info if not _is_info_option(t["description"])]
+    if advancing and len(advancing) < len(tasks_info):
+        task.log_info(f"跳过只看说明的选项：{[t['description'] for t in tasks_info if t not in advancing]}")
+        tasks_info = advancing
 
     check_region = task.box_of_screen(0.396, 0.286, 0.960, 0.718)
     check_features = [
@@ -3528,6 +3726,15 @@ def handle_event_task(task: TriggerTask):
             )
             battle_log.reroll(task, purpose, options=[t["description"] for t in tasks_info])
             _open_escape_menu(task, 0.053)
+        task.sleep(1)
+        return True
+
+    # 零式系统 boss 后的「雕琢记忆 / 奉行既定的启示」和「离开 / 事件结束」：总是雕琢（实跑 10/01 10:28
+    # 被「任务/装备优先级」里的「结束」带去点离开，雕琢卡片又被当成已选中，两边来回点）。点一次选中、再点一次确认
+    carve_task = next((t for t in tasks_info if "雕琢记忆" in t["description"]), None)
+    if carve_task is not None:
+        task.log_info(f"选择雕琢记忆: {carve_task['description']}")
+        click_event_option(carve_task, "雕琢记忆")
         task.sleep(1)
         return True
 
@@ -3895,6 +4102,9 @@ def handle_leave(task: TriggerTask):
     """离开按钮。"""
     box = find_box_at_point(task, 0.945, 0.918)
     if box and _clean_match(box.name, "离开"):
+        if _shop_opening(task):
+            task.log_info("刚点了德朗商店，等商店页面出来，先不点离开")
+            return True
         if is_button_active(task, box):
             task.log_info("检测到离开按钮，点击离开")
             task.click_box(box)
@@ -4100,9 +4310,18 @@ def handle_rest(task: TriggerTask):
     if shop_box and "德朗商店" in shop_box.name and hasattr(task, 'node_status') and task.node_status.get('shop', False):
         task.log_info("检测到德朗商店，且 node_status['shop']=True，进入商店")
         task.click_box(shop_box)
+        task._shop_clicked_at = time.time()
         task.sleep(2)
         return True
     return False
+
+
+_SHOP_OPENING = 3   # 点了「德朗商店」后这么多秒内不点「离开」：商店页还没出来，休息区的离开按钮仍在画面上
+
+
+def _shop_opening(task: TriggerTask):
+    """实跑 10/01 12:57：点了德朗商店，下一帧休息区的「离开」被点掉，点了 3 次才进去。"""
+    return time.time() - getattr(task, "_shop_clicked_at", 0) < _SHOP_OPENING
 
 
 def handle_shop(task: TriggerTask):
@@ -4216,14 +4435,25 @@ def handle_shop(task: TriggerTask):
                 None,
                 )
             else:
-                matched_name = next(
-                (canonical_name
-                 for priority in equipment_priorities
-                 for canonical_name, rank in [_match_equipment_name(item_name, priority)]
-                 if rank is not None),
-                None,
-                )
+                matched_name = None
+                for slot, priority in enumerate(equipment_priorities):
+                    canonical_name, rank = _match_equipment_name(item_name, priority)
+                    if rank is None:
+                        continue
+                    # 和购买页同一个标准：刷存档主战员这一格已有配置里更靠前的装备就不买
+                    # （实跑 10/01 12:09：商店点「黑曜石剑」，购买页嫌它不如现有的又取消，来回 14 次）
+                    current_name, current_rank = _current_equipment_for_slot(task, _equipment_state(task), slot)
+                    if current_name and current_rank <= rank:
+                        task.log_info(f"德朗商店: 装备「{item_name}」不如{slot + 1}号位现有的「{current_name}」，跳过")
+                        continue
+                    matched_name = canonical_name
+                    break
             if not matched_name:
+                continue
+            # 购买页上决定不买、点了取消的装备（比如没认出刷存档主战员），本轮不再点，免得来回点（实跑 10/01 11:02）
+            cancelled = task.node_status.get("shop_cancelled", [])
+            if not is_card and any(name in item_name or item_name in name for name in cancelled):
+                task.log_info(f"德朗商店: 装备「{item_name}」本轮在购买页取消过，跳过")
                 continue
 
             task.log_info(
