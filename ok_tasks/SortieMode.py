@@ -1,6 +1,7 @@
 from ok import TriggerTask, og
 
 import battle_log
+import config_layout
 import speedup
 import utils_battle
 import utils_sortie
@@ -48,14 +49,12 @@ class SortieMode(TriggerTask):
         self.default_config["优先移除基础牌"] = True
         self.default_config["几轮后停止(0为不停止)"] = 0
         self.default_config["卡牌奖励优先级"] = ["梦之边境", "装备包"]
-        self.default_config["丢弃卡牌优先级"] = ["展开极光", "极光剑", "凝聚极光"]
         self.default_config["任务优先级"] = ["选取随机3条命运","信用点增加", "移除"]
         self.default_config["拉黑任务"] = ["咒术卡牌", "压力"]
         self.default_config["拉黑主战员"] = ["黛安娜", "阿黛尔海特"]
         self.default_config["生命值大于多少优先闪光(百分比)"] = "60"
         self.default_config["路线优先级"] = ["休息", "事件", "小怪", "精英"]
         self.default_config["第几层boss前自动暂停"] = "不暂停"
-        # self.default_config["从右往左出牌"] = True
         self.node_status = {"shop": False, "flash_or_rest": False, "reach_final_boss": False, "final_boss_battle": False, "pass_final_boss_count": 0, 
                             "total_rounds": 0, "success_rounds": 0, "node_count": 0, "enter_new_node": False, "node_type": "",
                             "is_escaped": False, "save_target_member": False,
@@ -97,6 +96,8 @@ class SortieMode(TriggerTask):
         battle_log.install(self)
         # 实验性加速模式：新增配置项并接管等待逻辑，关闭时行为与原来完全一致
         speedup.install(self)
+        # 所有配置项都加完后按分组重排、隐藏平时不改的项、补全说明
+        config_layout.apply(self, config_layout.SORTIE_ORDER)
 
     def load_config(self):
         migrate_game_language_config_file(self)

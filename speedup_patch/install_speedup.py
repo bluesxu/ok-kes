@@ -9,7 +9,7 @@ ok-kes 自动更新到新版本后会覆盖改动，重新运行一次安装即�
 安装内容：
 - 加速补丁：复制 ok_tasks/speedup.py，让卡厄思/出击模式调用它；src/config.py 追加 OpenVINO f32 补丁。
 - 出牌策略与详细日志：用本仓库的 utils.py、utils_sortie.py、utils_chaos.py、ChaosMode.py、SortieMode.py 和翻译文件整份替换，
-  并新增 utils_battle.py、battle_log.py。只有安装目录里这些文件是 v1.4.3 原版时才替换；
+  并新增 utils_battle.py、battle_log.py、config_layout.py。只有安装目录里这些文件是 v1.4.3 原版时才替换；
   官方更新到新版本后对不上，就只装加速补丁并列出对不上的文件，需要先把本仓库合并到新版本。
 """
 import argparse
@@ -42,7 +42,7 @@ BASE_SHA = {
     "i18n/zh_CN/LC_MESSAGES/ok.mo": "c46330149aecc43c",
 }
 REPLACE = tuple(BASE_SHA)
-ADD = ("ok_tasks/speedup.py", "ok_tasks/utils_battle.py", "ok_tasks/battle_log.py")
+ADD = ("ok_tasks/speedup.py", "ok_tasks/utils_battle.py", "ok_tasks/battle_log.py", "ok_tasks/config_layout.py")
 ADD_ALWAYS = ("ok_tasks/speedup.py", "ok_tasks/battle_log.py")  # 官方版对不上、只装加速补丁时也复制
 BACKUP_TARGETS = TARGETS + tuple(rel for rel in REPLACE if rel not in TARGETS)
 

@@ -1,5 +1,6 @@
 from ok import TriggerTask, og
 
+import config_layout
 import speedup
 import utils_chaos
 from config_io import (
@@ -119,6 +120,8 @@ class ChaosMode(TriggerTask):
         )
         # 实验性加速模式：新增配置项并接管等待逻辑，关闭时行为与原来完全一致
         speedup.install(self)
+        # 所有配置项都加完后按分组重排、隐藏平时不改的项、补全说明
+        config_layout.apply(self, config_layout.CHAOS_ORDER)
 
     def load_config(self):
         migrate_flash_priority_config_file(self)

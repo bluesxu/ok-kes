@@ -301,3 +301,135 @@ msgstr "How many days to keep records and screenshots in battle_logs."
 
 msgid "battle_logs 总大小超过这个值时从最旧的文件删起"
 msgstr "When battle_logs grows beyond this size, the oldest files are deleted first."
+
+msgid "要刷存档的主战员名字。好装备、冥想、移除卡牌都优先给这个人，结算时存进存档的也是这个人"
+msgstr "Name of the member whose archive you are farming. Good equipment, meditation and card removal go to this member first, and this member's data is what gets saved."
+
+msgid "打完第一层就结束本轮（到第一层 boss 前直接撤退），本轮记成功"
+msgstr "End the run after the first layer (retreat right before the first-layer boss) and count it as a success."
+
+msgid "跑完这么多轮后自动停止，0 为一直跑"
+msgstr "Stop automatically after this many runs; 0 runs forever."
+
+msgid "到这一层的 boss 前停下来，留给你手动打"
+msgstr "Pause before the boss of this layer so you can fight it manually."
+
+msgid "把每个决定（出牌、装备、选卡、路线等）看到了什么、为什么这样做写进 battle_logs 目录，便于统计和排查"
+msgstr "Write what was seen and why each decision was made (cards, equipment, card picks, routes, etc.) to the battle_logs folder for statistics and troubleshooting."
+
+msgid "零式系统法典卡片、获得法典选项上「存档资料储存上限」低于这个值就重新合成；几个选项都达标时选上限最低的。0 为不限制"
+msgstr "Re-synthesize when the archive storage limit on the Zero System codex card or Obtain Codex options is below this value; when several options qualify, take the lowest. 0 means no limit."
+
+msgid "结算时存档价值不高于这个值的存档会被删除，0 为全部保留"
+msgstr "At settlement, archives worth no more than this value are deleted; 0 keeps all."
+
+msgid "结算时用验证卡领取卡厄思奖励；验证卡用完后自动关闭"
+msgstr "Claim Chaos rewards with verification cards at settlement; turns itself off when cards run out."
+
+msgid "填写目标卡牌名称后反复刷新初始卡牌；不能与“刷空档”同时使用。"
+msgstr "Keep rerolling the starting cards until this card appears; cannot be used together with empty-deck farming."
+
+msgid "初始任务必须包含“移除2张”，否则重新开始；不能与“刷初始卡牌”同时使用。"
+msgstr "Restart unless the starting task contains \"remove 2 cards\"; cannot be used together with starting-card farming."
+
+msgid "默认刷闪光优先级第一张，可刷神闪，第一层没刷出自动逃脱"
+msgstr "Farm the first entry of the flash priority (divine flashes included); escape if it does not appear on the first layer."
+
+msgid "选路线时节点类型的优先顺序，越靠前越优先"
+msgstr "Node types to prefer when choosing a route, highest first."
+
+msgid "事件选项按列表顺序，选第一个描述里包含该文字的选项"
+msgstr "For event options, pick the first option whose description contains an entry, in list order."
+
+msgid "描述里包含这些文字的事件选项不选（全部被拉黑时照常选）"
+msgstr "Never pick event options whose description contains these words (unless every option is blocked)."
+
+msgid "路过商店时进去买东西（删牌、装备等）"
+msgstr "Enter shops along the way to buy things (card removal, equipment, etc.)."
+
+msgid "主战员精神崩溃时去创伤中心治疗"
+msgstr "Treat members with a mental breakdown at the Trauma Center."
+
+msgid "治疗崩溃时用信用点，关闭时优先用旅行券"
+msgstr "Pay for breakdown treatment with credits; when off, use travel vouchers first."
+
+msgid "卡牌奖励页按列表顺序选第一张包含该文字的牌"
+msgstr "On card reward pages, pick the first card containing an entry, in list order."
+
+msgid "删牌时按列表顺序选第一张包含该文字的牌"
+msgstr "When removing cards, pick the first card containing an entry, in list order."
+
+msgid "删牌时先删基础牌，再按「移除卡牌列表」"
+msgstr "Remove basic cards first, then follow the removal list."
+
+msgid "复制卡牌时按列表顺序选第一张包含该文字的牌"
+msgstr "When copying cards, pick the first card containing an entry, in list order."
+
+msgid "灵光一闪时选哪张牌，按列表顺序选第一张包含该文字的牌"
+msgstr "Which card to flash, picking the first card containing an entry, in list order."
+
+msgid "卡牌名称和描述无需完整填写，输入几个关键字即可，但顺序须与游戏原文一致。"
+msgstr "Card names and descriptions do not need to be complete; a few keywords are enough, but they must appear in the same order as the game text."
+
+msgid "休息区冥想时选哪些牌，每张本局冥想一次"
+msgstr "Cards to meditate on at rest sites; each once per run."
+
+msgid "信用点不少于这个数时，休息区才冥想"
+msgstr "Only meditate at rest sites when credits are at least this amount."
+
+msgid "面具获得卡牌页选描述里包含这段文字的牌，没有就刷新或跳过；留空直接跳过"
+msgstr "On the mask card page, pick the card whose description contains this text, otherwise refresh or skip; leave empty to skip."
+
+msgid "面具卡牌刻印页要的刻印描述，不是就刷新或跳过"
+msgstr "Wanted engraving description on the mask card engraving page; refresh or skip otherwise."
+
+msgid "「选择刻印的记忆」页按列表顺序选第一张包含该关键词的记忆卡（牌名或描述，如「贪婪」「全体攻击」），三张都不含时先用卡下方的「重新搜索」刷新"
+msgstr "On the memory engraving page, pick the first memory card containing an entry (name or description); if none match, refresh with Search Again first."
+
+msgid "记忆卡牌优先级都没匹配上时选第几张"
+msgstr "Which memory card to pick when nothing in the memory priority matches."
+
+msgid "攻击力（1 号位）装备的优先顺序，写在这里的装备优先给刷存档主战员，独特装备的名额也只留给这里写的"
+msgstr "Priority of attack (slot 1) equipment. Listed items go to the archive member first, and that member's single unique slot is reserved for them."
+
+msgid "防御力（2 号位）装备的优先顺序，写在这里的装备优先给刷存档主战员，独特装备的名额也只留给这里写的"
+msgstr "Priority of defense (slot 2) equipment. Listed items go to the archive member first, and that member's single unique slot is reserved for them."
+
+msgid "生命值（3 号位）装备的优先顺序，写在这里的装备优先给刷存档主战员，独特装备的名额也只留给这里写的"
+msgstr "Priority of HP (slot 3) equipment. Listed items go to the archive member first, and that member's single unique slot is reserved for them."
+
+msgid "出现异常（识别失败、画面卡住、未识别页面等）时截图，同一种异常每场战斗最多 1 张"
+msgstr "Take a screenshot on anomalies (recognition failures, frozen screen, unknown pages, etc.), at most one per kind per battle."
+
+msgid "主战员配置页选出战主战员时，按列表顺序挑"
+msgstr "Members to send out on the member setup page, in list order."
+
+msgid "开局「主战员选择」页按列表顺序挑队友；都没有时先刷新一次，再优先选保护、治疗角色"
+msgstr "Teammates to pick on the member selection page, in list order; if none appear, refresh once, then prefer protectors and healers."
+
+msgid "「主战员选择」页不选这些人"
+msgstr "Never pick these members on the member selection page."
+
+msgid "结算时领取卡厄思战利品，关闭时放弃"
+msgstr "Claim the Chaos loot at settlement; when off, give it up."
+
+msgid "休息区血量高于上限的这个百分比时闪光，否则休息"
+msgstr "At rest sites, flash when HP is above this percentage of max, otherwise rest."
+
+msgid "「获得卡牌」页和抽牌事件按列表顺序选第一张包含该文字的牌"
+msgstr "On Obtain Card pages and draw events, pick the first card containing an entry, in list order."
+
+msgid "休息区闪光时选哪张牌，填牌名；本局这些牌都闪过（选牌页里不再出现）后，休息区改为休息"
+msgstr "Cards to flash at rest sites. Once all of them have been flashed this run (no longer offered), rest instead."
+
+msgid "闪光出来的 3 个版本选哪个：「牌名:关键词」只对这张牌生效，不带牌名的对所有牌生效；关键词写描述里的几个字，顺序与原文一致。都没命中时保留原类型、选数值最大的"
+msgstr "Which of the 3 flash versions to take. \"Card:keywords\" applies to that card only, plain keywords apply to all; keywords are a few characters from the description in original order. If nothing matches, keep the original type and take the largest value."
+
+msgid "战斗中先出这些牌（按列表顺序），排在 0 费、强化、攻击牌之前；3 个字以上的牌名读错一个字也能认出"
+msgstr "Play these cards first in battle (list order), ahead of 0-cost, enhance and attack cards; names of 3+ characters still match with one misread character."
+
+msgid "保命牌（加护盾、回血）：牌名带「盾」「格挡」「壁」「治」「疗」「恢复」等字的会自动认出，这里只需补充认不出的牌；预计这回合会被打死、或挨打后血量低于「防御血量线」时先出这些牌"
+msgstr "Survival cards (shields, heals). Names containing shield/block/wall/heal words are recognized automatically; list only the ones that are missed. Played first when this turn could be lethal or HP would drop below the defense HP line."
+
+msgid "预计敌人这一轮打完后我方血量低于上限的百分之几，就先出保命牌；0 为只在会被打死时才出"
+msgstr "Play survival cards first when HP after the enemies' attacks is expected to drop below this percentage of max; 0 means only when it would be lethal."
