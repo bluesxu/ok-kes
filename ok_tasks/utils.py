@@ -3730,8 +3730,17 @@ def handle_event_task(task: TriggerTask):
         return True
 
     # 零式系统 boss 后的「雕琢记忆 / 奉行既定的启示」和「离开 / 事件结束」：总是雕琢（实跑 10/01 10:28
-    # 被「任务/装备优先级」里的「结束」带去点离开，雕琢卡片又被当成已选中，两边来回点）。点一次选中、再点一次确认
+    # 被「任务/装备优先级」里的「结束」带去点离开，雕琢卡片又被当成已选中，两边来回点）。点一次选中、再点一次确认。
+    # 已经雕琢过（记忆雕琢页离开时记下 carve_done，路线页清掉）就选离开，否则会在事件页和雕琢页之间来回进出
     carve_task = next((t for t in tasks_info if "雕琢记忆" in t["description"]), None)
+    if carve_task is not None and getattr(task, "node_status", {}).get("carve_done", False):
+        leave_task = next((t for t in tasks_info if "事件结束" in t["description"]
+                           or t["description"].startswith("离开")), None)
+        if leave_task is not None:
+            task.log_info(f"本节点已雕琢过，选择离开: {leave_task['description']}")
+            click_event_option(leave_task, "已雕琢过，离开")
+            task.sleep(1)
+            return True
     if carve_task is not None:
         task.log_info(f"选择雕琢记忆: {carve_task['description']}")
         click_event_option(carve_task, "雕琢记忆")
@@ -3901,6 +3910,8 @@ def handle_route_selection(task: TriggerTask):
     # 更新节点状态：进入路线选择页面时 flash_or_rest 置为 True
     if hasattr(task, 'node_status'):
         task.node_status['flash_or_rest'] = True
+        task.node_status['carve_done'] = False
+        task.node_status['memory_processed'] = False
         task.log_info("检测到路线选择页面，更新 node_status['flash_or_rest']=True")
         # 检查"进入商店"配置，若为 True 则同时更新 shop 状态
         if _get_config_value(task, '进入商店', False):

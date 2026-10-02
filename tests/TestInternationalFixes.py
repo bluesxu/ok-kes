@@ -835,17 +835,70 @@ class TestMemoryCarving(unittest.TestCase):
     def test_leaves_when_button_gray(self):
         self.assertEqual(["离开"], self.run_page((200, 200, 200)))
 
-    def test_event_page_picks_carving(self):
+    def run_finished_page(self, processed=False):
+        """雕琢完成后：右边变成「雕琢完成」，左边「记忆加工」变橙色可点。"""
+        import numpy as np
+        page = [t for t in self.PAGE if t[0] != "記憶雕琢" or t[2] != 0.795] + [("雕琢完成", 0.85, 0.795)]
+        task = PageTask(page)
+        task.node_status["memory_processed"] = processed
+        task.frame = np.zeros((HEIGHT, WIDTH, 3), np.uint8)
+        for px in (0.86, 0.16):
+            x, y = int(px * WIDTH), int(0.795 * HEIGHT)
+            task.frame[y - 20:y + 20, x - 20:x + 20] = (50, 140, 235)
+        self.assertTrue(utils_chaos.handle_memory_carving(task))
+        return task
+
+    def test_processes_once_after_carving_finished(self):
+        task = self.run_finished_page()
+        self.assertEqual(["记忆加工"], task.clicked)
+        self.assertTrue(task.node_status["memory_processed"])
+
+    def test_leaves_after_processing(self):
+        task = self.run_finished_page(processed=True)
+        self.assertEqual(["离开"], task.clicked)
+        self.assertTrue(task.node_status["carve_done"])
+
+    def run_processing(self, priority=None):
+        """截图里的记忆加工页：伤害量+10% / 攻击力+4% / 伤害量+6%，返回选中的卡的 x。"""
+        task = PageTask([("記憶加工", 0.501, 0.13),
+                         ("觸發韌性傷害增加的攻擊", 0.255, 0.648), ("卡牌時，自身傷害量增", 0.255, 0.684),
+                         ("加10%（每回合1次，每", 0.255, 0.72),
+                         ("觸發韌性傷害增加的攻擊", 0.505, 0.648), ("卡牌時，攻擊力+4%（", 0.5, 0.684),
+                         ("觸發韌性傷害增加的攻擊", 0.757, 0.648), ("卡牌時，傷害量增", 0.75, 0.684),
+                         ("加6%（每回合1次，每", 0.75, 0.72), ("確認", 0.83, 0.928)])
+        if priority is not None:
+            task.config["记忆加工优先级"] = priority
+        self.assertTrue(utils_chaos.handle_memory_processing(task))
+        self.assertEqual("(0.830, 0.928)", task.clicked[-1])
+        return task.clicked[0]
+
+    def test_processing_picks_highest_percent_without_priority(self):
+        self.assertEqual("(0.249, 0.500)", self.run_processing())
+
+    def test_processing_picks_keyword_first(self):
+        self.assertEqual("(0.500, 0.500)", self.run_processing(["攻击力", "伤害量"]))
+
+    def test_processing_keyword_tie_picks_higher_percent(self):
+        self.assertEqual("(0.249, 0.500)", self.run_processing(["暴击", "伤害量"]))
+
+    def run_event(self, carve_done=False):
         def option(description, x, y):
             return {"x": x, "y": y, "description": description,
                     "description_region": (x - 0.1, 0.78, x + 0.1, 0.86), "feature_name": "event3", "confidence": 0.9}
         options = [option("雕琢记忆奉行既定的启示", 0.37, 0.947), option("离开事件结束", 0.63, 0.947)]
         task = PageTask([])
+        task.node_status["carve_done"] = carve_done
         task.config["任务/装备优先级"] = ["结束"]
         task.find_feature = lambda *args, **kwargs: []
         with unittest.mock.patch.object(utils, "recognize_event_options", lambda *args, **kwargs: options):
             self.assertTrue(utils.handle_event_task(task))
-        self.assertEqual(["(0.370, 0.820)"], task.clicked)
+        return task.clicked
+
+    def test_event_page_picks_carving(self):
+        self.assertEqual(["(0.370, 0.820)"], self.run_event())
+
+    def test_event_page_leaves_after_carving(self):
+        self.assertEqual(["(0.630, 0.820)"], self.run_event(carve_done=True))
 
 
 if __name__ == '__main__':

@@ -510,21 +510,24 @@ def handle_threat_detection(task: TriggerTask):
 
 
 _CARVE_BUTTON_COLOR = (0.86, 0.795)   # 右下「记忆雕琢」按钮上文字和水晶之间的底色：橙色可点，灰色不可点
+_PROCESS_BUTTON_COLOR = (0.16, 0.795)  # 左下「记忆加工」按钮上文字和水晶之间的底色：雕琢完成后才变橙色可点
+_PROCESS_COLUMNS = (0.249, 0.5, 0.751)  # 记忆加工页三张卡的中心 x
 
 
-def _carve_button_active(task: TriggerTask):
+def _carve_button_active(task: TriggerTask, point=_CARVE_BUTTON_COLOR):
     frame = getattr(task, "frame", None)
     if frame is None:
         return None
     height, width = frame.shape[:2]
-    x, y = int(_CARVE_BUTTON_COLOR[0] * width), int(_CARVE_BUTTON_COLOR[1] * height)
+    x, y = int(point[0] * width), int(point[1] * height)
     blue, _, red = (float(v) for v in frame[y - 6:y + 6, x - 6:x + 6, :3].reshape(-1, 3).mean(axis=0))
     return red > blue + 60
 
 
 def handle_memory_carving(task: TriggerTask):
-    """「记忆雕琢」页（零式系统 boss 后选「雕琢记忆」进来）：一直点右边的「记忆雕琢」，按钮变灰（水晶不够）后点「离开」。
-    左边的「记忆加工」不点。"""
+    """「记忆雕琢」页（零式系统 boss 后选「雕琢记忆」进来）：一直点右边的「记忆雕琢」；变成「雕琢完成」后
+    左边的「记忆加工」可点（只能 1 次），点进去选一张（见 handle_memory_processing）；都做完或按钮变灰（水晶不够）
+    后点「离开」，并记下本节点已雕琢过，回到事件页改选离开（否则事件页又选雕琢，来回进出）。"""
     title = find_box_at_point(task, 0.501, 0.128)
     if not (title and "记忆雕琢" in title.name):
         return False
@@ -540,14 +543,64 @@ def handle_memory_carving(task: TriggerTask):
         return True
     if active is None:
         return False
+    finished = any("雕琢完成" in box.name for box in task.all_texts)
+    process = next((box for box in task.all_texts if "记忆加工" in box.name
+                    and (box.x + box.width / 2) / task.width < 0.4 and (box.y + box.height / 2) / task.height > 0.7), None)
+    node_status = getattr(task, "node_status", {})
+    if (finished and process and not node_status.get("memory_processed", False)
+            and _carve_button_active(task, _PROCESS_BUTTON_COLOR)):
+        task.log_info("记忆雕琢：雕琢已完成，点击「记忆加工」")
+        battle_log.record(task, "记忆雕琢", choice="加工", rate=rate)
+        node_status["memory_processed"] = True  # 只能加工 1 次，点过就不再点，免得按钮没变灰时来回点
+        task.click_box(process)
+        task.sleep(2)
+        return True
     leave = next((box for box in task.all_texts if _clean_match(box.name, "离开")
                   and (box.y + box.height / 2) / task.height > 0.85), None)
     if leave is None:
         return False
-    task.log_info("记忆雕琢：按钮已变灰，点击离开")
+    task.log_info(f"记忆雕琢：{'雕琢已完成' if finished else '按钮已变灰'}，点击离开")
     battle_log.record(task, "记忆雕琢", choice="离开", rate=rate)
+    if hasattr(task, "node_status"):
+        task.node_status["carve_done"] = True
     task.click_box(leave)
     task.sleep(1)
+    return True
+
+
+def handle_memory_processing(task: TriggerTask):
+    """「记忆加工」页：三张同名记忆卡、数值不同。按「记忆加工优先级」顺序找第一个有卡描述包含的关键词，
+    几张都包含时选百分比大的；都不包含时选百分比最大的一张（读不到就选第一张）。再点右下「确认」。"""
+    title = find_box_at_point(task, 0.501, 0.13)
+    if not (title and "记忆加工" in title.name):
+        return False
+    columns = [[] for _ in _PROCESS_COLUMNS]
+    percents = [0] * len(_PROCESS_COLUMNS)
+    for box in sorted(task.all_texts, key=lambda b: b.y):
+        cy = (box.y + box.height / 2) / task.height
+        if not 0.55 < cy < 0.8:
+            continue
+        cx = (box.x + box.width / 2) / task.width
+        column = min(range(len(_PROCESS_COLUMNS)), key=lambda i: abs(_PROCESS_COLUMNS[i] - cx))
+        columns[column].append(box.name)
+        for value in re.findall(r"(\d+)\s*[%％]", box.name):
+            percents[column] = max(percents[column], int(value))
+    texts = [re.sub(r"[\W_]", "", "".join(parts)) for parts in columns]
+    priority = _get_config_value(task, "记忆加工优先级", [])
+    candidates, reason = list(range(len(texts))), "没有匹配的关键词，选百分比最大的"
+    for word in priority if isinstance(priority, list) else []:
+        key = re.sub(r"[\W_]", "", str(word))
+        matched = [i for i, text in enumerate(texts) if key and key in text]
+        if matched:
+            candidates, reason = matched, f"记忆加工优先级「{word}」"
+            break
+    choice = max(candidates, key=lambda i: (percents[i], -i))
+    task.log_info(f"记忆加工：各卡百分比 {percents}，{reason}，选第 {choice + 1} 张")
+    battle_log.record(task, "记忆加工", options=texts, percents=percents, chosen=choice + 1, reason=reason)
+    _move_and_click(task, _PROCESS_COLUMNS[choice], 0.5)
+    task.sleep(1)
+    _move_and_click(task, 0.83, 0.928)
+    task.sleep(2)
     return True
 
 
@@ -1081,7 +1134,8 @@ PAGE_HANDLERS = [
     handle_center_confirm, #页面中央确认按钮
     handle_archive_target_member, #信息统计页面，记录刷存档目标主战员
     handle_chaos_mask_engraving, #面具卡牌刻印获取页面
-    handle_memory_carving, #记忆雕琢页：一直雕琢到按钮变灰再离开，优先于离开按钮
+    handle_memory_carving, #记忆雕琢页：一直雕琢到完成或按钮变灰，完成后做一次记忆加工，再离开，优先于离开按钮
+    handle_memory_processing, #记忆加工页：选百分比最大的一张再确认
     handle_equipment, #装备选择
     handle_card_assign,
     handle_confirm, #确认按钮

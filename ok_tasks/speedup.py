@@ -78,6 +78,7 @@ SHOP_REFRESH_KEY = "刷新商店"
 STORAGE_CAPACITY_KEY = "存档储存上限大于等于多少pt"
 MEMORY_PRIORITY_KEY = "记忆卡牌优先级"
 MEMORY_DEFAULT_KEY = "记忆卡牌默认选择"
+MEMORY_PROCESS_KEY = "记忆加工优先级"
 
 _GRID = 10              # 文字中心按 10x10 网格量化后比较页面
 _SAME_PAGE = 0.6        # 与点击前文字布局相似度 >= 0.6 视为页面还没响应
@@ -201,6 +202,11 @@ def install(task):
             "三张都不含时先用卡下方的「重新搜索」刷新"
         )
         task.config_description[MEMORY_DEFAULT_KEY] = "记忆卡牌优先级都没匹配上时选第几张"
+        task.default_config.setdefault(MEMORY_PROCESS_KEY, [])
+        task.config_description[MEMORY_PROCESS_KEY] = (
+            "记忆雕琢完成后的「记忆加工」页按列表顺序选第一张描述包含该关键词的卡（如「攻击力」「伤害量」），"
+            "几张都包含时选百分比大的；都不包含时选百分比最大的"
+        )
 
     orig = {
         name: getattr(task, name)
@@ -328,7 +334,7 @@ def install(task):
         enabled = _enabled(task)
         st.update(active=enabled, in_run=enabled, in_action=False, owed_until=0.0, actions=0,
                   moved=False, held=False, hit=None, action_sig=None, action_box=None, match_cache=None,
-                  pay_hook=None, battle_play=False, battle_left=False)
+                  pay_hook=None, battle_play=False, battle_left=False, gated=False)
         if not enabled:
             st.update(gate=None, prev_sig=None, battle=False)
             task.trigger_interval = 1
@@ -368,6 +374,9 @@ def install(task):
     _patch_decompose_checkbox()
     _patch_storage_capacity()
     _patch_memory_imprint()
+    recorder = _import("recorder")  # 官方版补丁不带现场记录
+    if recorder is not None:
+        recorder.install(task)
 
 
 def _handlers_module(task):
@@ -389,6 +398,7 @@ def _gated_run(task, st):
     """与原版 run() 相同，只在交给页面处理函数前多一道文字闸门。"""
     texts = utils._simplify_texts(task.ocr())
     if _gate_blocks(task, st, texts):
+        st["gated"] = True  # 现场记录据此标出这一帧没交给页面处理函数
         return
     task.all_texts = texts
     for handle_page in st["handlers"].PAGE_HANDLERS:

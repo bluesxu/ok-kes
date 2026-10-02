@@ -389,6 +389,9 @@ msgstr "On the memory engraving page, pick the first memory card containing an e
 msgid "记忆卡牌优先级都没匹配上时选第几张"
 msgstr "Which memory card to pick when nothing in the memory priority matches."
 
+msgid "记忆雕琢完成后的「记忆加工」页按列表顺序选第一张描述包含该关键词的卡（如「攻击力」「伤害量」），几张都包含时选百分比大的；都不包含时选百分比最大的"
+msgstr "On the Memory Processing page after carving, pick the first card whose description contains an entry (e.g. ATK, damage); if several match, take the higher percentage; if none match, take the highest percentage."
+
 msgid "攻击力（1 号位）装备的优先顺序，写在这里的装备优先给刷存档主战员，独特装备的名额也只留给这里写的"
 msgstr "Priority of attack (slot 1) equipment. Listed items go to the archive member first, and that member's single unique slot is reserved for them."
 
@@ -398,8 +401,14 @@ msgstr "Priority of defense (slot 2) equipment. Listed items go to the archive m
 msgid "生命值（3 号位）装备的优先顺序，写在这里的装备优先给刷存档主战员，独特装备的名额也只留给这里写的"
 msgstr "Priority of HP (slot 3) equipment. Listed items go to the archive member first, and that member's single unique slot is reserved for them."
 
-msgid "出现异常（识别失败、画面卡住、未识别页面等）时截图，同一种异常每场战斗最多 1 张"
-msgstr "Take a screenshot on anomalies (recognition failures, frozen screen, unknown pages, etc.), at most one per kind per battle."
+msgid "出现异常（识别失败、画面卡住、未识别页面等）时截图，同一种异常每场战斗最多 1 张；卡住、循环、输掉战斗等问题改存现场包（前后各 30 秒的画面和识别结果，在 battle_logs/现场）"
+msgstr "Take a screenshot on anomalies (recognition failures, frozen screen, unknown pages, etc.), at most one per kind per battle; stuck screens, loops, lost battles and similar problems save a scene package instead (30 seconds of frames and recognition results before and after, in battle_logs/现场)."
+
+msgid "标记现场"
+msgstr "Mark Scene"
+
+msgid "把前 30 秒和后 30 秒的画面、识别结果和动作存成现场包，供事后排查"
+msgstr "Save the last 30 seconds and the next 30 seconds (frames, recognition results and actions) as a scene package for later troubleshooting"
 
 msgid "主战员配置页选出战主战员时，按列表顺序挑"
 msgstr "Members to send out on the member setup page, in list order."

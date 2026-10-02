@@ -292,6 +292,15 @@ class TestChoosePlay(unittest.TestCase):
         self.assertEqual("冲动", chosen["name"])
         self.assertIn("1/5", reason)
 
+    def test_unknown_cost_twin_not_banned_by_name(self):
+        # 实跑 11:53：3 费暗黑之刃读不到费用、AP 只剩 2，出不掉后按牌名封禁，把旁边 1 费的暗黑之刃也封了
+        last = {"name": "暗黑之刃", "slot": "1/4", "cost": None, "remaining": 2, "twin_ok": True}
+        self.assertFalse(battle._short_of_ap(last))
+        state = {"unplayable": set()}
+        battle._mark_unplayable(state, last, by_name=battle._short_of_ap(last))
+        self.assertEqual({"1/4"}, state["unplayable"])
+        self.assertTrue(battle._short_of_ap(dict(last, twin_ok=False)))
+
     def test_remaining_unknown_plays_anything(self):
         self.assertEqual("破碎", battle.choose_play([card("破碎", 3, "攻击")], None, [], [], False, set())[0]["name"])
 
@@ -448,6 +457,19 @@ class TestKillPreview(unittest.TestCase):
         ups = [m for m in interaction.messages if m[0] == battle._WM_LBUTTONUP]
         self.assertEqual([(battle._WM_LBUTTONUP, 0, (768, 576))], ups)  # 只松手一次，在最后停的位置
         self.assertIn((battle._WM_MOUSEMOVE, battle._MK_LBUTTON, (1792, 576)), interaction.messages)
+
+
+class TestReadCosts(unittest.TestCase):
+    def test_same_name_cards_read_each_cost(self):
+        """实跑 11:44：两张暗黑之刃一张 1 费、一张 3 费，按牌名缓存会把 3 费那张也当成 1 费。"""
+        state = {"costs": {"暗黑之刃": 1}}
+        cards = [{"name": "暗黑之刃", "slot": "1/3"}, {"name": "暗黑之刃", "slot": "2/3"}, {"name": "磁场", "slot": "3/3"}]
+        read = {"1/3": 3, "2/3": 1, "3/3": 1}
+        task = SimpleNamespace(_battle_session={"zero_cost": set()})
+        with mock.patch.object(battle, "_card_cost", lambda task, frame, card: read[card["slot"]]):
+            battle._read_costs(task, state, None, cards, {})
+        self.assertEqual([3, 1, 1], [c["cost"] for c in cards])
+        self.assertEqual({"暗黑之刃": 1, "磁场": 1}, state["costs"])  # 同名牌不写缓存
 
 
 class TestPlayTurn(unittest.TestCase):
@@ -617,20 +639,68 @@ class TestPlayTurn(unittest.TestCase):
     def test_keys_dead_switches_to_mouse(self):
         # 实跑 17:59~18:45：游戏不理后台按键（数字键、E 都没反应），鼠标照常有效，卡了 45 分钟
         clicks = []
-        counts = iter([2, 2, 1, 1])
-        skill = lambda task, count: [dict(card("斗志", None, "技能", key="1"), x=0.4, y=None)]
-        with mock.patch.object(battle, "_move_and_click", lambda task, x, y: clicks.append((x, y))), \
-                mock.patch.object(battle, "read_hand", skill), \
-                mock.patch.object(battle, "read_remaining_cost", lambda task, frame: None):
+        counts = iter([3, 3, 2, 2, 1, 1])
+        fight = dict(card("斗志", None, "技能", key="1"), x=0.4, y=None)
+        guard = dict(card("刀背格挡", None, "技能", key="1"), x=0.4, y=None)
+        hand = lambda task, count: [dict(fight if count == 3 else guard)]
+        with mock.patch.object(battle, "_move_and_click", lambda task, x, y: clicks.append((x, y))),                 mock.patch.object(battle, "read_hand", hand),                 mock.patch.object(battle, "read_remaining_cost", lambda task, frame: None):
             battle.play_turn(self.task, next(counts), True)   # 斗志按键
             battle.play_turn(self.task, next(counts), True)   # 没打出去：拖动再试
-            self.assertEqual(["1", "enter", "drag"], self.keys)
-            battle.play_turn(self.task, next(counts), True)   # 拖动打出去了：本场改用鼠标
+            battle.play_turn(self.task, next(counts), True)   # 拖动打出去了；只有一张牌这样，还不算键盘失效
+            self.assertFalse(self.task._battle.get("keys_dead"))
+            self.assertEqual(["1", "enter", "drag", "1", "enter"], self.keys)  # 刀背格挡照常按键
+            battle.play_turn(self.task, next(counts), True)   # 也没打出去：拖动再试
+            battle.play_turn(self.task, next(counts), True)   # 拖动打出去了：两张不同的牌都这样，本场改用鼠标
             self.assertTrue(self.task._battle["keys_dead"])
-            self.assertEqual(["1", "enter", "drag", "drag"], self.keys)  # 不用选目标的牌也拖到场地中间
+            self.assertEqual("drag", self.keys[-1])           # 不用选目标的牌也拖到场地中间
             battle.play_turn(self.task, next(counts), True)   # 没打出去（AP 不够）：没牌可出，按 E 同时点按钮
         self.assertEqual("e", self.keys[-1])
         self.assertEqual([battle._END_TURN_POINT], clicks)
+
+    def test_single_key_failure_drags_that_card_for_rest_of_battle(self):
+        # 实跑 10:53：闪耀核心开局按键没打出去、拖动打出去了，以前整场改用鼠标；同一场后来按键其实能出
+        skill = lambda task, count: [dict(card("斗志", None, "技能", key="1"), x=0.4, y=None)]
+        with mock.patch.object(battle, "read_hand", skill),                 mock.patch.object(battle, "read_remaining_cost", lambda task, frame: None):
+            battle.play_turn(self.task, 3, True)   # 按键
+            battle.play_turn(self.task, 3, True)   # 没打出去：拖动再试
+            battle.play_turn(self.task, 2, True)   # 拖动打出去了
+            self.assertFalse(self.task._battle.get("keys_dead"))
+            battle._new_turn(self.task._battle)
+            self.keys.clear()
+            battle.play_turn(self.task, 2, True)   # 下一回合这张牌直接拖，不再先按键白试一次
+        self.assertEqual(["drag"], self.keys)
+
+    def test_untyped_card_dragged_onto_enemy(self):
+        # 实跑 10:53：电浆飞弹的「攻击」标签没读到，键盘失效时被拖到场地中间，打不出去
+        targets = []
+        hand = lambda task, count: [dict(card("电浆飞弹", 1, None, key="1"), x=0.4, y=None)]
+        self.task.default_config["出牌优先级"] = ["电浆飞弹"]
+        battle.start_battle(self.task)
+        self.task._battle["keys_dead"] = True
+        with mock.patch.object(battle, "read_hand", hand),                 mock.patch.object(battle, "_drag_card", lambda task, c, t, *rest, **kw: targets.append(t)):
+            battle.play_turn(self.task, 1, True)
+        self.assertEqual([500], [t.get("hp") for t in targets])  # 拖到敌人身上，不是场地中间
+
+    def test_card_type_remembered_by_name(self):
+        hands = {2: [dict(card("电浆飞弹", 1, "攻击", key="1"), x=0.4, y=None),
+                     dict(card("斗志", 1, "技能", key="2"), x=0.5, y=None)],
+                 1: [dict(card("飞弹", 1, None, key="1"), x=0.4, y=None)]}  # 下一帧标签没读到、牌名也读残了
+        seen = []
+        with mock.patch.object(battle, "read_hand", lambda task, count: [dict(c) for c in hands[count]]),                 mock.patch.object(battle, "choose_play", lambda cards, *a, **k: seen.append([c["type"] for c in cards]) or (None, "看看")):
+            battle.play_turn(self.task, 2, True)
+            battle.play_turn(self.task, 1, True)
+        self.assertEqual(["攻击"], seen[-1])
+
+    def test_retries_capped_per_turn(self):
+        # 实跑 11:00：苍白流星 4 费、AP 读不到，拖动、按键、再拖动轮流试了 12 次
+        self.task.default_config["出牌优先级"] = ["破碎"]
+        meteor = lambda task, count: [dict(card("破碎", 4, "攻击", key="1"), x=0.4, y=None)]
+        with mock.patch.object(battle, "read_hand", meteor),                 mock.patch.object(battle, "_move_and_click", lambda task, x, y: None),                 mock.patch.object(battle, "read_remaining_cost", lambda task, frame: None):
+            for _ in range(15):
+                battle.play_turn(self.task, 1, True)
+        attempts = [k for k in self.keys if k in ("drag", "1")]
+        self.assertLessEqual(len(attempts), battle._TURN_FAIL_LIMIT + 1)
+        self.assertIn("破碎", self.task._battle["unplayable"])
 
     def test_end_turn_clicks_button_when_e_ignored(self):
         clicks = []

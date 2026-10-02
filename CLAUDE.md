@@ -57,6 +57,18 @@ python real_bugfix_check.py                           # 用官方安装目录里
 - `choose_play` / `choose_target` 是纯函数，`tests/TestBattle.py` 用 `tests/images/battle` 的真实截图 + 真实 OCR 测识别，改坐标或阈值后要跑它。
 - `battle_log.py` 写结构化记录（`battle_logs/*.jsonl`）和异常截图，并按保留天数/总大小清理。两个模式共用：出击模式在 `SortieMode` 里装开关，卡厄思模式由 `speedup.install` 装。事件名和字段见 `CONTEXT.md`「详细日志」，查日志时按那张表过滤；新增决定时在点击处记一行，同一种决定两个模式用同一个事件名。
 
+**现场包 `ok_tasks/recorder.py` + `scripts/scene.py`**：排查自动化出的问题时先看这里，比 jsonl 和单张截图全。
+- `speedup.install` 末尾给两个模式装上记录器（包在加速补丁接管的 `run` 和点击/按键/识别方法外层），内存里留最近 30 秒的每一帧；出问题时写出前后各 30 秒到 `battle_logs/现场/`。开关跟「详细战斗日志」+「异常截图」走，触发条件和去重规则见 `CONTEXT.md`「现场包」。加速关闭时记不到接手的处理函数。
+- 目录内容：`meta.json`（模式、轮次、触发列表、配置）、`timeline.jsonl`（每帧一行：`hit` 接手的处理函数、`gated` 闸门等待、`texts` 全屏文字、`calls` 识别调用 → 结果、`actions` 动作、`events` 这一帧写的 jsonl 事件、`images` 画面编号）、`frames/` 1280 宽画面、`full/` 有动作那几帧的原尺寸画面、`state.pkl` 第一帧的跨帧状态，看完后写 `诊断.md`。
+- 排查流程（用户说「看一下现场」时）：
+  1. `python scripts/scene.py list` 列出还没有 `诊断.md` 的现场包；
+  2. `scene.py timeline <包>` 读精简时间线（页面切换、动作、决定、异常，重复帧已合并），先只看文字；
+  3. 需要看画面时 `scene.py draw <包> <帧序号>`，读 `annotated/` 下画了 OCR 框编号和动作位置（A1、A2…）的图，只挑关键的 2~3 帧；
+  4. 改完代码 `scene.py replay <包>`，用记录的识别结果重跑页面处理函数，逐帧和当时的决定对比（`-v` 看重放日志）；「记录里没有的识别调用」是改代码后新增的识别：OCR 会在当时的画面上实际跑一遍，模板匹配一律当作没找到；
+  5. 在包里写 `诊断.md`：结论、改了什么、还要观察什么。
+- `scene.py html <包>` 生成 `index.html` 回放页，给用户在浏览器里逐帧翻看。
+- 新增要写现场包的异常：把异常名加进 `recorder.TRIGGER_KINDS`。新的识别方法要能重放，就加进 `PERCEPTION_METHODS`，并在 `scene.ReplayTask` 里补上同名方法。
+
 **加速模式 `ok_tasks/speedup.py`**：`ChaosMode` / `SortieMode` 在 `__init__` 末尾调用 `speedup.install(self)`，它通过猴子补丁接管任务的 `sleep`/`click*`/`run` 等方法，以及 `utils*` 里的部分处理函数：
 - 延迟支付处理函数里的 sleep；点击后用“文字闸门”判断页面已响应就继续，最长不超过原时长。
 - 并行模板匹配、路线页/牌库滚动“停稳即识别”、出击出牌按手牌变化继续。

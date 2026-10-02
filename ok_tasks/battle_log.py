@@ -44,7 +44,7 @@ def install(task):
     task.default_config[KEEP_DAYS_KEY] = 7
     task.default_config[MAX_MB_KEY] = 500
     task.config_description[LOG_KEY] = "把每个决定（出牌、装备、选卡、路线等）看到了什么、为什么这样做写进 battle_logs 目录，便于统计和排查"
-    task.config_description[SHOT_KEY] = "出现异常（识别失败、画面卡住、未识别页面等）时截图，同一种异常每场战斗最多 1 张"
+    task.config_description[SHOT_KEY] = "出现异常（识别失败、画面卡住、未识别页面等）时截图，同一种异常每场战斗最多 1 张；卡住、循环、输掉战斗等问题改存现场包（前后各 30 秒的画面和识别结果，在 battle_logs/现场）"
     task.config_description[KEEP_DAYS_KEY] = "battle_logs 里的记录和截图保留多少天"
     task.config_description[MAX_MB_KEY] = "battle_logs 总大小超过这个值时从最旧的文件删起"
     config_io.UI_ONLY_CONFIG_KEYS.update({LOG_KEY, SHOT_KEY, KEEP_DAYS_KEY, MAX_MB_KEY})
@@ -90,16 +90,28 @@ def _node(task):
     }
 
 
+def _recorder():
+    """现场记录模块；官方版补丁不带它，导入不到时返回 None。"""
+    try:
+        import recorder
+    except ImportError:
+        return None
+    return recorder
+
+
 def record(task, event, **fields):
-    """写一条战斗记录。写失败只记主日志，不影响出牌。"""
-    if not enabled(task):
-        return
+    """写一条战斗记录。写失败只记主日志，不影响出牌。现场记录不论开没开详细日志都会收到一份。"""
     state = _state(task)
     entry = {"time": datetime.datetime.now().isoformat(timespec="milliseconds"),
              "task": getattr(task, "name", ""), "round": state["round_id"], "battle": state["battle_id"],
              "event": event}
     entry.update(_node(task))
     entry.update(fields)
+    recorder = _recorder()
+    if recorder is not None:
+        recorder.note_event(task, entry)
+    if not enabled(task):
+        return
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         path = os.path.join(LOG_DIR, f"战斗记录_{datetime.date.today().isoformat()}.jsonl")
@@ -111,11 +123,16 @@ def record(task, event, **fields):
 
 
 def anomaly(task, kind, detail, frame=None, **fields):
-    """记录一次异常；开启截图时，同一种异常每场战斗最多截 1 张。"""
+    """记录一次异常。要写现场包的异常交给现场记录（不再单独截图）；其余异常开启截图时，
+    同一种每场战斗最多截 1 张。"""
     task.log_info(f"战斗异常「{kind}」：{detail}")
     shot = None
     state = _state(task)
-    if kind not in state["shots"]:
+    recorder = _recorder()
+    scene = recorder.trigger(task, kind, detail) if recorder is not None else None
+    if scene is not None:
+        fields["scene"] = scene
+    elif kind not in state["shots"]:
         shot = save_shot(task, kind, frame if frame is not None else getattr(task, "frame", None))
         if shot:
             state["shots"].add(kind)
@@ -129,6 +146,9 @@ def end_round(task, **fields):
         # 输掉的战斗直接进结算页，等不到离开战斗画面 8 秒：先在本轮记上「战斗结束」，不然会算到下一轮
         state["in_battle"] = False
         record(task, "战斗结束", seconds=round(state["battle_last"] - state["battle_start"]))
+        recorder = _recorder()
+        if recorder is not None:
+            recorder.trigger(task, recorder.LOST_BATTLE, "战斗中直接进了结算页")
     record(task, "一轮结束", seconds=round(time.time() - state["round_start"]), rerolls=state["rerolls"], **fields)
     state.update(round_id=state["round_id"] + 1, round_start=time.time(), shots=set(), last_hp=None, rerolls=0, once=set())
 
