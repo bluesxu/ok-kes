@@ -1,7 +1,7 @@
 import sys
 
 from PySide6.QtCore import QObject
-from qfluentwidgets import (FluentIcon, InfoBar, InfoBarPosition, MessageBoxBase, NavigationItemPosition,
+from qfluentwidgets import (BodyLabel, FluentIcon, InfoBar, InfoBarPosition, MessageBoxBase, NavigationItemPosition,
                             PlainTextEdit, SubtitleLabel)
 
 from ok import Logger, og
@@ -58,8 +58,14 @@ class _NoteDialog(MessageBoxBase):
     def __init__(self, parent):
         super().__init__(parent)
         self.viewLayout.addWidget(SubtitleLabel(MARK_TEXT, self))
+        intro = BodyLabel("自动化出了问题（卡住、点错、选错牌等）时用：把按下按钮前后各 30 秒的画面、"
+                          "识别结果和动作存成现场包，放在 battle_logs/现场，供事后排查。\n"
+                          "按下按钮时就已经开始记了，写说明不耽误；点「保存现场」后再录到按下按钮后 30 秒，"
+                          "点「取消」不存。", self)
+        intro.setWordWrap(True)
+        self.viewLayout.addWidget(intro)
         self.edit = PlainTextEdit(self)
-        self.edit.setPlaceholderText("写一下哪里不对、本来应该怎样（必填）。按下按钮时就开始记了，不用急")
+        self.edit.setPlaceholderText("说明（必填）：哪里不对、本来应该怎样")
         self.edit.setMinimumSize(420, 120)
         self.viewLayout.addWidget(self.edit)
         self.yesButton.setText("保存现场")

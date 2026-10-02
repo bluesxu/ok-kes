@@ -1376,22 +1376,25 @@ def _post_drag(task, start, drop, on_hover=None):
     time.sleep(0.05)
     interaction.post(_WM_LBUTTONDOWN, _MK_LBUTTON, lparam)
     time.sleep(0.08)
-    lparam, point = move(start, drop), drop
-    time.sleep(_DRAG_HOVER)
-    while on_hover is not None:
-        try:
-            nxt = on_hover()
-        except Exception as e:  # 识别出错不能让牌一直拿在手上
-            task.log_info(f"拖动悬停时出错：{e}")
-            nxt = None
-        if not nxt:
-            break
-        if recorder is not None:
-            recorder.note_action(task, "drag_move", nxt)
-        lparam, point = move(point, nxt), nxt
+    try:
+        lparam, point = move(start, drop), drop
         time.sleep(_DRAG_HOVER)
-    interaction.post(_WM_MOUSEMOVE, _MK_LBUTTON, lparam)
-    interaction.post(_WM_LBUTTONUP, 0, lparam)
+        while on_hover is not None:
+            try:
+                nxt = on_hover()
+            except Exception as e:  # 识别出错不能让牌一直拿在手上
+                task.log_info(f"拖动悬停时出错：{e}")
+                nxt = None
+            if not nxt:
+                break
+            if recorder is not None:
+                recorder.note_action(task, "drag_move", nxt)
+            lparam, point = move(point, nxt), nxt
+            time.sleep(_DRAG_HOVER)
+        interaction.post(_WM_MOUSEMOVE, _MK_LBUTTON, lparam)
+    finally:
+        # 中途出错也必须松手：按住不放牌会一直拿在手里，结束回合按钮变灰，游戏一直等（兜底见 utils._esc_fallback）
+        interaction.post(_WM_LBUTTONUP, 0, lparam)
     return True
 
 

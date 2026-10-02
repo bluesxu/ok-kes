@@ -238,6 +238,13 @@ def unhandled_frame(task):
     return False
 
 
+def handled_frame(task):
+    """这一帧有页面处理函数接手：「未识别页面」重新计时。事件对话、走地图时常是几帧没人认领、一帧点一下「继续」，
+    只靠 _UNHANDLED_GAP 判断不会清零，实跑中累计 10 秒就误报「未识别页面」，20 秒还会误按 ESC。"""
+    state = _state(task)
+    state.update(unhandled_since=None, unhandled_reported=False)
+
+
 def unhandled_seconds(task):
     """当前这段「没有处理函数认领画面」已持续多少秒；战斗中或刚被认领过返回 0。"""
     state = _state(task)

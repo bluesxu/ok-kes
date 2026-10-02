@@ -458,6 +458,30 @@ class TestKillPreview(unittest.TestCase):
         self.assertEqual([(battle._WM_LBUTTONUP, 0, (768, 576))], ups)  # 只松手一次，在最后停的位置
         self.assertIn((battle._WM_MOUSEMOVE, battle._MK_LBUTTON, (1792, 576)), interaction.messages)
 
+    def test_drag_releases_button_when_move_fails(self):
+        # 中途发消息出错也必须松手：按住不放牌会一直拿在手里，结束回合按钮变灰（实跑 10/02 15:15 卡了 103 分钟）
+        class PostMessageInteraction:
+            def __init__(self):
+                self.messages = []
+                self.fail = False
+
+            def update_mouse_pos(self, x, y):
+                return (x, y)
+
+            def post(self, message, wparam, lparam):
+                if self.fail and message == battle._WM_MOUSEMOVE and wparam == battle._MK_LBUTTON:
+                    raise RuntimeError("窗口没了")
+                self.messages.append((message, wparam, lparam))
+
+        interaction = PostMessageInteraction()
+        task = SimpleNamespace(executor=SimpleNamespace(interaction=interaction), width=2560, height=1440,
+                               log_info=lambda message: None)
+        interaction.fail = True
+        with mock.patch.object(battle.time, "sleep", lambda seconds: None):
+            with self.assertRaises(RuntimeError):
+                battle._post_drag(task, (0.5, 0.86), (0.7, 0.4))
+        self.assertEqual(1, sum(m[0] == battle._WM_LBUTTONUP for m in interaction.messages))
+
 
 class TestReadCosts(unittest.TestCase):
     def test_same_name_cards_read_each_cost(self):
@@ -879,8 +903,8 @@ class TestBattleLogEvents(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.task = SimpleNamespace(name="自动卡厄思模式", config={}, default_config={battle_log.LOG_KEY: True},
                                     node_status={"node_count": 3, "node_type": "小怪", "pass_final_boss_count": 0},
-                                    all_texts=[Box(0, 0, 10, 10, name="奇怪的页面")], frame=None,
-                                    log_info=lambda message: None)
+                                    all_texts=[Box(0, 0, 10, 10, name="奇怪的页面")], frame=None, width=2560,
+                                    height=1440, log_info=lambda message: None)
 
     def rows(self):
         import json
@@ -995,6 +1019,21 @@ class TestBattleLogEvents(unittest.TestCase):
             self.now[0] += 1
         self.assertEqual(["esc", "esc"], keys)              # 第 20 秒按一次，隔 10 秒再按一次
         self.assertEqual(2, sum(r["event"] == "ESC兜底" for r in self.rows()))
+
+    def test_battle_stuck_clicks_to_drop_held_card(self):
+        # 实跑 10/02 15:15：牌拿在手里没放下，结束回合按钮变灰，按 ESC 只会打开撤退菜单，来回卡了 103 分钟
+        self.task.all_texts = [Box(1177, 1368, 198, 62, name="四可1/10")]  # 手牌数「1/10」压在战斗页下方
+        clicks, keys = [], []
+        self.task.move_relative, self.task.click = lambda x, y: None, lambda x, y: clicks.append((x, y))
+        self.task.sleep, self.task.send_key = lambda s: None, keys.append
+        self.assertTrue(utils._esc_fallback(self.task, "画面卡住已持续20秒"))
+        self.assertEqual([(0.5, 0.45)], clicks)                    # 战斗页面：点场地中间把牌放下
+        self.assertEqual([], keys)                                 # 不按 ESC：ESC 只会打开撤退菜单
+        self.assertFalse(utils._esc_fallback(self.task, "同上"))     # 间隔不够，不重复点
+        self.now[0] += utils._ESC_FALLBACK_GAP
+        self.task.all_texts = [Box(0, 0, 10, 10, name="奇怪的页面")]
+        self.assertTrue(utils._esc_fallback(self.task, "同上"))
+        self.assertEqual(["esc"], keys)                            # 非战斗页面照旧按 ESC
 
     def test_no_esc_during_battle(self):
         keys = []

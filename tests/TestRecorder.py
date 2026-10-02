@@ -249,6 +249,19 @@ class TestRecording(RecorderTestCase):
         self.assertIn("没在运行", recorder.hold(self.task))
         self.assertIsNone(self.task._recorder["hold"])
 
+    def test_handled_frame_resets_unhandled_timer(self):
+        # 实跑：事件对话几帧没人认领、一帧点「继续」，交替着累计 10 秒就误报「未识别页面」
+        for _ in range(8):
+            for _ in range(4):
+                self.now[0] += 0.5
+                battle_log.unhandled_frame(self.task)
+            battle_log.handled_frame(self.task)
+        self.assertEqual([], self.events("异常"))
+        for _ in range(21):
+            self.now[0] += 0.5
+            battle_log.unhandled_frame(self.task)
+        self.assertEqual(["未识别页面"], [e["kind"] for e in self.events("异常")])
+
     def test_common_anomaly_only_screenshot(self):
         self.frames(5)
         battle_log.anomaly(self.task, "AP不足", "常见且有兜底")

@@ -404,6 +404,8 @@ def _gated_run(task, st):
     for handle_page in st["handlers"].PAGE_HANDLERS:
         if handle_page(task):
             st["hit"] = handle_page.__name__
+            if st["hit"] != "log_unhandled_page" and hasattr(battle_log, "handled_frame"):  # ESC 兜底不算接手
+                battle_log.handled_frame(task)
             check_loop = getattr(utils, "check_loop", None)  # 官方原版 utils 没有通用循环检测
             if check_loop is not None:
                 check_loop(task, st["hit"])

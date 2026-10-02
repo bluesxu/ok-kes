@@ -2009,16 +2009,32 @@ def log_node_status(task: TriggerTask):
     return False
 
 
-_ESC_FALLBACK_AFTER = 20  # 没有处理函数认领画面 / 画面卡住且别的兜底都没动作，持续这么多秒就按 ESC
-_ESC_FALLBACK_GAP = 10    # 两次 ESC 兜底至少间隔这么久，给页面留出响应时间
+_ESC_FALLBACK_AFTER = 20  # 没有处理函数认领画面 / 画面卡住且别的兜底都没动作，持续这么多秒就兜底一次
+_ESC_FALLBACK_GAP = 10    # 两次兜底至少间隔这么久，给页面留出响应时间
+_CARD_HELD_POINT = (0.5, 0.45)           # 战斗里「把拿在手里的牌放下」的点击位置（和拖牌打空地的落点一致）
+_CARD_HELD_TEXT = re.compile(r"\d+/10")  # 手牌数「N/10」就压在战斗页下方中央，读到它说明是战斗页面
+
+
+def _on_battle_page(task: TriggerTask) -> bool:
+    """画面是战斗页面（手牌数「N/10」压在下方中央）时返回 True。
+    牌的拖动松手消息丢了、或数字键选中后回车没跟上时，牌会一直拿在手里、结束回合按钮变灰，见 _esc_fallback。"""
+    box = find_box_at_point(task, 0.509, 0.972)
+    return bool(box and _CARD_HELD_TEXT.search(box.name))
 
 
 def _esc_fallback(task: TriggerTask, reason: str) -> bool:
-    """没见过的页面、卡住的页面最后按 ESC 兜底（多数弹窗/子页面 ESC 就能关掉或返回）。"""
+    """没见过的页面、卡住的页面最后按 ESC 兜底（多数弹窗/子页面 ESC 就能关掉或返回）。
+    战斗页面除外：那里按 ESC 只会打开撤退菜单，关掉后还是原来那样，来回循环（实跑 10/02 15:15 这样卡了 103 分钟）。
+    战斗里卡住多半是有一张牌还拿在手里，点一下场地中间就是把牌放下。"""
     now = time.time()
     if now - getattr(task, "_esc_fallback_at", 0) < _ESC_FALLBACK_GAP:
         return False
     task._esc_fallback_at = now
+    if _on_battle_page(task):
+        task.log_info(f"{reason}，战斗页面：点场地中间把拿在手里的牌放下")
+        battle_log.record(task, "放下卡牌", reason=reason)
+        _move_and_click(task, *_CARD_HELD_POINT)
+        return True
     task.log_info(f"{reason}，按 ESC 兜底")
     battle_log.record(task, "ESC兜底", reason=reason)
     task.send_key("esc")
@@ -2056,10 +2072,12 @@ def log_unhandled_page(task: TriggerTask):
 
 
 def handle_battle_crash(task: TriggerTask):
-    """战斗信息错乱 / 点击重试: 点击屏幕中央恢复。"""
+    """战斗信息错乱 / 点击重试 / 发生未知错误: 点击屏幕中央恢复。
+    「发生未知错误。err:card_available_failed:...  请点击画面」：出击模式出牌时游戏偶尔弹出，实跑中没人认领卡了 30 秒。"""
     if (find_text(task, r'出现错乱')
             or find_text(task, r'点击重试')
-            or find_text(task, r'通讯不稳定.*重新尝试')):
+            or find_text(task, r'通讯不稳定.*重新尝试')
+            or find_text(task, r'发生未知错误')):
         task.log_info("战斗信息出现错乱，点击恢复")
         _move_and_click(task, 0.5, 0.5)
         return True
