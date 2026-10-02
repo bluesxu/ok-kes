@@ -29,7 +29,6 @@ from ok import Box
 from utils import _get_config_value, _move_and_click, _normalize_text, _simplify_texts, close_monster_panel
 
 DEFENSE_KEY = "防御卡牌列表"
-FINE_KEY = "精细化战斗"
 COLLECT_KEY = "意图采集"
 DANGER_KEY = "防御血量线(%)"
 
@@ -70,17 +69,12 @@ _TURN_FAIL_LIMIT = 3        # 同一张牌一回合里不论按键、拖动，�
 _KEYS_DEAD_CARDS = 2        # 这么多张不同的牌按键没打出去、拖动打出去了，才算键盘失效（单张牌常是自身原因）
 _DRAG_STEPS = 12            # 后台拖动中途发几次鼠标移动
 _DRAG_STEP_INTERVAL = 0.02
-_DRAG_HOVER = 0.3           # 拖到敌人身上停多久再松手（等击杀预览显示出来）
+_DRAG_HOVER = 0.3           # 拖到目标上停多久再松手，让游戏锁定目标
 # 实跑 17:59~18:45：游戏不再理会后台发的按键（数字键出牌、E 都没反应），鼠标拖动、点击照常有效，卡了 45 分钟。
 # 按键出牌没打出去时先拖动再试一次，拖动打出去了就认定本场键盘失效，之后出牌、结束回合都用鼠标
 _FIELD_DROP = (0.5, 0.45)   # 不用选目标的牌拖到场地中间松手
 _END_TURN_POINT = (0.89, 0.867)  # 右下角「结束回合」按钮
 _E_KEY_LIMIT = 2            # 同一回合按了这么多次 E 按钮还在，之后每次再用鼠标点一下按钮
-_PREVIEW_SHOTS = 20         # 每次运行最多存几张击杀预览截图（因为打得死改了目标时），用来核对识别
-_PREVIEW_OTHERS = 2         # 精细化战斗：默认目标之外最多再悬停看几个敌人（加上默认目标共 3 次）
-_LETHAL_MARGIN = 0.7        # 估计伤害不低于敌人血量 + 护盾的这个比例，才去悬停确认能不能打死
-_PREVIEW_FRAMES = 2         # 每次悬停最多取几帧（第一帧读不到数字时再取一帧）
-_PREVIEW_BOX = (-0.08, -0.03, 0.08, 0.07)  # 悬停时读数字的范围，相对拖动前血量数字的位置（拖牌时镜头推近，实测往右下偏约 0.03）
 _WM_MOUSEMOVE, _WM_LBUTTONDOWN, _WM_LBUTTONUP, _MK_LBUTTON = 0x0200, 0x0201, 0x0202, 0x0001
 _RED_SAMPLES = 4            # 读预计扣血时连续取样的帧数（红色段是闪烁的）
 _RED_INTERVAL = 0.25
@@ -112,12 +106,10 @@ _OCR_LOCK = threading.Lock()
 def install(task):
     """给出击模式加上出牌相关配置项。"""
     task.default_config[DEFENSE_KEY] = []
-    task.default_config[FINE_KEY] = True
     task.default_config[COLLECT_KEY] = False
     task.default_config[DANGER_KEY] = 25
     task.config_description[DEFENSE_KEY] = "保命牌（加护盾、回血）：牌名带「盾」「格挡」「壁」「治」「疗」「恢复」等字的会自动认出，这里只需补充认不出的牌；预计这回合会被打死、或挨打后血量低于「防御血量线」时先出这些牌"
     task.config_description[DANGER_KEY] = "预计敌人这一轮打完后我方血量低于上限的百分之几，就先出保命牌；0 为只在会被打死时才出"
-    task.config_description[FINE_KEY] = "攻击牌拖到目标上时读击杀预览，记下这张牌本场的伤害；估计能一张牌打死别的敌人时，先悬停确认再补刀；关闭时直接打目标"
     task.config_description[COLLECT_KEY] = "前期收集数据用：遇到没见过的意图图标时点开怪物信息面板读出意图并记下图标，会变慢；图标收集够后关闭"
     config_io.UI_ONLY_CONFIG_KEYS.add(COLLECT_KEY)
 
@@ -837,62 +829,6 @@ def _focus_rank(e):
     return (0 if _attacking(e) else 1, _toughness(e), countdown)
 
 
-def preview_candidates(enemies, target, damage):
-    """精细化战斗：默认目标之外值得悬停确认能不能打死的敌人（补刀）。damage 是这张牌本场战斗读到的伤害，
-    没读到过时不看别的敌人。只看估计伤害不低于血量 + 护盾 _LETHAL_MARGIN 的：装备、增益会让实际伤害偏高，留点余量，
-    打不打得死以击杀预览为准。"""
-    if not damage:
-        return []
-    others = [e for e in enemies if e is not target and damage >= _LETHAL_MARGIN * _toughness(e)]
-    return sorted(others, key=_focus_rank)[:_PREVIEW_OTHERS]
-
-
-def hit_damage(enemy, after):
-    """悬停时读到的剩余血量 → 这张牌的伤害（先扣护盾再扣血）。护盾没打穿（血量不变）或读不到时算不出，返回 None。"""
-    if after is None or after >= enemy["hp"]:
-        return None
-    return enemy["hp"] - after + (enemy.get("shield") or 0)
-
-
-def read_preview_hp(task, frame, enemy):
-    """悬停时敌人血条上方的数字：击杀预览期间它显示的是这张牌打完后剩下的血量（打得死时是 0，旁边出现骷髅）。
-    读不到返回 None（比如出牌动画挡住了画面）。拖牌时镜头会推近、敌人整体偏移，所以在拖动前数字位置附近
-    裁一块，取离原位置最近的数字。单独一个「0」不放大读不出来。"""
-    px, py = _hp_pos(enemy)
-    dx1, dy1, dx2, dy2 = _PREVIEW_BOX
-    region = (max(0.0, px + dx1), max(0.0, py + dy1), min(1.0, px + dx2), min(1.0, py + dy2))
-    variants = list(_variants(_crop(frame, region)))
-    for image in variants[::2]:  # 放大、白字二值化；灰度那种在这里读不出更多
-        ih, iw = image.shape[:2]
-        numbers = []
-        for text, box in ((t.name.strip().replace(" ", "").replace("O", "0").replace("o", "0"), t)
-                          for t in _ocr_boxes(task, image)):
-            if _NUMBER.match(text):
-                cx = region[0] + (box.x + box.width / 2) / iw * (region[2] - region[0])
-                cy = region[1] + (box.y + box.height / 2) / ih * (region[3] - region[1])
-                numbers.append((abs(cx - px) + abs(cy - py), int(text)))
-        if numbers:
-            return min(numbers)[1]
-    return None
-
-
-def _ocr_boxes(task, image):
-    try:
-        with _OCR_LOCK:  # 同 _ocr_texts
-            return task.ocr(frame=image)
-    except Exception as e:
-        task.log_info(f"战斗识别 OCR 失败：{e}")
-        return []
-
-
-def _hp_pos(enemy):
-    return enemy.get("hp_pos") or (enemy["x"] + 0.055, enemy["y"] - 0.012)
-
-
-def is_lethal(enemy, value):
-    return value == 0 and enemy["hp"] > 0
-
-
 # ======================================================================
 # 执行
 # ======================================================================
@@ -945,7 +881,7 @@ def _session(task):
     session = getattr(task, "_battle_session", None)
     if session is None:
         # zero_cost：本次运行读到过 0 费的牌名，见 _read_costs；types：读到过的牌名 → 类型，见 _remember_type
-        session = {"drag_ok": 0, "drag_fail": 0, "drag_disabled": False, "preview_shots": 0, "zero_cost": set(),
+        session = {"drag_ok": 0, "drag_fail": 0, "drag_disabled": False, "zero_cost": set(),
                    "types": {}}
         task._battle_session = session
     session.setdefault("types", {})  # 热重载前建的 session 没有这一项
@@ -956,8 +892,7 @@ def start_battle(task):
     state = _state(task)
     state.clear()
     _new_turn(state)
-    # damage：本场战斗每张攻击牌悬停时读到的伤害（装备、增益让伤害在局内一直变，只在本场用）
-    state.update(sticky=None, drag_fail={}, last_remaining=None, last_seen=time.time(), zero_frames=0, damage={})
+    state.update(sticky=None, drag_fail={}, last_remaining=None, last_seen=time.time(), zero_frames=0)
     session = _session(task)
     session.update(drag_disabled=False, drag_fail=0)
     state["key_fail_cards"] = set()  # 本场按键没打出去、拖动打出去了的牌，见 _KEYS_DEAD_CARDS
@@ -1284,13 +1219,12 @@ def play_turn(task, hand_count, finish_turn_visible):
     if _hand_changed(task, state, hand_count):
         return True
 
-    target, target_reason, others = None, None, []
+    target, target_reason = None, None
     # 本回合按键没打出去的牌位；本场按键失败、拖动打出去过的牌以后直接拖
     retry = card["slot"] in state["key_retry"] or card["name"] in state.get("key_fail_cards", ())
     use_drag = _use_drag(task, state, card)
     # 要改用拖动、但类型没读到的牌按攻击牌拖到敌人身上：多半是标签没读到的攻击牌，拖到场地中间打不出去
     untyped = card["type"] is None and (state.get("keys_dead") or retry) and not _session(task)["drag_disabled"]
-    fine = _get_config_value(task, FINE_KEY, True)
     if use_drag or untyped:
         use_drag = True
         if zero_hp:
@@ -1304,8 +1238,6 @@ def play_turn(task, hand_count, finish_turn_visible):
         use_drag = target is not None
         if use_drag and untyped:
             target_reason = f"类型没读到，按攻击牌拖到敌人身上（{target_reason}）"
-        if use_drag and fine:
-            others = preview_candidates(enemies, target, state.get("damage", {}).get(card["name"]))
     # 本场键盘失效、或这张牌按键没打出去：不用选目标（或没找到目标）的牌也拖到场地中间打出
     field = not use_drag and (state.get("keys_dead") or retry) and not _session(task)["drag_disabled"]
     if field:
@@ -1324,7 +1256,7 @@ def play_turn(task, hand_count, finish_turn_visible):
                      "remaining": remaining, "cost": card["cost"], "twin_ok": twin_ok,
                      "key_retry": retry, "once": retry or field}
     if use_drag:
-        _drag_card(task, card, target, others, preview=fine)
+        _drag_card(task, card, target)
         state["sticky"] = (target["x"], target["y"])
     elif field:
         _drag_card(task, card, {"drop": _FIELD_DROP})
@@ -1346,12 +1278,11 @@ def _post_message_interaction(task):
     return interaction
 
 
-def _post_drag(task, start, drop, on_hover=None):
+def _post_drag(task, start, drop):
     """后台拖动，返回 False 表示当前不是后台交互、没拖。
     框架 PostMessageInteraction.swipe 在游戏里拖不出牌：松手消息的坐标固定是 (0, 0)（它的 mouse_pos 从不更新），
     牌在窗口左上角松手被游戏当成取消；中途也只移 3 步、到不了终点。这里自己发消息：
-    按下 → 分步移到落点 → 停一下（on_hover 可看击杀预览）→ 在落点松手。
-    on_hover 返回新的落点时，牌不松手移过去再停一下、再调用它，直到它返回 None。"""
+    按下 → 分步移到落点 → 停一下让游戏锁定目标 → 在落点松手。"""
     interaction = _post_message_interaction(task)
     if interaction is None:
         return False
@@ -1377,20 +1308,8 @@ def _post_drag(task, start, drop, on_hover=None):
     interaction.post(_WM_LBUTTONDOWN, _MK_LBUTTON, lparam)
     time.sleep(0.08)
     try:
-        lparam, point = move(start, drop), drop
+        lparam = move(start, drop)
         time.sleep(_DRAG_HOVER)
-        while on_hover is not None:
-            try:
-                nxt = on_hover()
-            except Exception as e:  # 识别出错不能让牌一直拿在手上
-                task.log_info(f"拖动悬停时出错：{e}")
-                nxt = None
-            if not nxt:
-                break
-            if recorder is not None:
-                recorder.note_action(task, "drag_move", nxt)
-            lparam, point = move(point, nxt), nxt
-            time.sleep(_DRAG_HOVER)
         interaction.post(_WM_MOUSEMOVE, _MK_LBUTTON, lparam)
     finally:
         # 中途出错也必须松手：按住不放牌会一直拿在手里，结束回合按钮变灰，游戏一直等（兜底见 utils._esc_fallback）
@@ -1398,68 +1317,11 @@ def _post_drag(task, start, drop, on_hover=None):
     return True
 
 
-def _hover_reading(task, enemy):
-    """悬停时读这个敌人的数字；第一帧没读到再取一帧。返回 (帧, 读数)。"""
-    # 加速模式包装过的 next_frame 会先补足欠下的等待，拖动途中不能停那么久
-    capture = getattr(task.executor, "_speedup_original_next_frame", None) or task.next_frame
-    frame, value = None, None
-    for _ in range(_PREVIEW_FRAMES):
-        frame = capture()
-        if frame is None:
-            continue
-        value = read_preview_hp(task, frame, enemy)
-        if value is not None:
-            break
-    return frame, value
-
-
-def _preview_hover(task, card, target, others):
-    """精细化战斗的悬停：依次停在其他候选敌人身上，打得死就在那里松手；都打不死最后停到默认目标上松手。
-    每次读到的剩余血量都换算成这张牌的伤害记下来（见 hit_damage），下一张同名牌据此判断要不要看别的敌人。
-    群攻牌不另外识别：它打谁都一样，只是多悬停几次。"""
-    visits = list(others) + [target]
-    seen = []
-    step = {"i": 0}
-
-    def finish(frame, chosen, reason):
-        fields = {"card": card["name"], "chosen": {k: chosen[k] for k in ("x", "y", "hp")}, "reason": reason,
-                  "seen": seen}
-        session = _session(task)
-        if chosen is not target and frame is not None and session["preview_shots"] < _PREVIEW_SHOTS:
-            session["preview_shots"] += 1  # 改了目标的留一张图，事后核对识别对不对
-            name = re.sub(r'[\\/:*?"<>|]', "", card["name"])
-            fields["screenshot"] = battle_log.save_shot(task, f"击杀预览_{name}", frame)
-        battle_log.record(task, "击杀预览", **fields)
-        if chosen is not target:
-            task.log_info(f"击杀预览：{reason}，改打敌人 hp={chosen['hp']}")
-        return None
-
-    def hover():
-        enemy = visits[step["i"]]
-        frame, value = _hover_reading(task, enemy)
-        seen.append({"hp": enemy["hp"], "after": value})
-        damage = hit_damage(enemy, value)
-        if damage:
-            _state(task).setdefault("damage", {})[card["name"]] = damage
-        if enemy is not target and is_lethal(enemy, value):
-            return finish(frame, enemy, "打得死")
-        step["i"] += 1
-        if step["i"] < len(visits):
-            return visits[step["i"]]["drop"]
-        return finish(frame, target, "都打不死，打默认目标" if others else "打默认目标")
-    return hover
-
-
-def _drag_card(task, card, target, others=(), preview=False):
-    """preview（精细化战斗）时在落点读击杀预览、记下这张牌的伤害；others 非空时先拖到它们身上看能不能打死，
-    见 _preview_hover。"""
+def _drag_card(task, card, target):
+    """把牌从牌身中部拖到目标身上松手。"""
     # 从牌身中部拖起；牌名没读到时没有 y，用手牌区牌身的大致高度
     start = (card["x"] + 0.035, min(0.93, card["y"] + 0.07) if card.get("y") is not None else 0.86)
-    first, on_hover = target["drop"], None
-    if others or preview:
-        first = (others[0] if others else target)["drop"]
-        on_hover = _preview_hover(task, card, target, others)
-    if not _post_drag(task, start, first, on_hover=on_hover):
+    if not _post_drag(task, start, target["drop"]):
         task.swipe_relative(start[0], start[1], target["drop"][0], target["drop"][1], duration=0.35)
     speed = getattr(task, "_speedup", None)
     if speed is not None:

@@ -284,9 +284,6 @@ msgstr "When off, the shop's free refresh is not used and the shop is left when 
 msgid "保命牌（加护盾、回血）：牌名带「盾」「格挡」「壁」「治」「疗」「恢复」等字的会自动认出，这里只需补充认不出的牌；预计这回合会被打死时先出这些牌"
 msgstr "Survival cards (shield or heal): cards whose names contain words like 盾, 格挡, 壁, 治, 疗 or 恢复 are recognized automatically, so only list the ones that are missed; they are played first when this turn's incoming damage would be lethal."
 
-msgid "攻击牌拖到目标上时读击杀预览，记下这张牌本场的伤害；估计能一张牌打死别的敌人时，先悬停确认再补刀；关闭时直接打目标"
-msgstr "Read the kill preview when an attack card is dragged onto its target and remember the card's damage for this battle; when a card looks able to kill another enemy, hover over it to confirm and finish it off first. When off, attack the target directly."
-
 msgid "前期收集数据用：遇到没见过的意图图标时点开怪物信息面板读出意图并记下图标，会变慢；图标收集够后关闭"
 msgstr "For early data collection: when an unknown intent icon is seen, open the enemy info panel to read the intent and save the icon. Slower; turn off once enough icons are collected."
 
