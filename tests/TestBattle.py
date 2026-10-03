@@ -744,6 +744,56 @@ class TestPlayTurn(unittest.TestCase):
             battle.play_turn(self.task, 1, True)
         self.assertNotIn("斗志", self.task._battle["unplayable"])
 
+    def test_turn_fail_limit_counts_all_methods(self):
+        # 10/03 13:54：同一张牌拖动、按键、拖动重试轮流试了 6 次才放弃。修后换什么法子都算同一本账：
+        # 拖动 2 次 + 按键 1 次 = 3 次就封，本回合不再出它
+        drags, anomalies = [], []
+        with mock.patch.object(battle, "read_hand",
+                               lambda task, count: [dict(card("庇护飞踢", None, "攻击", key="1"), x=0.4, y=None)]), \
+                mock.patch.object(battle, "read_remaining_cost", lambda task, frame: 1), \
+                mock.patch.object(battle, "_drag_card", lambda task, c, t: drags.append("拖动")), \
+                mock.patch.object(battle.battle_log, "anomaly",
+                                  lambda task, kind, detail, *a, **k: anomalies.append(kind)):
+            for _ in range(4):
+                battle.play_turn(self.task, 1, True)
+        self.assertEqual(["拖动", "拖动"], drags)          # 拖动两次后拖动被封
+        self.assertEqual(["1", "enter", "e"], self.keys)   # 按键（第 3 次）失败后封牌并结束回合
+        self.assertIn("出不掉牌", anomalies)
+
+    def test_ap_spike_reread_blocks_false_new_turn(self):
+        # 10/03 13:54：单帧把剩余 AP「1」读成「7」，触发假新回合清掉本回合状态，连锁让同一张牌试了 6 次。
+        # 跳变时先重截一帧重读，重读值更小就不按新回合处理
+        records = []
+        reads = [1, 7]
+        with mock.patch.object(battle, "read_hand",
+                               lambda task, count: [dict(card("斗志", None, "技能", key="1"), x=0.4, y=None)]), \
+                mock.patch.object(battle, "read_remaining_cost",
+                                  lambda task, frame: reads.pop(0) if reads else 7), \
+                mock.patch.object(battle, "_fresh_remaining_cost", lambda task: 1), \
+                mock.patch.object(battle.battle_log, "record",
+                                  lambda task, event, **f: records.append(event)):
+            battle.play_turn(self.task, 1, True)
+            self.task._battle["unplayable"].add("破碎")
+            battle.play_turn(self.task, 1, True)
+        self.assertIn("AP误读", records)
+        self.assertIn("破碎", self.task._battle["unplayable"])   # 假新回合会清空它
+        self.assertEqual(1, self.task._battle["last_remaining"])  # 用重读值
+
+    def test_attack_card_never_dragged_to_the_field(self):
+        # 键盘失效时攻击牌曾被拖到场地中间（敌人都在上方，空地无目标）注定失败：10/03 13:54 白送一次
+        drags = []
+        self.task._battle = {"drag_fail": {"庇护飞踢": 2}, "keys_dead": True, "key_retry": set(),
+                             "key_fail_cards": set(), "attempts": {}, "turn_fails": {}, "unplayable": set(),
+                             "costs": {}, "last": None, "last_remaining": None, "last_seen": time.time(),
+                             "not_zero": set(), "probe_fails": {}, "collected": set()}
+        with mock.patch.object(battle, "read_hand",
+                               lambda task, count: [dict(card("庇护飞踢", None, "攻击", key="1"), x=0.4, y=None)]), \
+                mock.patch.object(battle, "read_remaining_cost", lambda task, frame: 1), \
+                mock.patch.object(battle, "_drag_card", lambda task, c, t: drags.append(t)):
+            battle.play_turn(self.task, 1, True)
+        self.assertEqual([], drags)                  # 没被拖到任何地方（尤其场地中间）
+        self.assertEqual(["1", "enter"], self.keys)  # 直接按键
+
 
 class TestPlayTurnRecovery(TestPlayTurn):
     """实跑中发现的问题：后台拖动没被游戏当成出牌、牌名前后多读出杂字、意图采集读不出时反复点开怪物。"""

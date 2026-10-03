@@ -73,7 +73,7 @@ _PROBE_LIMIT = 2            # AP 用完时试读不到费用的牌，连着几�
 _STUCK_LIMIT = 3            # 同一张牌连续这么多次还在手里（又没提示 AP不足），本回合不再出它
 _BUTTON_GONE_LIMIT = 30     # 「结束回合」按钮消失这么多秒还没回来，就不再当作敌人行动中干等
 _DRAG_FAIL_LIMIT = 2        # 拖动连续这么多次没打出去，本场改用按键 + 回车打默认目标
-_TURN_FAIL_LIMIT = 3        # 同一张牌一回合里不论按键、拖动，总共这么多次没打出去就不再出它（兜底，防止换着法子一直试）
+_TURN_FAIL_LIMIT = 3        # 同一张牌一回合里不论按键、拖动、拖动重试，总共这么多次没打出去就不再出它（兜底，防止换着法子一直试）
 _KEYS_DEAD_CARDS = 2        # 这么多张不同的牌按键没打出去、拖动打出去了，才算键盘失效（单张牌常是自身原因）
 _DRAG_STEPS = 12            # 后台拖动中途发几次鼠标移动
 _DRAG_STEP_INTERVAL = 0.02
@@ -1009,14 +1009,11 @@ def _check_last_play(task, state, hand_count, remaining):
             session["drag_fail"] += 1
             drag_fail = state["drag_fail"]
             drag_fail[last["name"]] = drag_fail.get(last["name"], 0) + 1
-            if drag_fail[last["name"]] >= _DRAG_FAIL_LIMIT and not last.get("once"):
-                # 改用按键后重新计数，不让拖动的失败次数算到按键头上。只试一次的拖动（按键失败后的重试、拖到场地中间）
-                # 不清零：实跑中苍白流星的每次重试都把计数清掉，同一回合按键、拖动轮流试了 12 次
-                fails[last["slot"]] = 0
+            # 拖动失败不清 fails：换法子（拖动→按键→拖动重试）都算同一张牌一回合的总账。
+            # 清零曾让「苍白流星」按键、拖动轮流试 12 次，10/03 的「庇护飞踢」又试出 6 次
             if not session["drag_ok"] and session["drag_fail"] >= _DRAG_FAIL_LIMIT and not session["drag_disabled"]:
                 # 本次运行还没拖成功过、这场又连着失败：本场改用按键，下一场重新试
                 session["drag_disabled"] = True
-                fails[last["slot"]] = 0
                 battle_log.anomaly(task, "拖动出牌无效",
                                    f"拖动出牌连续 {session['drag_fail']} 次都没打出去，本场战斗改用按键打默认目标")
     if last.get("key_retry") and played and not state.get("keys_dead"):
@@ -1030,16 +1027,7 @@ def _check_last_play(task, state, hand_count, remaining):
                                                  "本场战斗改用鼠标出牌和结束回合")
         else:
             task.log_info(f"「{last['name']}」按键没打出去、拖动打出去了，先只对这张牌改用拖动")
-    if last["method"] == "按键" and not played and remaining != 0 and last["slot"] not in state["key_retry"] \
-            and not _session(task)["drag_disabled"]:
-        # 键盘可能失效了：先不记出不起，下一帧拖动再试一次（AP 确实不够时多花一次拖动）
-        state["key_retry"].add(last["slot"])
-        fails[last["slot"]] = 0
-        task.log_info(f"「{last['name']}」按键没打出去，改用拖动再试一次")
-        return
-    # 按键出的牌没打出去多半是 AP 不够（「AP不足」提示一闪而过常常读不到）：失败一次本回合就不再出它，
-    # 不再每张试 3 次（实跑中回合末尾每张牌白按 3 遍，每场战斗浪费 20~30 秒）。
-    # 拖到场地中间的牌、按键失败后改拖动重试的牌同样只试一次
+    # 这张牌本回合（按牌名）失败了几次：按键、拖动、拖动重试都记同一本账，换着法子一直出不掉就封它
     limit = 1 if last["method"] == "按键" or last.get("once") else _STUCK_LIMIT
     turn_fails = state.setdefault("turn_fails", {})
     card_key = last["name"] if not last["name"].startswith("未识别") else last["slot"]
@@ -1047,6 +1035,16 @@ def _check_last_play(task, state, hand_count, remaining):
         turn_fails[card_key] = turn_fails.get(card_key, 0) + 1
         if turn_fails[card_key] >= _TURN_FAIL_LIMIT:
             fails[last["slot"]] = max(fails[last["slot"]], limit)  # 换着法子也一直出不掉：本回合不再出它
+    if last["method"] == "按键" and not played and remaining != 0 and last["slot"] not in state["key_retry"] \
+            and not _session(task)["drag_disabled"] and turn_fails[card_key] < _TURN_FAIL_LIMIT:
+        # 键盘可能失效了：下一帧拖动再试一次（AP 确实不够时多花一次拖动）。这次重试照常计入上面那本账，
+        # 不再清 fails——清零曾让「庇护飞踢」一回合被试 6 次（实跑 10/03 13:54）；本账满了（3 次）就不给重试，
+        # 直接按出不起记账
+        state["key_retry"].add(last["slot"])
+        task.log_info(f"「{last['name']}」按键没打出去，改用拖动再试一次")
+        return
+    # 按键出的牌没打出去多半是 AP 不够（「AP不足」提示一闪而过常常读不到）：失败一次本回合就不再出它，
+    # 不再每张试 3 次（实跑中回合末尾每张牌白按 3 遍，每场战斗浪费 20~30 秒）。
     if not played and fails[last["slot"]] >= limit:
         by_name = _short_of_ap(last)
         _mark_unplayable(state, last, by_name=by_name)
@@ -1176,6 +1174,13 @@ def _fresh_hand_count(task):
     return read_hand_count(task, frame) if frame is not None else None
 
 
+def _fresh_remaining_cost(task):
+    """重截一帧读剩余费用（跳变确认用）。读不到或没有截图方法（测试替身）返回 None。"""
+    capture = _raw_capture(task)
+    frame = capture() if capture is not None else None
+    return read_remaining_cost(task, frame) if frame is not None else None
+
+
 def _hand_changed(task, state, hand_count):
     """识别完手牌、准备出牌前再读一次手牌数：和识别时不一样，说明新牌刚到手，
     按旧的排位出牌会按错，这一帧放弃，下一帧重新识别。连续 _STALE_LIMIT 次都这样就照常出牌，免得卡住。"""
@@ -1230,9 +1235,19 @@ def play_turn(task, hand_count, finish_turn_visible):
         remaining = 0
         task.log_info("AP 已用完（灰色的 0 或手牌沉下去）")
     if remaining is not None and state["last_remaining"] is not None and remaining > state["last_remaining"]:
-        _new_turn(state)  # 费用回满：新回合（也可能是某张牌加了费用，同样应该重新判断）
-    state["last_remaining"] = remaining
+        # 读数比上一帧大：费用回满（新回合），也可能某张牌加了费用。单帧误读会清掉本回合状态，
+        # 实跑 10/03 13:54 把「1」读成「7」触发假新回合，连锁让同一张牌被试 6 次：先重截一帧重读，
+        # 重读值更小才算误读；读不出（None）按原行为当新回合。
+        confirm = _fresh_remaining_cost(task)
+        if confirm is not None and confirm < remaining:
+            task.log_info(f"剩余费用读数 {remaining}→重读 {confirm}，单帧误读，不按新回合处理")
+            battle_log.record(task, "AP误读", reading=remaining, reread=confirm)
+            remaining = confirm
+        else:
+            _new_turn(state)  # 费用回满：新回合（也可能是某张牌加了费用，同样应该重新判断）
+    # 上一张牌的检查放在 _new_turn 之前：_new_turn 会清 state["last"]，假新回合曾把该记的失败吞掉
     _check_last_play(task, state, hand_count, remaining)
+    state["last_remaining"] = remaining
     _read_costs(task, state, frame, cards, pending)
     for card in cards:
         if card["type"] == "崩溃":
@@ -1313,8 +1328,11 @@ def play_turn(task, hand_count, finish_turn_visible):
         use_drag = target is not None
         if use_drag and untyped:
             target_reason = f"类型没读到，按攻击牌拖到敌人身上（{target_reason}）"
-    # 本场键盘失效、或这张牌按键没打出去：不用选目标（或没找到目标）的牌也拖到场地中间打出
-    field = not use_drag and (state.get("keys_dead") or retry) and not _session(task)["drag_disabled"]
+    # 本场键盘失效、或这张牌按键没打出去：不用选目标（或没找到目标）的牌也拖到场地中间打出。
+    # 攻击牌不行：敌人都在画面上方，拖到空地没有目标、打不出去（实跑 10/03 13:54 白送一次）；
+    # 攻击牌要么走上面的拖到敌人，要么按失败记账
+    field = (not use_drag and (state.get("keys_dead") or retry)
+             and card["type"] != "攻击" and not _session(task)["drag_disabled"])
     if field:
         target_reason = "按键无效，拖到场地中间" if state.get("keys_dead") else "按键没打出去，改用拖动再试"
     method = "拖动" if use_drag or field else "按键"
