@@ -334,6 +334,33 @@ def _merge_split_texts_at_point(task: TriggerTask, px, py):
     )
 
 
+# 底部按钮条：结算/奖励类页面的按钮文字有高/低两套渲染位置（条目数不同时上下浮动约 45px，
+# 见 10/03 命运结算页卡死），固定检测点会落空。按钮检测一律先固定点、落空再在这里按文字找。
+_BOTTOM_BUTTON_REGION = (0.600, 0.820, 1.000, 0.990)
+
+
+def find_text_in_region(task: TriggerTask, matcher, region):
+    """在区域内找第一个 matcher(name) 命中的文字框，多个命中返回面积最小的（最精确）。"""
+    x1, y1, x2, y2 = region
+    hits = [
+        box for box in task.all_texts
+        if x1 <= (box.x + box.width / 2) / task.width <= x2
+        and y1 <= (box.y + box.height / 2) / task.height <= y2
+        and matcher(box.name)
+    ]
+    if not hits:
+        return None
+    return min(hits, key=lambda box: box.area())
+
+
+def find_button_by_text(task: TriggerTask, words, region=_BOTTOM_BUTTON_REGION):
+    """在区域内按按钮文字精确查找（_clean_match，去符号后完全相等）；不做包含匹配——
+    「获得」不能匹配到「获得卡牌」。"""
+    return find_text_in_region(
+        task, lambda name: any(_clean_match(name, word) for word in words), region
+    )
+
+
 def find_target_card(task: TriggerTask):
     """查找target卡牌特征，返回特征框列表及其对应的相对点击位置。"""
     search_box = task.box_of_screen(0.090, 0.179, 0.927, 0.342)
@@ -2013,6 +2040,8 @@ _ESC_FALLBACK_AFTER = 20  # 没有处理函数认领画面 / 画面卡住且别�
 _ESC_FALLBACK_GAP = 10    # 两次兜底至少间隔这么久，给页面留出响应时间
 _CARD_HELD_POINT = (0.5, 0.45)           # 战斗里「把拿在手里的牌放下」的点击位置（和拖牌打空地的落点一致）
 _CARD_HELD_TEXT = re.compile(r"\d+/10")  # 手牌数「N/10」就压在战斗页下方中央，读到它说明是战斗页面
+# 卡死兜底时按文字找的安全按钮：点一下只会推进/关闭页面，不会消费或做不可逆操作（命运结算页的「跳过」不在内）
+_ESC_SAFE_BUTTONS = ("离开", "关闭", "继续", "下一步", "返回")
 
 
 def _on_battle_page(task: TriggerTask) -> bool:
@@ -2025,7 +2054,9 @@ def _on_battle_page(task: TriggerTask) -> bool:
 def _esc_fallback(task: TriggerTask, reason: str) -> bool:
     """没见过的页面、卡住的页面最后按 ESC 兜底（多数弹窗/子页面 ESC 就能关掉或返回）。
     战斗页面除外：那里按 ESC 只会打开撤退菜单，关掉后还是原来那样，来回循环（实跑 10/02 15:15 这样卡了 103 分钟）。
-    战斗里卡住多半是有一张牌还拿在手里，点一下场地中间就是把牌放下。"""
+    战斗里卡住多半是有一张牌还拿在手里，点一下场地中间就是把牌放下。
+    ESC 前先在底部按文字找安全按钮：命运结算页的按钮有高/低两套渲染、探针全落空时 ESC 完全无效，
+    实跑白按了 2.5 小时（10/03 11:11）。"""
     now = time.time()
     if now - getattr(task, "_esc_fallback_at", 0) < _ESC_FALLBACK_GAP:
         return False
@@ -2034,6 +2065,13 @@ def _esc_fallback(task: TriggerTask, reason: str) -> bool:
         task.log_info(f"{reason}，战斗页面：点场地中间把拿在手里的牌放下")
         battle_log.record(task, "放下卡牌", reason=reason)
         _move_and_click(task, *_CARD_HELD_POINT)
+        return True
+    button = find_button_by_text(task, _ESC_SAFE_BUTTONS)
+    if button:
+        task.log_info(f"{reason}，点击「{button.name}」")
+        battle_log.record(task, "兜底按钮", reason=reason, button=button.name)
+        task.click_box(button)
+        task.sleep(1)
         return True
     task.log_info(f"{reason}，按 ESC 兜底")
     battle_log.record(task, "ESC兜底", reason=reason)
@@ -4119,6 +4157,9 @@ def handle_route_selection(task: TriggerTask):
 def handle_obtain_reward(task: TriggerTask):
     """获得奖励页面: 点击领取。若此时 reach_final_boss 为 True，说明已通关关底boss，过层+1并重置层状态。"""
     box = find_box_at_point(task, 0.924, 0.922)
+    if not (box and _clean_match(box.name, "获得")):
+        # 按钮有高/低两套渲染位置，固定检测点会落空（10/03 命运结算页卡死）：区域内按文字找
+        box = find_button_by_text(task, ("获得",))
     if box and _clean_match(box.name, "获得"):
         task.log_info("检测到获得奖励页面，点击领取")
         task.click_box(box)
@@ -4130,6 +4171,9 @@ def handle_obtain_reward(task: TriggerTask):
 def handle_leave(task: TriggerTask):
     """离开按钮。"""
     box = find_box_at_point(task, 0.945, 0.918)
+    if not (box and _clean_match(box.name, "离开")):
+        # 按钮有高/低两套渲染位置，固定检测点会落空（10/03 命运结算页卡死）：区域内按文字找
+        box = find_button_by_text(task, ("离开",))
     if box and _clean_match(box.name, "离开"):
         if _shop_opening(task):
             task.log_info("刚点了德朗商店，等商店页面出来，先不点离开")

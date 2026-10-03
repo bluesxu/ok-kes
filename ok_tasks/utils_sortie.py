@@ -2,7 +2,7 @@ from ok import TriggerTask
 
 from utils import (
     _move_and_click, _simplify_texts, _edit_distance, _get_config_value, _get_card_list, _get_route_priority, _get_game_text,
-    find_box_at_point, find_text, recognize_cards,
+    find_box_at_point, find_text, find_text_in_region, recognize_cards,
     _card_has_type_below, select_card, calculate_dominant_hue,
     log_credit, log_node_status, handle_battle_crash, handle_close_page, handle_refine_equipment_credit,
     handle_center_confirm, handle_dont_show_again, handle_settlement, handle_skip,
@@ -471,7 +471,14 @@ def handle_get_card(task: TriggerTask):
     """获得卡牌页面: 按优先级选择卡牌。"""
     title = find_box_at_point(task, 0.502, 0.128)
     tip = find_box_at_point(task, 0.883, 0.131)
-    if not (title and title.name == "获得卡牌" and tip and re.search(r"请选择.*获得的卡牌", tip.name)):
+    if not (title and title.name == "获得卡牌"):
+        # 标题和提示有高/低两套渲染位置，探针会落空（10/03 11:43 的选牌子页面 15 秒没人认领）：区域内按文字找
+        title = find_text_in_region(
+            task, lambda name: _clean_match(name, "获得卡牌"), (0.360, 0.040, 0.680, 0.180))
+    if not (tip and re.search(r"请选择.*获得的卡牌", tip.name)):
+        tip = find_text_in_region(
+            task, lambda name: re.search(r"请选择.*获得的卡牌", name), (0.700, 0.040, 1.000, 0.200))
+    if not (title and tip):
         return False
     cards = recognize_cards(task, page="获得卡牌页面")
     if not cards:
