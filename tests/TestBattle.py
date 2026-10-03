@@ -19,6 +19,7 @@ from ok import Box  # noqa: E402
 import battle_log  # noqa: E402
 import utils  # noqa: E402
 import utils_battle as battle  # noqa: E402
+import utils_sortie  # noqa: E402
 
 IMAGES = os.path.join(ROOT, "tests", "images", "battle")
 
@@ -1305,6 +1306,50 @@ class TestEgo(unittest.TestCase):
 
     def test_elite_spends_like_boss(self):
         self.assertTrue(self._use("精英", [False, True, False])[0][0])
+
+
+class TestHandSelect(unittest.TestCase):
+    """战斗中手牌选择页（handle_battle_hand_select）：只允许选攻击牌的场景选中技能牌后要换牌重试
+    （实跑 10/03 16:05：攻击牌的牌名框缺失、只剩类型标签，候选里只有技能牌「物质再生」，反复点它卡了 11 分钟）。"""
+
+    # 现场包 20261003-160626 第 0 帧的实际 OCR（2554x1437）
+    PAGE = (("请选择1张欲赋豫的卡牌。", 1213, 140, 200, 40),
+            ("102/10", 1220, 1377, 120, 40),
+            ("物质再生", 960, 1045, 220, 60),
+            ("基本技能", 1015, 1085, 130, 40),
+            ("攻击", 1390, 1085, 74, 40))
+
+    def setUp(self):
+        self.clicks = []
+        patcher = mock.patch.object(utils_sortie, "_move_and_click",
+                                    lambda task, x, y: self.clicks.append((round(x, 3), round(y, 3))))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def make_task(self):
+        task = SimpleNamespace(width=2554, height=1437, log_info=lambda message: None, sleep=lambda s: None)
+        task.all_texts = [Box(x, y, w, h, name=name) for name, x, y, w, h in self.PAGE]
+        task.ocr = lambda *a, **k: [Box(b.x, b.y, b.width, b.height, name=b.name) for b in task.all_texts]
+        return task
+
+    def test_retry_replaces_tried_card(self):
+        task = self.make_task()
+        with mock.patch.object(utils_sortie.random, "choice", lambda seq: seq[0]):
+            self.assertTrue(utils_sortie.handle_battle_hand_select(task))
+            self.assertEqual((0.419, 0.748), self.clicks[0])          # 候选里技能牌排最前：先点到它
+            self.assertEqual([(4, 7)], task._hand_select_pending)
+            self.assertTrue(utils_sortie.handle_battle_hand_select(task))  # 页面还在
+        self.assertEqual({(4, 7)}, task._hand_select_tried)           # 上次点的进了「已试」
+        self.assertEqual((0.559, 0.744), self.clicks[2])              # 换到「攻击」标签上方的牌
+        self.assertEqual(4, len(self.clicks))                         # 每次 = 点牌 + 点确认
+
+    def test_tried_resets_when_page_closes(self):
+        task = self.make_task()
+        with mock.patch.object(utils_sortie.random, "choice", lambda seq: seq[0]):
+            utils_sortie.handle_battle_hand_select(task)
+        task.all_texts = []                                           # 页面关了
+        self.assertFalse(utils_sortie.handle_battle_hand_select(task))
+        self.assertEqual(set(), task._hand_select_tried)
 
 
 if __name__ == "__main__":

@@ -705,11 +705,48 @@ def handle_ether_supply(task: TriggerTask):
     return False
 
 
+_HAND_SELECT_TAGS = ("攻击", "强化", "技能", "咒术", "基础", "基本", "状态异常", "诅咒")
+
+
+def _hand_select_candidates(task: TriggerTask):
+    """本页可点的牌位：牌名框直接用；带类型标签的框（攻击/基本技能…）点标签上方的牌面
+    ——牌名没读到的牌就靠这条定位（实跑 10/03 16:05：攻击牌的牌名框缺失、只读出「攻击」标签，
+    候选里只剩技能牌「物质再生」，反复点它卡了 11 分钟）。返回 [(key, 描述, (x, y))]。"""
+    out, seen = [], set()
+    for b in task.all_texts:
+        cx = (b.x + b.width / 2) / task.width
+        cy = (b.y + b.height / 2) / task.height
+        if not (0.116 <= cx <= 0.859 and 0.697 <= cy <= 0.878):
+            continue
+        name = b.name.strip()
+        if len(name) <= 1 or name in ("确认", "返回", "跳过"):
+            continue
+        if re.search(r"\d+\s*/\s*\d+", name):  # 手牌数、血量这类「数字/数字」是 OCR 串进来的，不是卡牌
+            continue
+        if re.fullmatch(r"[A-Za-z]\d{1,2}", name):  # 「C2」「F1」这类是牌的按键提示，不是牌
+            continue
+        if any(kw in name for kw in _HAND_SELECT_TAGS):
+            point, label = (cx, cy - 0.025), f"类型「{name}」"
+        else:
+            if "攻" in name and len(name) <= 3:
+                continue
+            point, label = (cx, cy), name
+        key = (round(point[0] * 10), round(point[1] * 10))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((key, label, point))
+    return out
+
+
 def handle_battle_hand_select(task: TriggerTask):
-    """战斗中手牌选择页面: 检测到请选择卡牌文本且底部有手牌数，随机选择指定数量的卡牌。"""
+    """战斗中手牌选择页面: 检测到请选择卡牌文本且底部有手牌数，随机选择指定数量的卡牌。
+    点过的牌没让页面推进（这页可能只允许选某个类型，比如只让选攻击牌）就换别的牌试：
+    实跑 10/03 15:54、16:05 两次反复随机点到技能牌，卡了十几分钟。"""
     # 检测(0.5, 0.111)位置的提示文本
     prompt = find_box_at_point(task, 0.5, 0.111)
     if not prompt:
+        task._hand_select_tried, task._hand_select_pending = set(), None  # 页面关了：重试记录清零
         return False
     m = re.search(r'请选择(?=.*卡牌).*?(\d+)张', prompt.name)
     if not m:
@@ -721,37 +758,43 @@ def handle_battle_hand_select(task: TriggerTask):
         return False
 
     need = int(m.group(1))
+    tried = getattr(task, "_hand_select_tried", None)
+    if tried is None:
+        tried = task._hand_select_tried = set()
+    pending = getattr(task, "_hand_select_pending", None)
+    if pending:
+        # 上一帧选了这几张、页面还停在这里：这些都不行，换别的试
+        tried.update(pending)
+        task._hand_select_pending = None
+        task.log_info(f"上次选的牌没让页面推进，本次换别的（已试过 {len(tried)} 个位置）")
     task.log_info(f"检测到战斗中手牌选择页面，需选择{need}张卡牌，随机选择")
 
-    _card_exclude_keywords = {"攻击", "强化", "技能", "咒术", "基础", "基本", "状态异常", "诅咒"}
-    selected = 0
+    selected, clicked = 0, []
     for _ in range(need):
         task.all_texts = _simplify_texts(task.ocr())
-        cards = [
-            b for b in task.all_texts
-            if 0.116 <= (b.x + b.width / 2) / task.width <= 0.859
-            and 0.697 <= (b.y + b.height / 2) / task.height <= 0.878
-            and len(b.name.strip()) > 1
-            and b.name not in ["确认", "返回", "跳过"]
-            and not any(kw in b.name for kw in _card_exclude_keywords)
-            and not ("攻" in b.name and len(b.name) <= 3)
-            and not re.search(r"\d+\s*/\s*\d+", b.name)  # 手牌数、血量这类「数字/数字」是 OCR 串进来的，不是卡牌
-        ]
-        if not cards:
+        candidates = _hand_select_candidates(task)
+        fresh = [c for c in candidates if c[0] not in tried and c[0] not in clicked]
+        if not fresh and candidates:
+            tried.clear()  # 全都试过一遍：重来（到时候还不行只能靠卡住兜底收尾）
+            fresh = [c for c in candidates if c[0] not in clicked]
+        if not fresh:
             task.log_info("手牌区域未找到卡牌，随机在手牌区域内点击一个位置")
             rx = random.uniform(0.216, 0.759)
             ry = random.uniform(0.697, 0.878)
             _move_and_click(task, rx, ry)
+            clicked.append((round(rx * 10), round(ry * 10)))
             selected += 1
             task.sleep(1)
             continue
-        chosen = random.choice(cards)
-        task.log_info(f"选择手牌: {chosen.name}")
-        task.click_box(chosen)
+        key, label, (px, py) = random.choice(fresh)
+        clicked.append(key)
+        task.log_info(f"选择手牌: {label}")
+        _move_and_click(task, px, py)
         selected += 1
         task.sleep(1)
 
     if selected > 0:
+        task._hand_select_pending = clicked
         task.log_info(f"已完成选择，点击确认")
         _move_and_click(task, 0.934, 0.883)
         task.sleep(1)
