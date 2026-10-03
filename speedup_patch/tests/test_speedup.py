@@ -688,7 +688,7 @@ def main():
     check("长按时长不被缩短", held >= 2.0, f"按住 {held:.2f}s")
     check("松开后等待补足", after_up >= 1.0, f"{after_up:.2f}s")
 
-    # 战斗中检测间隔保持 1 秒，非战斗 0.3 秒
+    # 战斗中按战斗间隔（speedup._BATTLE_INTERVAL），非战斗 0.3 秒
     world, task = make("BATTLE", {}, [handle_battle_auto_check])
     run_loop(task, 0.5)
     battle_interval = task.trigger_interval
@@ -696,7 +696,7 @@ def main():
     utils_chaos.PAGE_HANDLERS[:] = [handle_page_b, handle_battle_auto_check]
     world.page = "B"
     run_loop(task, 1.2)
-    check("战斗/非战斗检测间隔", battle_interval == 1.0 and task.trigger_interval == 0.3,
+    check("战斗/非战斗检测间隔", battle_interval == speedup._BATTLE_INTERVAL and task.trigger_interval == 0.3,
           f"战斗 {battle_interval}s，非战斗 {task.trigger_interval}s")
 
     # 出击模式：处理函数列表取自 utils_sortie，闸门与检测间隔同样生效
@@ -713,7 +713,7 @@ def main():
     utils_sortie.PAGE_HANDLERS[:] = [handle_page_b, handle_battle_page]
     world.page = "B"
     run_loop(task, 1.2)
-    check("出击模式：战斗中检测间隔保持 1 秒", battle_interval == 1.0 and task.trigger_interval == 0.3,
+    check("出击模式：战斗中按战斗间隔", battle_interval == speedup._BATTLE_INTERVAL and task.trigger_interval == 0.3,
           f"战斗 {battle_interval}s，非战斗 {task.trigger_interval}s")
 
     # run() 结构与预期不符（例如作者改版）：自动停用闸门，其余优化照常
@@ -935,7 +935,7 @@ def main():
     popup_play, popup_world, _ = play_card(True, popup=True)
     check("出牌后弹出“请选择功能”：不再干等，马上交给下一轮处理",
           popup_play < 1.2 and [key for _, key in popup_world.keys] == ["4", "enter"]
-          and popup_world.task.trigger_interval == 0.3 and world.task.trigger_interval == 1.0,
+          and popup_world.task.trigger_interval == 0.3 and world.task.trigger_interval == speedup._BATTLE_INTERVAL,
           f"出牌到结束 {popup_play:.2f}s（原 3 秒），按键 {[key for _, key in popup_world.keys]}，"
           f"下一轮间隔 {popup_world.task.trigger_interval}s（普通出牌后 {world.task.trigger_interval}s）")
     fallback_original, _, _ = play_card(False, handler=handle_battle_fallback)

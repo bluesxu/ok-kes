@@ -75,9 +75,9 @@ _BUTTON_GONE_LIMIT = 30     # 「结束回合」按钮消失这么多秒还没�
 _DRAG_FAIL_LIMIT = 2        # 拖动连续这么多次没打出去，本场改用按键 + 回车打默认目标
 _TURN_FAIL_LIMIT = 3        # 同一张牌一回合里不论按键、拖动、拖动重试，总共这么多次没打出去就不再出它（兜底，防止换着法子一直试）
 _KEYS_DEAD_CARDS = 2        # 这么多张不同的牌按键没打出去、拖动打出去了，才算键盘失效（单张牌常是自身原因）
-_DRAG_STEPS = 12            # 后台拖动中途发几次鼠标移动
-_DRAG_STEP_INTERVAL = 0.02
-_DRAG_HOVER = 0.3           # 拖到目标上停多久再松手，让游戏锁定目标
+_DRAG_STEPS = 8             # 后台拖动中途发几次鼠标移动（原 12）
+_DRAG_STEP_INTERVAL = 0.015
+_DRAG_HOVER = 0.15          # 拖到目标上停多久再松手，让游戏锁定目标（原 0.3）
 # 实跑 17:59~18:45：游戏不再理会后台发的按键（数字键出牌、E 都没反应），鼠标拖动、点击照常有效，卡了 45 分钟。
 # 按键出牌没打出去时先拖动再试一次，拖动打出去了就认定本场键盘失效，之后出牌、结束回合都用鼠标
 _FIELD_DROP = (0.5, 0.45)   # 不用选目标的牌拖到场地中间松手
@@ -101,8 +101,8 @@ _AP_ZERO_GRAY = 0.3         # 剩余费用数字区域灰色像素超过这个�
 # 出牌前比截图也常误报变化 10%~26%
 _COUNT_BOX = (0.470, 0.950, 0.560, 0.995)  # 手牌数「N/10」
 _COUNT_TEXT = re.compile(r"(\d+)\s*/\s*1[0O]")
-_SETTLE_MIN = 1.0           # 出牌后至少等这么久（原来固定等 1 秒）
-_SETTLE_STABLE = 0.6        # 手牌数连续这么久没变才算停稳
+_SETTLE_MIN = 0.6           # 出牌后至少等这么久（原 1.0；停稳与否主要看 _SETTLE_STABLE）
+_SETTLE_STABLE = 0.6        # 手牌数连续这么久没变才算停稳（实跑抽牌到手要 ~0.6 秒，不能再短）
 _SETTLE_MAX = 2.5           # 最多等这么久
 _SETTLE_POLL = 0.05         # 轮询粒度：调密只是更快发现“已停稳”，不改判定条件
 _SETTLE_MISSING = 3         # 连续几次读不到手牌数：多半弹出了选择页面，不再等
@@ -680,12 +680,17 @@ def collect_intent(task, enemy):
     frame = task.frame
     crop = _crop(frame, enemy["icon_region"]).copy()
     _move_and_click(task, *enemy["drop"])
-    task.sleep(0.8)
-    task.next_frame()
+    # 原逻辑固定等 0.8 秒等面板弹出：改为轮询到面板出现即继续，最长仍等 0.8 秒。
+    # 面板里读到「弱点」字样算已弹出（与下面关面板用的是同一个特征）
     x1, y1, x2, y2 = _PANEL_REGION
-    lines = []
-    for box in task.ocr(x1, y1, x2, y2):
-        lines.append((_normalize_text(box.name), (box.y + box.height / 2) / task.height))
+    deadline = time.time() + 0.8
+    while True:
+        task.sleep(0.05)
+        task.next_frame()
+        lines = [(_normalize_text(box.name), (box.y + box.height / 2) / task.height)
+                 for box in task.ocr(x1, y1, x2, y2)]
+        if any(_WEAKNESS.search(text) for text, _ in lines) or time.time() >= deadline:
+            break
     lines.sort(key=lambda item: item[1])
     result = classify_intent_panel(lines)
     acted = result is None and any("已行动" in text or "行动完成" in text for text, _ in lines)
