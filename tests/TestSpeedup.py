@@ -819,7 +819,7 @@ class TestSpeedup(unittest.TestCase):
     def test_trigger_interval_in_battle_and_navigation(self):
         game, task = self.make("BATTLE", {}, [handle_battle_auto_check])
         run_executor(task, 0.5)
-        self.assertEqual(1.0, task.trigger_interval)
+        self.assertEqual(speedup._BATTLE_INTERVAL, task.trigger_interval)
         utils_chaos.PAGE_HANDLERS[:] = [handle_page_b, handle_battle_auto_check]
         game.page = "B"
         run_executor(task, 1.2)
@@ -1072,7 +1072,7 @@ class TestSpeedup(unittest.TestCase):
         self.assertLess(fast, 1.2)
         self.assertGreaterEqual(enter - digit, CARD_RAISE)  # 卡牌上滑到位后才回车
         self.assertEqual(4, game.hand)
-        self.assertEqual(1.0, task.trigger_interval)  # 仍在战斗中：检测间隔保持 1 秒
+        self.assertEqual(speedup._BATTLE_INTERVAL, task.trigger_interval)  # 仍在战斗中：按战斗间隔
 
     def test_card_play_without_response_waits_original_time(self):
         elapsed, game, _ = self.play_card(True, raise_card=False, play_works=False)
@@ -1139,6 +1139,64 @@ class TestEndTurnGate(unittest.TestCase):
         self.assertFalse(allowed)  # 第一轮只记下时间
         st["end_turn_seen"] -= 1.0
         self.assertTrue(speedup._end_turn_allowed(SimpleNamespace(log_info=lambda m: None), st))
+
+
+class TestPrefetchMatches(unittest.TestCase):
+    """单例匹配预取：首次调用把整批在同一帧上并行跑完，其余调用查缓存；区域/阈值不匹配的照走原逻辑。"""
+
+    class _Task:
+        width, height = 2000, 1000
+
+        def __init__(self):
+            self.executor = SimpleNamespace(frame=object())
+            self.calls = []
+
+        def box_of_screen(self, x, y, to_x, to_y):
+            return SimpleNamespace(x=x * self.width, y=y * self.height,
+                                   width=(to_x - x) * self.width, height=(to_y - y) * self.height)
+
+        def find_feature(self, feature_name=None, box=None, threshold=0, frame=None):
+            self.calls.append(feature_name)
+            return [Box(feature_name, 10, 10)] if feature_name == "rest" else []
+
+    def position_kwargs(self, task):
+        return {"box": task.box_of_screen(0.335, 0.568, 0.453, 0.751), "threshold": 0}
+
+    def test_first_call_prefetches_whole_list_and_second_uses_cache(self):
+        task = self._Task()
+        st = {}
+        hit = speedup._prefetch_hit(task, st, task.find_feature, "position", self.position_kwargs(task))
+        self.assertEqual([], hit)
+        self.assertEqual(sorted(n for n, _, _ in speedup._PREFETCH_MATCHES), sorted(task.calls))  # 整批都跑了
+        task.find_feature = lambda **kwargs: self.fail("第二次调用不应重新匹配")
+        rest = speedup._prefetch_hit(task, st, task.find_feature, "rest",
+                                     {"box": task.box_of_screen(0.157, 0.503, 0.467, 0.863), "threshold": 0})
+        self.assertEqual(["rest"], [b.name for b in rest])
+
+    def test_mismatched_region_returns_none(self):
+        task = self._Task()
+        hit = speedup._prefetch_hit(task, {}, task.find_feature, "position",
+                                    {"box": task.box_of_screen(0.1, 0.1, 0.2, 0.2), "threshold": 0})
+        self.assertIsNone(hit)
+        self.assertEqual([], task.calls)  # 区域对不上：没触发预取
+
+    def test_list_names_merge_results(self):
+        task = self._Task()
+        hit = speedup._prefetch_hit(task, {}, task.find_feature, ["memberinfo", "memberinfo2"],
+                                    {"box": task.box_of_screen(0.005, 0.018, 0.080, 0.343), "threshold": 0})
+        self.assertEqual([], hit)
+        self.assertIn("memberinfo", task.calls)
+        self.assertIn("memberinfo2", task.calls)
+
+    def test_new_frame_refreshes_prefetch(self):
+        task = self._Task()
+        st = {}
+        speedup._prefetch_hit(task, st, task.find_feature, "position", self.position_kwargs(task))
+        first = len(task.calls)
+        task.executor.frame = object()  # 新的一帧
+        speedup._prefetch_hit(task, st, task.find_feature, "rest",
+                              {"box": task.box_of_screen(0.157, 0.503, 0.467, 0.863), "threshold": 0})
+        self.assertEqual(len(task.calls), first * 2)  # 新帧要重新预取整批
 
 
 if __name__ == '__main__':

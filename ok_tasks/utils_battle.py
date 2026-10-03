@@ -104,7 +104,7 @@ _COUNT_TEXT = re.compile(r"(\d+)\s*/\s*1[0O]")
 _SETTLE_MIN = 1.0           # 出牌后至少等这么久（原来固定等 1 秒）
 _SETTLE_STABLE = 0.6        # 手牌数连续这么久没变才算停稳
 _SETTLE_MAX = 2.5           # 最多等这么久
-_SETTLE_POLL = 0.15
+_SETTLE_POLL = 0.05         # 轮询粒度：调密只是更快发现“已停稳”，不改判定条件
 _SETTLE_MISSING = 3         # 连续几次读不到手牌数：多半弹出了选择页面，不再等
 _STALE_LIMIT = 2            # 出牌前发现手牌数变了，最多连续重读几次，之后照常出牌
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="出牌识别")  # 几块区域的裁剪识别并行跑

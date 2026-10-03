@@ -85,7 +85,7 @@ _SAME_PAGE = 0.6        # 与点击前文字布局相似度 >= 0.6 视为页面�
 _STABLE = 0.75          # 相邻两次识别相似度 >= 0.75 视为文字已稳定
 _BUTTON_TOLERANCE = 0.02
 _GATE_INTERVAL = 0.05   # 闸门等待期间尽快再识别
-_BATTLE_INTERVAL = 1.0  # 战斗中保持原版 1 秒，避免多占 CPU
+_BATTLE_INTERVAL = 0.5  # 战斗中帧间隔：原版 1 秒；0.5 让回合边界（「结束回合」按钮回来/敌人行动完）发现更快，CPU 略升
 _STATS_EVERY = 30
 _EXPECTED_RUN_SOURCE = (
     "self.all_texts = _simplify_texts(self.ocr())",
@@ -108,8 +108,21 @@ _PARALLEL_GROUPS = (
     ("kalei_in_map", "shop_in_map", "seal_in_map", "hard_in_map"),  # 小地图特殊标记（阈值 0.65）
     ("attack_in_deck", "skill_in_deck", "enhance_in_deck", "hex_in_deck", "hex_in_deck_tw"),  # 牌库卡牌类型
     ("attack", "skill", "enhance", "hex", "abnormal"),  # 选卡页卡牌类型
+    ("event1", "event2", "event3", "event4", "event5", "event6", "event7", "event8"),  # 事件选项（阈值 0.70）
 )
 _GROUP_OF = {name: group for group in _PARALLEL_GROUPS for name in group}
+# 单例匹配预取：这些特征分散在不同处理函数的开头、各有各的固定区域，几乎每帧都会被串行查到（合计 ~60-90ms）。
+# 第一次查到其中任意一个时，把整批在同一帧上并行跑完，其余调用查预取结果；区域/阈值对不上的调用照走原逻辑。
+_PREFETCH_MATCHES = (
+    ("position", (0.335, 0.568, 0.453, 0.751), 0),             # handle_route_selection: 路线页的当前位置图标
+    ("memberinfo", (0.005, 0.018, 0.080, 0.343), 0),           # handle_archive_target_member: 主战员头像
+    ("memberinfo2", (0.005, 0.018, 0.080, 0.343), 0),
+    ("flash_in_sortie_safezoom", (0.702, 0.347, 0.963, 0.713), 0),  # 休息区闪光
+    ("rest", (0.157, 0.503, 0.467, 0.863), 0),                 # 休息区
+    ("finishturn", (0.844, 0.782, 0.998, 0.990), 0),           # 结束回合按钮
+    ("minimizemap", None, 0),                                  # 小地图（全屏）
+)
+_PREFETCH_OF = {name: (box, threshold) for name, box, threshold in _PREFETCH_MATCHES}
 _PREFETCH_KWARGS = {"feature_name", "box", "threshold"}
 _match_pool = None
 _ROUTE_TOLERANCE = 3        # 路线图标两次识别位置相差不超过 3 像素视为已停止入场动画
@@ -307,6 +320,10 @@ def install(task):
 
     def find_feature(*args, **kwargs):
         name = kwargs.get("feature_name")
+        if not args and st["active"] and set(kwargs) <= _PREFETCH_KWARGS:
+            hit = _prefetch_hit(task, st, orig["find_feature"], name, kwargs)
+            if hit is not None:
+                return hit
         group = _GROUP_OF.get(name) if isinstance(name, str) else None
         if group is None or args or not st["active"] or not set(kwargs) <= _PREFETCH_KWARGS:
             return orig["find_feature"](*args, **kwargs)
@@ -334,7 +351,7 @@ def install(task):
         enabled = _enabled(task)
         st.update(active=enabled, in_run=enabled, in_action=False, owed_until=0.0, actions=0,
                   moved=False, held=False, hit=None, action_sig=None, action_box=None, match_cache=None,
-                  pay_hook=None, battle_play=False, battle_left=False, gated=False)
+                  prefetch_cache=None, pay_hook=None, battle_play=False, battle_left=False, gated=False)
         if not enabled:
             st.update(gate=None, prev_sig=None, battle=False)
             task.trigger_interval = 1
@@ -540,6 +557,56 @@ def _wrap_executor_next_frame(executor):
 def _match_group(find_feature, group, frame, common):
     futures = {n: _pool().submit(find_feature, feature_name=n, frame=frame, **common) for n in group}
     return {n: f.result() for n, f in futures.items()}
+
+
+def _box_matches(task, box, rel):
+    """调用点的 box 与预取清单里的相对区域是否一致（±1px）；rel 为 None 表示全屏（box 也要为 None）。"""
+    if rel is None:
+        return box is None
+    if box is None or isinstance(box, str):
+        return False
+    expected = (rel[0] * task.width, rel[1] * task.height,
+                (rel[2] - rel[0]) * task.width, (rel[3] - rel[1]) * task.height)
+    return all(abs(getattr(box, attr, -1e9) - value) <= 1
+               for attr, value in zip(("x", "y", "width", "height"), expected))
+
+
+def _prefetch_matches(task, find_feature, frame):
+    """把单例清单（各自固定的区域/阈值）在同一帧上并行跑一遍。"""
+    futures = {}
+    for name, (rel, threshold) in _PREFETCH_OF.items():
+        kwargs = {"feature_name": name, "frame": frame, "threshold": threshold}
+        if rel is not None:
+            kwargs["box"] = task.box_of_screen(*rel)
+        futures[name] = _pool().submit(find_feature, **kwargs)
+    return {name: f.result() for name, f in futures.items()}
+
+
+def _prefetch_hit(task, st, find_feature, name, kwargs):
+    """name 命中单例预取清单且区域/阈值一致时，用本帧的批量预取结果回答；否则返回 None 走原逻辑。
+    列表名（如 ["memberinfo", "memberinfo2"]）全部命中时合并返回，调用方 find_one 自己取最优。"""
+    names = [name] if isinstance(name, str) else list(name) if isinstance(name, list) else None
+    if not names or any(n not in _PREFETCH_OF for n in names):
+        return None
+    threshold = kwargs.get("threshold", 0)
+    box = kwargs.get("box")
+    for n in names:
+        rel, spec_threshold = _PREFETCH_OF[n]
+        if threshold != spec_threshold or not _box_matches(task, box, rel):
+            return None
+    frame = task.executor.frame
+    if frame is None:
+        return None
+    cache = st.get("prefetch_cache")
+    if cache is None or cache["frame"] is not frame:
+        cache = {"frame": frame, "results": _prefetch_matches(task, find_feature, frame)}
+        st["prefetch_cache"] = cache
+    if isinstance(name, str):
+        return list(cache["results"].get(name) or [])
+    merged = []
+    for n in names:
+        merged += list(cache["results"].get(n) or [])
+    return merged
 
 
 def _icon_positions(results):
