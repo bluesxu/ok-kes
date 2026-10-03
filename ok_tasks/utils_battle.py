@@ -57,11 +57,19 @@ _NUMBER = re.compile(r"^\d{1,6}$")
 _ICON_THRESHOLD = 0.45     # 白色笔画重合度：已收集的图标里不同类别之间最高 0.31
 _GLYPH_FRAC = 0.75
 _GLYPH_MIN_PIXELS = 30
+# ---- 0 费字形 ----
+# 费用是 0 时游戏把「0」画成空心的圆角方框（1/2/3 都是实心笔画），OCR 读不出来，只能按形状认
+_ZERO_BLUR = 12            # 找白描边时的模糊半径：笔画比周围亮，用局部对比才分得出压在卡面上的描边
+_ZERO_CONTRAST = 25        # 描边要比周围亮这么多
+_ZERO_HOLE = 0.25          # 中间空心占外接矩形的比例（实心数字没有洞，实测 0.32~0.42）
+_ZERO_FILL = 0.7           # 描边围成的形状几乎填满外接矩形
+_ZERO_SOLID = 0.85         # 与凸包的填充率（卡面干扰会让描边有缺口）
 _AP_SHORT = re.compile(r"AP\s*不足", re.IGNORECASE)
 # 牌名里带这些字的非攻击牌算保命牌（加护盾、回血）
 _SHIELD_WORDS = ("盾", "格挡", "壁", "屏障", "防御", "防护", "守护")
 _DEFENSE_WORDS = _SHIELD_WORDS + ("治", "愈", "疗", "恢复", "回复", "再生", "包扎")
 _EXTRA_WAIT_CARDS = ("极光", "万众英雄")  # 打出后动画较长，沿用原逻辑额外等 2 秒
+_PROBE_LIMIT = 2            # AP 用完时试读不到费用的牌，连着几个回合都出不掉才认定它要花 AP（见 _check_last_play）
 _STUCK_LIMIT = 3            # 同一张牌连续这么多次还在手里（又没提示 AP不足），本回合不再出它
 _BUTTON_GONE_LIMIT = 30     # 「结束回合」按钮消失这么多秒还没回来，就不再当作敌人行动中干等
 _DRAG_FAIL_LIMIT = 2        # 拖动连续这么多次没打出去，本场改用按键 + 回车打默认目标
@@ -168,6 +176,52 @@ def _read_digit(task, frame, region, pattern=_DIGITS, votes=1):
         if readings.count(value) >= votes:
             return value
     return None
+
+
+def _strokes(image):
+    """比周围亮的白描边：卡面颜色深浅不一，固定亮度阈值在浅色卡面上会把整块卡面都算成笔画。"""
+    sharp = image - cv2.GaussianBlur(image, (0, 0), _ZERO_BLUR)
+    strokes = (sharp > _ZERO_CONTRAST).astype(np.uint8) * 255
+    return cv2.morphologyEx(strokes, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+
+def _has_empty_box(strokes):
+    """笔画图里有没有一个空心的方框：外轮廓接近正方形、几乎填满外接矩形、中间一大块空心。"""
+    height, width = strokes.shape[:2]
+    contours, hierarchy = cv2.findContours(strokes, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return False
+    for index, contour in enumerate(contours):
+        if hierarchy[0][index][3] != -1:  # 只看外轮廓
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        if not (0.2 * width <= w <= 0.95 * width and 0.25 * height <= h <= 0.95 * height):
+            continue
+        if not 0.55 <= w / h <= 1.7:
+            continue
+        hole = 0
+        child = hierarchy[0][index][2]
+        while child != -1:
+            hole += cv2.contourArea(contours[child])
+            child = hierarchy[0][child][0]
+        area, hull = cv2.contourArea(contour), cv2.contourArea(cv2.convexHull(contour))
+        if hull <= 0 or hole / (w * h) < _ZERO_HOLE or area / (w * h) < _ZERO_FILL:
+            continue
+        if area / hull >= _ZERO_SOLID:
+            return True
+    return False
+
+
+def _looks_like_zero(crop):
+    """这张牌的费用是不是 0：游戏里「0」写成空心的圆角方框，OCR 读不出这个方框（1/2/3 都读得出来）。
+    灰度和「白度」（亮度高、饱和度低）两个通道各试一次：浅蓝色卡面上的白描边在灰度里几乎看不见，
+    在白度里分得开；深色卡面上的白框又只有灰度认得出（实测 238 块手牌费用，两个通道合起来误判 0 块）。"""
+    if crop is None or crop.size == 0:
+        return False
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV).astype(np.float32)
+    whiteness = hsv[:, :, 2] * (255.0 - hsv[:, :, 1]) / 255.0
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    return _has_empty_box(_strokes(gray)) or _has_empty_box(_strokes(whiteness))
 
 
 def read_remaining_cost(task, frame):
@@ -449,6 +503,8 @@ def _card_cost(task, frame, card):
     dx1, dy1, dx2, dy2 = _CARD_COST_BOX
     region = (card["x"] + dx1, card["y"] + dy1, card["x"] + dx2, card["y"] + dy2)
     cost = _read_digit(task, frame, region, _ONE_DIGIT, votes=2)
+    if cost is None and _looks_like_zero(_crop(frame, region)):
+        return 0  # 读不到数字又画着空心方框：0 费（1 费以上都读得出数字）
     return cost if cost is not None else card.get("cost_hint")
 
 
@@ -715,7 +771,8 @@ def is_shield(card):
 
 def choose_play(cards, remaining, priority, defense, danger, unplayable, zero_hp=False):
     """挑这一次要出的牌。cards 为 [{name, key, type, cost}]，cost 读不到为 None；remaining 读不到为 None。
-    unplayable 里是本回合出不起的牌名或位置（「按键/手牌数」）。返回 (牌, 理由)；没有能出的牌时返回 (None, 理由)。
+    unplayable 里是本回合出不起的牌名或位置（「按键/手牌数」）；AP 用完时调用方会把这一场试过、出不掉的
+    牌名也放进来，那些牌不再试。返回 (牌, 理由)；没有能出的牌时返回 (None, 理由)。
 
     顺序：崩溃牌 → 预计会被打死或血量过低（danger）时先出防御牌 → 「出牌优先级」里的牌（按列表顺序）→ 0 费牌 → 强化牌 → 攻击牌 → 技能/防御/其余牌。
     「出牌优先级」里的牌不看类型：类型常被读错（实跑中「破碎」读不出类型，排到了其余牌里，被普通攻击牌抢先）。
@@ -727,7 +784,10 @@ def choose_play(cards, remaining, priority, defense, danger, unplayable, zero_hp
         if remaining is None:
             return True
         if card["cost"] is None:
-            return remaining > 0  # 读不到费用：还有费用就试着出，出不去时会被记为出不起
+            # 读不到费用：试着出，出不去时会被记为出不起。AP 用完时也试——0 费牌不花 AP，
+            # 而「0」在游戏里是空心方框、OCR 读不出来（形状也没认出来时），不出就白白结束回合。
+            # 调用方在 AP 用完时会把这一场试过、出不掉的牌名放进 unplayable，不会反复试
+            return True
         return card["cost"] <= remaining
 
     def pick(group, reason):
@@ -893,6 +953,8 @@ def start_battle(task):
     state.clear()
     _new_turn(state)
     state.update(sticky=None, drag_fail={}, last_remaining=None, last_seen=time.time(), zero_frames=0)
+    state["not_zero"] = set()  # AP 用完时试过、确认要花 AP 的牌名，这一场不再试（见 play_turn）
+    state["probe_fails"] = {}  # 上面那些牌各自试失败了几次
     session = _session(task)
     session.update(drag_disabled=False, drag_fail=0)
     state["key_fail_cards"] = set()  # 本场按键没打出去、拖动打出去了的牌，见 _KEYS_DEAD_CARDS
@@ -988,6 +1050,14 @@ def _check_last_play(task, state, hand_count, remaining):
     if not played and fails[last["slot"]] >= limit:
         by_name = _short_of_ap(last)
         _mark_unplayable(state, last, by_name=by_name)
+        if last.get("remaining") == 0 and by_name:
+            # AP 用完时试过、出不掉：这张牌要花 AP。连着一回合各一次都出不掉才不再试——只失败一次可能是
+            # 打出去了没看出来（定位雷射击破后回到手牌，手牌数和 AP 都不变）
+            name = last["name"] if not last["name"].startswith("未识别") else last["slot"]
+            probe_fails = state.setdefault("probe_fails", {})
+            probe_fails[name] = probe_fails.get(name, 0) + 1
+            if probe_fails[name] >= _PROBE_LIMIT:
+                state.setdefault("not_zero", set()).add(name)
         battle_log.anomaly(task, "出不掉牌", f"「{last['name']}」{last['method']}出牌 {limit} 次没打出去，"
                            + ("本回合不再出它" if by_name else "费用够，只跳过这个位置，同名牌照样出"))
 
@@ -1205,7 +1275,12 @@ def play_turn(task, hand_count, finish_turn_visible):
         lethal, after = incoming_lethal(task)  # 只有手里有防御牌时才值得花时间读预计扣血
     danger = lethal or in_danger(hp, after, _get_config_value(task, DANGER_KEY, 25))
 
-    card, reason = choose_play(cards, remaining, priority, defense, danger, state["unplayable"], zero_hp=zero_hp)
+    # AP 用完时，费用读不到的牌也要挑一张试试：0 费牌不花 AP，读不出费用（「0」是空心方框）的 0 费牌
+    # 不出的话，手里留着一堆 0 费牌就结束回合了。试过、出不掉的牌名记在 not_zero 里，这一场不再重复试。
+    blocked = state["unplayable"]
+    if remaining == 0:
+        blocked = blocked | state.setdefault("not_zero", set())
+    card, reason = choose_play(cards, remaining, priority, defense, danger, blocked, zero_hp=zero_hp)
     observed = {
         "hand_count": hand_count, "remaining": remaining, "hp": hp, "shield": read_shield(task),
         "hp_after_ratio": round(after, 3), "lethal": lethal, "danger": danger, "zero_hp": zero_hp,

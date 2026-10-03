@@ -263,12 +263,35 @@ class TestChoosePlay(unittest.TestCase):
         cards = [card("破碎", 2, "攻击"), card("冰壁", 2, "技能", key="2")]
         self.assertEqual("冰壁", battle.choose_play(cards, 2, ["破碎"], [], True, set())[0]["name"])
 
-    def test_unknown_cost_is_tried_but_not_when_no_cost_left(self):
+    def test_zero_cost_read_from_empty_box(self):
+        """0 费的「0」在游戏里画成空心方框，OCR 读不出来，按形状认（实跑 21:34：手里好几张定位雷射
+        读不到费用，AP 用完后一张不出就结束了回合）。1/2/3 都是实心笔画，不许认成 0 费。"""
+        zeros = 0
+        for name, truth in TRUTH.items():
+            task = screenshot_task(name)
+            for card in battle.read_hand(task, truth["hand"]):
+                true_cost = truth["cards"][card["key"]][1]
+                if true_cost is None or card["y"] is None:
+                    continue
+                cost = battle._card_cost(task, task.frame, card)
+                label = f"{name} 按键 {card['key']}「{card['name']}」"
+                if true_cost == 0:
+                    self.assertEqual(0, cost, label)
+                    zeros += 1
+                else:
+                    self.assertNotEqual(0, cost, f"{label} 是 {true_cost} 费，认成了 0 费")
+        self.assertGreaterEqual(zeros, 3)
+
+    def test_unknown_cost_is_tried_even_without_ap_left(self):
+        # 实跑 21:34：AP 用完时手里 4 张定位雷射（0 费）读不到费用，一张不出就结束了回合。
+        # 0 费牌不花 AP，所以没有费用时也要挑一张读不到费用的试试，出不掉时调用方会把它记进 unplayable
         cards = [card("未识别1", None)]
         self.assertIsNotNone(battle.choose_play(cards, 1, [], [], False, set())[0])
-        self.assertIsNone(battle.choose_play(cards, 0, [], [], False, set())[0])
+        self.assertIsNotNone(battle.choose_play(cards, 0, [], [], False, set())[0])
         cards[0]["slot"] = "1/1"
         self.assertIsNone(battle.choose_play(cards, 1, [], [], False, {"1/1"})[0])  # 这个位置提示过 AP不足
+        self.assertIsNone(battle.choose_play(cards, 0, [], [], False, {"1/1"})[0])  # 这一场试过、出不掉
+        self.assertIsNone(battle.choose_play([card("定位雷射", None)], 0, [], [], False, {"定位雷射"})[0])
         self.assertIsNotNone(battle.choose_play([card("孢子", 0)], 0, [], [], False, set())[0])  # 0 费照出
 
     def test_zero_hp_skips_shield_and_collapse(self):
@@ -516,12 +539,37 @@ class TestPlayTurn(unittest.TestCase):
         self.assertLess(clock[0], battle._SETTLE_MAX)
         self.assertEqual({"owed_until": 0.0, "pay_hook": None}, self.task._speedup)  # 已等过，加速模式不用再补
 
-    def test_lowered_hand_ends_turn_without_trying_cards(self):
+    def test_lowered_hand_means_no_ap_and_tries_unknown_cost(self):
+        # 手牌沉下去 = AP 用完（灰色的 0 读不出来）。这时读不到费用的牌仍要试一张：0 费牌不花 AP
         labels = [Box(700, 1260, 150, 40, name="基本攻击"), Box(1200, 1270, 100, 40, name="攻击")]
         self.task.all_texts = labels
         with mock.patch.object(battle, "read_remaining_cost", lambda task, frame: None):
             battle.play_turn(self.task, 2, True)
-        self.assertEqual(["e"], self.keys)  # 读不到费用的斗志、3 费的破碎都不试，直接结束回合
+        self.assertEqual(["1", "enter"], self.keys)
+
+    def test_lowered_hand_ends_turn_when_costs_known(self):
+        labels = [Box(700, 1260, 150, 40, name="基本攻击"), Box(1200, 1270, 100, 40, name="攻击")]
+        self.task.all_texts = labels
+        hand = [dict(card("斗志", 2, "技能", key="1"), x=0.4, y=None), dict(card("破碎", 3, "攻击", key="2"), x=0.5, y=None)]
+        with mock.patch.object(battle, "read_hand", lambda task, count: hand[:count]), \
+                mock.patch.object(battle, "read_remaining_cost", lambda task, frame: None):
+            battle.play_turn(self.task, 2, True)
+        self.assertEqual(["e"], self.keys)  # 2 费的斗志、3 费的破碎都出不起：结束回合
+
+    def test_unknown_cost_probed_until_proven_to_cost_ap(self):
+        # AP 用完时试读不到费用的牌：连着两个回合都出不掉才认定它要花 AP，这一场不再试
+        with mock.patch.object(battle, "read_remaining_cost", lambda task, frame: 0), \
+                mock.patch.object(battle, "_move_and_click", lambda task, x, y: None):
+            for _ in range(battle._PROBE_LIMIT):
+                self.keys.clear()
+                battle.play_turn(self.task, 1, True)      # 这一回合试一次
+                self.assertEqual(["1", "enter"], self.keys)
+                battle.play_turn(self.task, 1, True)      # 手牌数、AP 都没变：出不掉
+                battle._new_turn(self.task._battle)       # 新回合：出不起的记号复位
+            self.keys.clear()
+            self.assertIn("斗志", self.task._battle["not_zero"])
+            battle.play_turn(self.task, 1, True)          # 这一场不再试它，直接结束回合
+        self.assertEqual(["e"], self.keys)
 
     def test_ap_insufficient_marks_card(self):
         battle.play_turn(self.task, 1, True)
@@ -659,7 +707,9 @@ class TestPlayTurn(unittest.TestCase):
 
     def test_end_turn_clicks_button_when_e_ignored(self):
         clicks = []
-        with mock.patch.object(battle, "_move_and_click", lambda task, x, y: clicks.append((x, y))), \
+        hand = lambda task, count: [dict(card("破碎", 3, "攻击", key="1"), x=0.4, y=None)]  # 出不起，不试
+        with mock.patch.object(battle, "read_hand", hand), \
+                mock.patch.object(battle, "_move_and_click", lambda task, x, y: clicks.append((x, y))), \
                 mock.patch.object(battle, "read_remaining_cost", lambda task, frame: 0):
             for _ in range(battle._E_KEY_LIMIT):
                 battle.play_turn(self.task, 1, True)
