@@ -1,5 +1,6 @@
 # 自动出击模式出牌（ok_tasks/utils_battle.py）与战斗日志（ok_tasks/battle_log.py）测试
 # 识别部分用 tests/images/battle 下的真实战斗截图 + 真实 OCR；决策部分是纯函数测试
+import json
 import os
 import sys
 import tempfile
@@ -913,6 +914,63 @@ class TestBattleLogCleanup(unittest.TestCase):
             self.assertEqual(1, battle_log.cleanup(folder, keep_days=7, max_mb=10, now=now))  # 10 天前的
             self.assertEqual(1, battle_log.cleanup(folder, keep_days=7, max_mb=2, now=now))   # 超过 2MB 删最旧的
             self.assertEqual([False, False, True, True], [os.path.exists(p) for p in paths])
+
+    @staticmethod
+    def make_file(folder, rel, age_days, mb, now):
+        path = os.path.join(folder, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"x" * int(mb * 1024 * 1024))
+        os.utime(path, (now - age_days * 86400, now - age_days * 86400))
+        return path
+
+    def test_manual_scene_survives_age_and_size_cleanup(self):
+        # 手动标记的现场包不受保留天数/总大小清理影响，只能被新的手动标记顶掉
+        with tempfile.TemporaryDirectory() as folder:
+            now = time.time()
+            manual = self.make_file(folder, os.path.join("现场", "20261003-160626_自动出击模式_手动标记", "timeline.jsonl"),
+                                    30, 1, now)
+            auto = self.make_file(folder, os.path.join("现场", "20261003-170330_自动出击模式_出不掉牌", "timeline.jsonl"),
+                                  30, 1, now)
+            log = self.make_file(folder, "战斗记录.jsonl", 30, 1, now)
+            self.assertEqual(2, battle_log.cleanup(folder, keep_days=7, max_mb=10, now=now))
+            self.assertTrue(os.path.exists(manual))
+            self.assertFalse(os.path.exists(auto))
+            self.assertFalse(os.path.exists(log))
+
+    def test_new_manual_scene_evicts_oldest_manual_over_size(self):
+        # 清完其余文件仍超限：从最旧的手动标记删起（新的手动标记把旧的顶掉）
+        with tempfile.TemporaryDirectory() as folder:
+            now = time.time()
+            old = self.make_file(folder, os.path.join("现场", "20261001-100000_自动出击模式_手动标记", "a.jsonl"),
+                                 2, 4, now)
+            new = self.make_file(folder, os.path.join("现场", "20261003-160626_自动出击模式_手动标记", "b.jsonl"),
+                                 1, 4, now)
+            auto = self.make_file(folder, os.path.join("现场", "20261003-170330_自动出击模式_出不掉牌", "c.jsonl"),
+                                  1, 1, now)
+            self.assertEqual(2, battle_log.cleanup(folder, keep_days=7, max_mb=5, now=now))
+            self.assertFalse(os.path.exists(auto))  # 自动的先删
+            self.assertFalse(os.path.exists(old))   # 仍超限：最旧的手动标记被新的顶掉
+            self.assertTrue(os.path.exists(new))
+
+    def test_manual_mark_merged_into_auto_scene_is_kept(self):
+        # 自动异常先触发录制时，手动标记并入那个包、目录名还是自动的：按 meta 里的触发同样豁免清理
+        with tempfile.TemporaryDirectory() as folder:
+            now = time.time()
+            scene = os.path.join(folder, "现场", "20261003-161634_自动出击模式_出不掉牌")
+            meta = self.make_file(folder, os.path.join("现场", "20261003-161634_自动出击模式_出不掉牌", "meta.json"),
+                                  30, 0.001, now)
+            with open(meta, "w", encoding="utf-8") as f:
+                json.dump({"triggers": [{"kind": "出不掉牌"}, {"kind": "手动标记", "note": "点错牌了"}]}, f)
+            data = self.make_file(folder, os.path.join("现场", "20261003-161634_自动出击模式_出不掉牌", "timeline.jsonl"),
+                                  30, 1, now)
+            auto = self.make_file(folder, os.path.join("现场", "20261003-170330_自动出击模式_出不掉牌", "d.jsonl"),
+                                  30, 1, now)
+            self.assertEqual(1, battle_log.cleanup(folder, keep_days=7, max_mb=10, now=now))
+            self.assertTrue(os.path.exists(data))   # 含手动标记的包留下
+            self.assertTrue(os.path.exists(meta))
+            self.assertFalse(os.path.exists(auto))  # 纯自动包照删
+            self.assertTrue(os.path.isdir(scene))
 
 
 class TestBattleLogEvents(unittest.TestCase):

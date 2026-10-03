@@ -6,6 +6,7 @@
 - 只在真正点下去的那一刻记一条决定，没点的帧不记。
 - 异常截图存到 battle_logs/截图/，JPG 质量 80；同一种异常每场战斗（卡厄思模式为每轮）最多截 1 张。
 - 清理：超过保留天数的文件删除；总大小超过上限时从最旧的删起。任务启动时清一次，运行中每小时清一次。
+  手动标记的现场包（battle_logs/现场/*_手动标记/）不参与常规清理，只在清完其余文件仍超上限时从最旧的手动包删起。
 
 注意：本文件不能定义顶层类，框架会把 ok_tasks 下含类的 .py 当作任务加载。
 """
@@ -289,9 +290,12 @@ def maybe_cleanup(task, force=False):
 
 
 def cleanup(folder, keep_days, max_mb, now=None):
-    """删除 folder 下超过 keep_days 天的文件；总大小仍超过 max_mb 时从最旧的删起。返回删除的文件数。"""
+    """删除 folder 下超过 keep_days 天的文件；总大小仍超过 max_mb 时从最旧的删起。返回删除的文件数。
+    含手动标记的现场包例外：自动清理不动它（不然超天数/超大小就被删了），
+    只有先清完其余文件仍超限时，才从最旧的手动包删起（手动标记只能被新的手动标记顶掉）。"""
     now = time.time() if now is None else now
-    files = []
+    manual_dirs = _manual_scene_dirs(folder)
+    files, manual = [], []
     for root, _, names in os.walk(folder):
         for name in names:
             path = os.path.join(root, name)
@@ -299,10 +303,13 @@ def cleanup(folder, keep_days, max_mb, now=None):
                 stat = os.stat(path)
             except OSError:
                 continue
-            files.append((stat.st_mtime, stat.st_size, path))
+            (manual if _in_manual_scene(path, manual_dirs) else files).append(
+                (stat.st_mtime, stat.st_size, path))
     files.sort()
-    removed, total = 0, sum(size for _, size, _ in files)
+    manual.sort()
     limit = max_mb * 1024 * 1024
+    removed = 0
+    total = sum(size for _, size, _ in files) + sum(size for _, size, _ in manual)
     for mtime, size, path in files:
         if now - mtime <= keep_days * 86400 and total <= limit:
             break
@@ -312,4 +319,36 @@ def cleanup(folder, keep_days, max_mb, now=None):
             continue
         removed += 1
         total -= size
+    for _, size, path in manual:  # 其余文件都清完还超限：从最旧的手动标记删起
+        if total <= limit:
+            break
+        try:
+            os.remove(path)
+        except OSError:
+            continue
+        removed += 1
+        total -= size
     return removed
+
+
+def _manual_scene_dirs(folder):
+    """folder 下含手动标记的现场包目录：包里的 meta.json 触发里记着手动标记就算
+    （自动异常先触发录制时，手动标记会并入那个包，目录名还是自动的）。"""
+    out = set()
+    for root, _, names in os.walk(folder):
+        if "meta.json" not in names:
+            continue
+        try:
+            with open(os.path.join(root, "meta.json"), encoding="utf-8") as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if any((t or {}).get("kind") == "手动标记" for t in meta.get("triggers") or []):
+            out.add(root)
+    return out
+
+
+def _in_manual_scene(path, manual_dirs):
+    """路径是否属于含手动标记的现场包（目录名以「_手动标记」结尾，或在手工标记包的目录里）。"""
+    return (any(part.endswith("_手动标记") for part in path.split(os.sep))
+            or any(path.startswith(d + os.sep) for d in manual_dirs))
