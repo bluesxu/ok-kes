@@ -2630,12 +2630,16 @@ def _pixel_rgb(task: TriggerTask, point):
 
 def _quality_from_rgb(rgb):
     """按底色判断品质：灰暗没有颜色返回 ""，蓝稀有、紫独特、橙传说，其余颜色认不出返回 None。
-    实跑读数：稀有 (72, 89, 160)、传说 (165, 110, 86)、独特 (136, 96, 184)。"""
+    实跑读数：稀有 (72, 89, 160)、传说 (165, 110, 86)、独特 (136, 96, 184)；成员装备格上的紫更暗，
+    实测 (135, 82, 163)——蓝只比红多 28，单靠「蓝>红+30」读不出来（10/03 之前「独特」一次都没读出过），
+    所以紫单独判：红蓝都明显高于绿、且蓝多于红。"""
     red, green, blue = rgb
     if max(rgb) - min(rgb) < 30:
         return ""
+    if red > green + 15 and blue > green + 30 and blue > red:
+        return "独特"
     if blue > red + 30:
-        return "独特" if red > green + 15 else "稀有"
+        return "稀有"
     if red > blue + 40 and red >= green:
         return "传说"
     return None
@@ -2881,10 +2885,11 @@ def _recommended_member(task: TriggerTask, lv_texts):
     return min(below, key=lambda index: lv_texts[index].y) if below else None
 
 
-def _choose_other_member(task: TriggerTask, lv_texts, others, new_equipment, by_slot):
+def _choose_other_member(task: TriggerTask, lv_texts, others, new_equipment):
     """刷存档主战员不要的装备给谁，返回 (主战员下标或 None, 原因, 各人装备格读数)。
-    by_slot（卡厄思模式）：先给这一格空着的人，再给这一格品质比它低的人里最低的，同样的给「推荐」的人、否则给站位靠前的；
-    谁都比不过就返回 None（提炼）。出击模式维持随机。每人只能装一件独特。"""
+    先给这一格空着的人，再给这一格品质比它低的人里最低的，同样的给「推荐」的人、否则给站位靠前的；
+    谁都比不过就返回 None（提炼）。每人只能装一件独特。
+    出击模式以前是随机选人、不看装备（10/03 实跑出「稀有顶掉独特」），现在两个模式同一套规则。"""
     slot = new_equipment["slot"]
     new_rank = _EQUIPMENT_QUALITY_RANKS.get(new_equipment["quality"] or "", 0)
     eligible, readings = [], {}
@@ -2896,8 +2901,6 @@ def _choose_other_member(task: TriggerTask, lv_texts, others, new_equipment, by_
         eligible.append((index, qualities[slot]))
     if not eligible:
         return None, "其他主战员都已有独特装备", readings
-    if not by_slot:
-        return random.choice(eligible)[0], "随机", readings
 
     recommended = _recommended_member(task, lv_texts)
 
@@ -3124,7 +3127,7 @@ def handle_equipment(task: TriggerTask):
                 install_reason = "未识别到刷存档主战员"
             others = [index for index in range(len(lv_texts)) if index != preferred_member_index]
             chosen_index, other_reason, other_slots = _choose_other_member(
-                task, lv_texts, others, new_equipment, by_slot=tracks_target_member)
+                task, lv_texts, others, new_equipment)
             task._slot_readings = target_readings
             if chosen_index is None:
                 refine_box = next(

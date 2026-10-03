@@ -659,6 +659,35 @@ class TestEquipmentAssign(unittest.TestCase):
                                 config={"装备2号位优先级": ["拷问工具箱"]})
         self.assertEqual(["提炼"], task.chosen())
 
+    def sortie_task(self, name, kind, quality, slots):
+        """出击模式：2 人队、没有「刷存档主战员」，主角是第一主战员。"""
+        task = EquipmentTask(name, kind, quality, slots)
+        task.default_config = {}
+        task.level_tags = task.level_tags[:2]
+        return task
+
+    def test_sortie_rare_does_not_replace_unique(self):
+        # 实跑 10/03 13:56：出击模式里稀有的「角斗士头盔」被随机装给第 2 主战员，顶掉了她 2 号位
+        # 刚装上的独特装备。修后品质更低不顶掉，走提炼
+        task = self.sortie_task("变异：角斗士头盔", "防御力", "稀有",
+                                [("", "稀有", ""), ("", "独特", "")])
+        self.assertTrue(utils.handle_equipment(task))
+        self.assertEqual(["提炼"], task.chosen())
+
+    def test_sortie_better_quality_replaces(self):
+        # 品质更高才顶掉：传说替换第 2 人 2 号位的稀有（装给其他人后返回 False，走同页决策缓存）
+        task = self.sortie_task("变异：角斗士头盔", "防御力", "传说",
+                                [("", "传说", ""), ("", "稀有", "")])
+        utils.handle_equipment(task)
+        self.assertEqual([2], task.chosen())
+
+    def test_sortie_fills_empty_slot_first(self):
+        # 这一格空着最优先：第 2 人 2 号位空着，直接装进去
+        task = self.sortie_task("变异：角斗士头盔", "防御力", "稀有",
+                                [("", "传说", ""), ("", "", "")])
+        utils.handle_equipment(task)
+        self.assertEqual([2], task.chosen())
+
     def test_purchase_only_for_target(self):
         with unittest.mock.patch.object(utils, "_get_current_credit", lambda task: 300):
             task, result = self.run_page("短刀", "攻击力", "稀有", [EMPTY, ("传说", "", ""), EMPTY], purchase=True)
