@@ -147,6 +147,29 @@ class TestBattlePerception(unittest.TestCase):
             with self.subTest(name):
                 self.assertFalse(battle.hand_lowered(screenshot_task(name)))
 
+    def test_card_height_tells_playable_from_sunk(self):
+        """游戏把这一帧出不了的牌在手牌里沉下去（比能出的牌低约 0.1 屏高）：出不起的、
+        0 血时的崩溃牌都沉，0 费牌 AP 用完也留在高弧。read_hand 逐张读出高度（lowered）。"""
+        cases = {
+            # 被改成 4 费的那张（按键 3）单独沉下去，其余都出得起
+            "modified_cost": {"1": False, "2": False, "3": True, "4": False, "5": False},
+            "single_enemy": {"1": False, "2": False, "3": True},                          # 3 费的破碎出不起
+            "ap_zero_raised": {"1": True, "2": True, "3": True, "4": False, "5": True},  # 0 费的逆转之刃留在高弧
+            "zero_hp_collapse": {"1": True, "2": True, "3": True, "4": True, "5": False, "6": False},  # 0 血：崩溃牌沉
+            "collapse_traps": {"1": False, "2": False, "3": False, "4": False, "5": False, "6": False},  # 活着：崩溃牌立着
+            "hand_lowered": {"1": True, "2": True, "3": True, "4": True, "5": True},      # 整排沉下去
+            "boss_full_hp": {"1": False, "2": False, "3": False, "4": False, "5": False, "6": False, "7": False},
+            "boss_minions_red": {"1": None, "2": False, "3": False, "4": False, "5": False, "6": False,
+                                 "7": False, "8": False, "9": False, "0": False},        # 10 张满手牌都立着
+            "card_suffix": {"1": False, "2": False, "3": False, "4": False, "5": False, "6": False, "7": False},
+            "card_selected_stuck": {"1": False, "2": False, "3": False, "4": False, "5": False},
+        }
+        for name, expected in cases.items():
+            with self.subTest(name):
+                task = screenshot_task(name)
+                cards = battle.read_hand(task, len(expected))
+                self.assertEqual(expected, {c["key"]: c["lowered"] for c in cards})
+
     def test_gray_zero_ap_by_color(self):
         # 实跑 12:14:50：刚打出 3 费的破碎，AP 已是灰色空心的「0」但手牌还没沉下去，读不出 AP 又去试了下一张牌
         for name in ("ap_zero_raised", "hand_lowered"):
@@ -328,6 +351,32 @@ class TestChoosePlay(unittest.TestCase):
 
     def test_remaining_unknown_plays_anything(self):
         self.assertEqual("破碎", battle.choose_play([card("破碎", 3, "攻击")], None, [], [], False, set())[0]["name"])
+
+    def test_sunk_card_not_tried_even_when_cost_looks_fine(self):
+        # 高度就是能不能出的判据：沉下去的不试（哪怕费用读起来够），立着的不拦（哪怕费用被读错）
+        sunk = dict(card("破碎", 2, "攻击"), lowered=True)
+        raised = dict(card("斗志", 1), lowered=False)
+        chosen, _ = battle.choose_play([sunk, raised], 9, ["破碎"], [], False, set())
+        self.assertEqual("斗志", chosen["name"])
+        misread = dict(card("破碎", 9, "攻击"), lowered=False)
+        chosen, _ = battle.choose_play([misread, raised], 1, ["破碎"], [], False, set())
+        self.assertEqual("破碎", chosen["name"])
+
+    def test_sunk_collapse_card_not_played_first(self):
+        # 0 血时崩溃牌沉下去（实跑里按了出不掉）：不再第一个去出它；活着时立着，照旧最先出
+        sunk = dict(card("冲动", 0, "崩溃"), lowered=True)
+        attack = dict(card("斩击", 1, "攻击", key="2"), lowered=False)
+        chosen, _ = battle.choose_play([sunk, attack], 3, [], [], False, set())
+        self.assertEqual("斩击", chosen["name"])
+        raised = dict(card("冲动", 0, "崩溃"), lowered=False, progress=(1, 5))
+        chosen, _ = battle.choose_play([raised, attack], 0, [], [], False, set())
+        self.assertEqual("冲动", chosen["name"])
+
+    def test_unknown_height_falls_back_to_cost(self):
+        # 高度没读到（None）的牌走旧逻辑：按费用/剩余 AP 判断，不因为读不到就判它出不了
+        cards = [card("破碎", 3, "攻击"), card("斗志", 1)]
+        self.assertEqual("斗志", battle.choose_play(cards, 2, ["破碎"], [], False, set())[0]["name"])
+        self.assertEqual("破碎", battle.choose_play([cards[0]], None, [], [], False, set())[0]["name"])
 
 
 def enemy(hp, countdown, intent=None, x=0.5, y=0.3, shield=0, infinite=False):
@@ -542,11 +591,40 @@ class TestPlayTurn(unittest.TestCase):
         self.assertEqual({"owed_until": 0.0, "pay_hook": None}, self.task._speedup)  # 已等过，加速模式不用再补
 
     def test_lowered_hand_means_no_ap_and_tries_unknown_cost(self):
-        # 手牌沉下去 = AP 用完（灰色的 0 读不出来）。这时读不到费用的牌仍要试一张：0 费牌不花 AP
+        # 手牌沉下去 = AP 用完（灰色的 0 读不出来）。这套用例的手牌是假的、没有高度（lowered 为 None），
+        # 走旧逻辑：读不到费用的牌仍要试一张（0 费牌不花 AP）
         labels = [Box(700, 1260, 150, 40, name="基本攻击"), Box(1200, 1270, 100, 40, name="攻击")]
         self.task.all_texts = labels
         with mock.patch.object(battle, "read_remaining_cost", lambda task, frame: None):
             battle.play_turn(self.task, 2, True)
+        self.assertEqual(["1", "enter"], self.keys)
+
+    def test_all_sunk_hand_ends_turn_with_sure(self):
+        # 手牌全沉下去 = 一张都出不了（游戏自己画的信号，不是 OCR 猜的）：直接结束回合，走确定通道
+        # （加速模式不必再等两轮确认）
+        self.task._speedup = {}
+        hand = [dict(card("斗志", 2, "技能", key="1"), x=0.4, y=None, lowered=True),
+                dict(card("破碎", 3, "攻击", key="2"), x=0.5, y=None, lowered=True)]
+        with mock.patch.object(battle, "read_hand", lambda task, count: [dict(c) for c in hand]):
+            battle.play_turn(self.task, 2, True)
+        self.assertEqual(["e"], self.keys)
+        self.assertTrue(self.task._speedup["end_turn_sure"])
+
+    def test_sunk_card_skipped_raised_card_played(self):
+        # 混排：只出立着的牌，沉下去的（就算在出牌优先级里）连试都不试
+        self.task.default_config["出牌优先级"] = ["破碎"]
+        hand = [dict(card("破碎", 3, "攻击", key="1"), x=0.4, y=None, lowered=True),
+                dict(card("斗志", 1, "技能", key="2"), x=0.5, y=None, lowered=False)]
+        with mock.patch.object(battle, "read_hand", lambda task, count: [dict(c) for c in hand]):
+            battle.play_turn(self.task, 2, True)
+        self.assertEqual(["2", "enter"], self.keys)
+
+    def test_unknown_height_keeps_old_trying_logic(self):
+        # 高度没读到不算「出不了」：照旧按费用/AP 判断（OCR 漏读不能变成提前结束回合）
+        hand = [dict(card("斗志", None, "技能", key="1"), x=0.4, y=None)]
+        with mock.patch.object(battle, "read_hand", lambda task, count: [dict(c) for c in hand]), \
+                mock.patch.object(battle, "read_remaining_cost", lambda task, frame: 0):
+            battle.play_turn(self.task, 1, True)
         self.assertEqual(["1", "enter"], self.keys)
 
     def test_lowered_hand_ends_turn_when_costs_known(self):

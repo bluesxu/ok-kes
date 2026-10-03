@@ -3,7 +3,9 @@
 按规则挑一张牌，按键或拖到目标身上打出。术语见仓库根目录 CONTEXT.md。
 
 出牌规则（每次只出一张，出完下一帧重新观察）：
-1. 只考虑出得起的牌：读到费用的按费用判断；读不到的先试着出，没打出去（手牌数和 AP 都没减少）就本回合不再出。
+1. 只考虑出得起的牌：游戏把这一帧出不了的牌（费用不够、0 血时打不出的崩溃牌）在手牌里沉下去，
+   按这个高度判断；高度没读到的牌才回退到费用判断——读到费用的按费用算，读不到的先试着出，
+   没打出去（手牌数和 AP 都没减少）就本回合不再出。
 2. 顺序：崩溃牌 → 预计挨打后会被打死或血量低于「防御血量线」时先出防御牌 → 「出牌优先级」里的牌（按列表顺序）→ 0 费牌 → 强化牌 → 攻击牌
    → 技能/防御/其余牌；同一类牌里按出牌优先级、再按费用从低到高。
 3. 没有出得起的牌就按 E 结束回合。
@@ -348,7 +350,8 @@ def incoming_lethal(task):
 _HAND_CENTER = 0.471        # 手牌扇形正中那张牌的牌名左端 x
 _HAND_AREA = (0.15, 0.68, 0.86, 0.905)
 _HAND_STRIP = (0.15, 0.66, 0.86, 0.95)   # 补读牌名时裁剪的手牌区
-_LOWERED_LABEL_Y = 0.83     # 类型标签最高的一个都在这以下：手牌沉下去了（实测正常 ≤0.79，沉下去 ≥0.87）
+_LOWERED_LABEL_Y = 0.83     # 类型标签中心 y 超过它：这张牌沉下去了、出不了（14 张测试图实测：立着 ≤0.805、沉下去 ≥0.867）
+_NAME_TO_LABEL_DY = 0.03    # 牌名框顶边到类型标签中心在画面上的距离（实测中位数 0.032）：牌名读到、标签没读到时用来估高度
 _CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩❶❷❸❹❺❻❼❽❾❿"
 
 
@@ -387,10 +390,24 @@ def hand_lowered(task):
     return bool(labels) and min(labels) > _LOWERED_LABEL_Y
 
 
+def card_lowered(label_y, name_y):
+    """这张牌沉下去了吗：游戏把这一帧出不了的牌（费用不够、0 血时打不出的崩溃牌）整张沉下去，
+    能出的牌留在原位。True 出不了、False 能出、None 高度没读到（调用方回退到费用判断）。
+    和 hand_lowered 同一个信号（类型标签中心 y 超过 _LOWERED_LABEL_Y，阈值实测：立着 ≤0.805、沉下去 ≥0.867）；
+    标签没读到、牌名读到时代入牌名框顶边（牌名在标签上方一个固定距离）。两个都没读到返回 None，
+    宁可回退旧逻辑，也不把「没读到」当成「出不了」。"""
+    if label_y is None:
+        if name_y is None:
+            return None
+        label_y = name_y + _NAME_TO_LABEL_DY
+    return label_y > _LOWERED_LABEL_Y
+
+
 def read_hand(task, count):
     """按位置读手牌：第几个位置就是按键几，不依赖 OCR 读出牌上方的按键数字（经常漏读，漏一个后面的就全错位）。
     每张牌的名字、类型取落在该位置上的文字；名字没读到时仍保留这张牌（名字记为「未识别N」），照样可以按键出。
-    返回 [{name, key, x, y, type, cost_hint}]。"""
+    返回 [{name, key, x, y, type, cost_hint, progress, label_y, lowered}]；
+    label_y 是类型标签中心的 y，lowered 是这张牌沉没沉下去（游戏把出不了的牌沉下去，见 card_lowered）。"""
     slots = hand_slots(count)
     if not slots:
         return []
@@ -398,6 +415,7 @@ def read_hand(task, count):
     x1, y1, x2, y2 = _HAND_AREA
     names = [[] for _ in slots]
     types = [[] for _ in slots]
+    labels = [[] for _ in slots]   # 每张牌的类型标签 (中心 y, 左端 x)：判断这张牌的高度
     progress = [None for _ in slots]
 
     def collect(boxes, only=None):
@@ -421,6 +439,7 @@ def read_hand(task, count):
             card_type = _type_of(text) if len(text) <= 8 else None
             if card_type:
                 types[index].append(card_type)
+                labels[index].append((cy, left))
                 continue
             hint = re.match(r"^(\d)(?=\D)", text)  # 「3禿鷹髮」：费用数字和牌名连成了一个框
             cleaned = re.sub(rf"^[\d{_CIRCLED}\s]+", "", text)
@@ -441,6 +460,7 @@ def read_hand(task, count):
     cards = []
     for i, x in enumerate(slots):
         best = max(names[i]) if names[i] else None
+        nearest = min(labels[i], key=lambda item: abs(item[1] - x)) if labels[i] else None
         cards.append({
             "name": best[1] if best else f"未识别{i + 1}",
             "key": str((i + 1) % 10),
@@ -449,6 +469,8 @@ def read_hand(task, count):
             "type": types[i][0] if types[i] else None,
             "cost_hint": best[3] if best else None,
             "progress": progress[i],
+            "label_y": nearest[0] if nearest else None,
+            "lowered": card_lowered(nearest[0] if nearest else None, best[2] if best else None),
         })
     return cards
 
@@ -775,10 +797,12 @@ def is_shield(card):
 
 
 def choose_play(cards, remaining, priority, defense, danger, unplayable, zero_hp=False):
-    """挑这一次要出的牌。cards 为 [{name, key, type, cost}]，cost 读不到为 None；remaining 读不到为 None。
+    """挑这一次要出的牌。cards 为 [{name, key, type, cost, lowered}]，cost 读不到为 None，
+    lowered 是这张牌的高度（True 沉下去出不了 / False 立着能出 / None 没读到）；remaining 读不到为 None。
     unplayable 里是本回合出不起的牌名或位置（「按键/手牌数」）；AP 用完时调用方会把这一场试过、出不掉的
     牌名也放进来，那些牌不再试。返回 (牌, 理由)；没有能出的牌时返回 (None, 理由)。
 
+    能不能出先看高度（沉下去的不试、立着的直接能出，费用 OCR 读错也不拦）；高度没读到的才按费用/剩余 AP 判断。
     顺序：崩溃牌 → 预计会被打死或血量过低（danger）时先出防御牌 → 「出牌优先级」里的牌（按列表顺序）→ 0 费牌 → 强化牌 → 攻击牌 → 技能/防御/其余牌。
     「出牌优先级」里的牌不看类型：类型常被读错（实跑中「破碎」读不出类型，排到了其余牌里，被普通攻击牌抢先）。
     zero_hp（我方血量为 0）：游戏进入特殊状态，护盾无效、崩溃牌打不出，再挨一次打就输。
@@ -786,10 +810,13 @@ def choose_play(cards, remaining, priority, defense, danger, unplayable, zero_hp
     def affordable(card):
         if _blocked(card, unplayable) or card.get("key") is None:
             return False
+        if card.get("lowered") is not None:
+            # 高度就是游戏自己的判断：沉下去 = 出不了（含费用不够、0 血时的崩溃牌），立着 = 能出
+            return not card["lowered"]
         if remaining is None:
             return True
         if card["cost"] is None:
-            # 读不到费用：试着出，出不去时会被记为出不起。AP 用完时也试——0 费牌不花 AP，
+            # 高度和费用都没读到：试着出，出不去时会被记为出不起。AP 用完时也试——0 费牌不花 AP，
             # 而「0」在游戏里是空心方框、OCR 读不出来（形状也没认出来时），不出就白白结束回合。
             # 调用方在 AP 用完时会把这一场试过、出不掉的牌名放进 unplayable，不会反复试
             return True
@@ -803,11 +830,12 @@ def choose_play(cards, remaining, priority, defense, danger, unplayable, zero_hp
         matched = _priority_rank(card, priority)[1]
         return card, reason + (f"，出牌优先级「{matched}」" if matched else "")
 
-    # 1. 崩溃牌不花 AP、不计入敌人的行动次数：手里有就最先出，打够张数才能觉醒
+    # 1. 崩溃牌不花 AP、不计入敌人的行动次数：手里有就最先出，打够张数才能觉醒（沉下去说明这帧打不出：0 血）
     for card in cards:
         if zero_hp:
             break
-        if card["type"] == "崩溃" and not _blocked(card, unplayable) and card.get("key") is not None:
+        if card["type"] == "崩溃" and not _blocked(card, unplayable) and card.get("key") is not None \
+                and card.get("lowered") is not True:
             done = card.get("progress")
             shown = f"，进度 {'?' if done[0] is None else done[0]}/{done[1]}" if done else ""
             return card, f"崩溃牌（不花 AP，打够张数觉醒）{shown}"
@@ -1300,17 +1328,23 @@ def play_turn(task, hand_count, finish_turn_visible):
     blocked = state["unplayable"]
     if remaining == 0:
         blocked = blocked | state.setdefault("not_zero", set())
-    card, reason = choose_play(cards, remaining, priority, defense, danger, blocked, zero_hp=zero_hp)
+    # 游戏把这一帧出不了的牌整排沉下去（费用不够、0 血时的崩溃牌）：整手都沉 = 一张都出不了，直接结束回合。
+    # 读不到高度的牌不算数（回退旧的费用判断），免得 OCR 漏读反而提前结束回合
+    all_lowered = bool(cards) and all(card.get("lowered") for card in cards)
+    if all_lowered:
+        card, reason = None, "手牌全沉下去了（都出不了）"
+    else:
+        card, reason = choose_play(cards, remaining, priority, defense, danger, blocked, zero_hp=zero_hp)
     observed = {
         "hand_count": hand_count, "remaining": remaining, "hp": hp, "shield": read_shield(task),
         "hp_after_ratio": round(after, 3), "lethal": lethal, "danger": danger, "zero_hp": zero_hp,
-        "cards": [{k: c.get(k) for k in ("name", "key", "type", "cost")} for c in cards],
+        "cards": [{k: c.get(k) for k in ("name", "key", "type", "cost", "lowered")} for c in cards],
         "enemies": [{k: e[k] for k in ("x", "y", "hp", "shield", "countdown", "intent")} for e in enemies],
         "unplayable": sorted(state["unplayable"]),
     }
     if card is None:
-        # AP 确实用完（读到 0 或手牌沉下去）且没有 0 费牌可出：加速模式不必再等 3 秒、再确认一轮
-        return _end_turn(task, reason, sure=remaining == 0, observed=observed)
+        # 全沉下去是游戏自己画出来的信号、AP 读到 0 同样确定：加速模式不必再等 3 秒、再确认一轮
+        return _end_turn(task, reason, sure=remaining == 0 or all_lowered, observed=observed)
     if _hand_changed(task, state, hand_count):
         return True
 
