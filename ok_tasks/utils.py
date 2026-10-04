@@ -3086,11 +3086,26 @@ def handle_equipment(task: TriggerTask):
                     install_reason = "独特名额留给优先级配置里的装备"
         target_readings = getattr(task, "_slot_readings", None)
         installs_first = should_install_first and preferred_member_index is not None
+        # 队友链在两种时候先算出来：主战员不要这件，或主战员只是「品质升级」——先看队友有没有这一格空着的。
+        # 顺序（用户 10/03 定）：列表装备、主战员自己的空位照旧最优先；队友这一格空着时，先补队友再给主战员升级。
+        target_missing = tracks_target_member and target_member_index is None
+        others = [index for index in range(len(lv_texts)) if index != preferred_member_index]
+        other_index, other_reason, other_slots = None, None, None
+        if (not installs_first or (install_reason.startswith("品质") and current_quality)) \
+                and not (is_purchase_page and target_missing):
+            other_index, other_reason, other_slots = _choose_other_member(task, lv_texts, others, new_equipment)
+            task._slot_readings = target_readings
+        if installs_first and other_reason == "这一格是空的":
+            installs_first = False
+            install_reason = f"{install_reason}；队友这一格空着，先补队友"
 
-        if is_purchase_page and not installs_first:
-            # 只给刷存档主战员（出击模式为第一主战员）买：配置里的装备，或比这一格更好的
-            task.log_info(f"购买装备「{new_equipment['name']}」不装给主战员（{install_reason}），点击「取消」")
-            _log_equipment(task, new_equipment, "取消", None, install_reason, current_name, current_quality,
+        if is_purchase_page and (target_missing or (not installs_first and other_index is None)):
+            # 谁都用不上才取消：主战员要（列表/空位/升级），或队友要用（空位优先、品质更低）都值得买。
+            # 认不出刷存档主战员时不乱装（万一「其他人」里就有他），照旧重取头像、四次后 ESC
+            reason = "未识别到刷存档主战员" if target_missing else (
+                f"{install_reason}；{other_reason}" if other_reason else install_reason)
+            task.log_info(f"购买装备「{new_equipment['name']}」谁都用不上（{reason}），点击「取消」")
+            _log_equipment(task, new_equipment, "取消", None, reason, current_name, current_quality,
                            is_purchase_page, equipment_price)
             if tracks_target_member and target_member_index is None:
                 if _target_member_missing(task, new_equipment):
@@ -3125,10 +3140,7 @@ def handle_equipment(task: TriggerTask):
         else:
             if tracks_target_member and target_member_index is None:
                 install_reason = "未识别到刷存档主战员"
-            others = [index for index in range(len(lv_texts)) if index != preferred_member_index]
-            chosen_index, other_reason, other_slots = _choose_other_member(
-                task, lv_texts, others, new_equipment)
-            task._slot_readings = target_readings
+            chosen_index = other_index
             if chosen_index is None:
                 refine_box = next(
                     (b for b in task.all_texts

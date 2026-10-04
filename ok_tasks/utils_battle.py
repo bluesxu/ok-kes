@@ -547,6 +547,28 @@ def enemy_bars(frame):
     return sorted(bars)
 
 
+def _bar_still_there(frame, x, y):
+    """记忆目标这一帧没被认出来时，按记住的位置复查洋红血条：还在说明只是漏检，不是死了。
+    判色同 enemy_bars，形状放宽些（血条被图标遮断、边缘发虚时不至于又判没）。"""
+    if frame is None or frame.size == 0:
+        return False
+    h, w = frame.shape[:2]
+    x1, x2 = max(0.0, x - 0.02), min(1.0, x + 0.25)
+    y1, y2 = max(0.0, y - 0.02), min(1.0, y + 0.02)
+    region = frame[int(y1 * h):int(y2 * h), int(x1 * w):int(x2 * w)]
+    if region.size == 0:
+        return False
+    mask = cv2.inRange(cv2.cvtColor(region, cv2.COLOR_BGR2HSV), (150, 120, 120), (178, 255, 255))
+    n, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+    for i in range(1, n):
+        bx, _, bw, bh, pixels = stats[i]
+        if bh < 0.002 * h or bh > 0.018 * h or bw < 2 * bh or pixels < 0.5 * bw * bh:
+            continue
+        if abs((bx + int(x1 * w)) / w - x) < 0.035:
+            return True
+    return False
+
+
 def _looks_like_infinity(crop):
     """菱形里的白色字形：∞ 横着宽（宽高比约 2），8 竖着高（约 0.6）。"""
     if crop is None or crop.size == 0:
@@ -985,7 +1007,7 @@ def start_battle(task):
     state = _state(task)
     state.clear()
     _new_turn(state)
-    state.update(sticky=None, drag_fail={}, last_remaining=None, last_seen=time.time(), zero_frames=0)
+    state.update(sticky=None, sticky_full=None, drag_fail={}, last_remaining=None, last_seen=time.time(), zero_frames=0)
     state["not_zero"] = set()  # AP 用完时试过、确认要花 AP 的牌名，这一场不再试（见 play_turn）
     state["probe_fails"] = {}  # 上面那些牌各自试失败了几次
     session = _session(task)
@@ -1227,6 +1249,20 @@ def _hand_changed(task, state, hand_count):
     return True
 
 
+def _keep_remembered_target(frame, state, target, target_reason):
+    """上一只从这一帧的敌人列表里消失时，choose_target 会当成它死了、按集火换一只，并把记忆也换过去
+    （实跑 10/03 15:19 一连换了两次，前一只还剩 267 血还活着）。这里按记住的位置复查血条：
+    还在就继续打它（怪不动，落点照旧可用），真没了才保留 choose_target 的重挑。"""
+    sticky, remembered = state.get("sticky"), state.get("sticky_full")
+    if not sticky or not remembered:
+        return target, target_reason
+    if target is not None and abs(target["x"] - sticky[0]) < 0.04 and abs(target["y"] - sticky[1]) < 0.04:
+        return target, target_reason  # 上一只还在列表里
+    if not _bar_still_there(frame, sticky[0], sticky[1]):
+        return target, target_reason  # 真没了：按原来的换
+    return dict(remembered), "上一只还在（这一帧没认出来），继续打它"
+
+
 def play_turn(task, hand_count, finish_turn_visible):
     """战斗页面一帧：看一眼、出一张牌或结束回合。返回 True 表示本帧已处理。"""
     state = _ensure_battle(task)
@@ -1364,6 +1400,8 @@ def play_turn(task, hand_count, finish_turn_visible):
             if boss_battle:
                 update_head(state, enemies)
             target, target_reason = choose_target(enemies, boss_battle, state["sticky"], state.get("head"))
+            if not boss_battle:
+                target, target_reason = _keep_remembered_target(frame, state, target, target_reason)
         use_drag = target is not None
         if use_drag and untyped:
             target_reason = f"类型没读到，按攻击牌拖到敌人身上（{target_reason}）"
@@ -1390,6 +1428,7 @@ def play_turn(task, hand_count, finish_turn_visible):
     if use_drag:
         _drag_card(task, card, target)
         state["sticky"] = (target["x"], target["y"])
+        state["sticky_full"] = {k: target.get(k) for k in ("x", "y", "hp", "countdown", "intent", "drop")}
     elif field:
         _drag_card(task, card, {"drop": _FIELD_DROP})
     else:

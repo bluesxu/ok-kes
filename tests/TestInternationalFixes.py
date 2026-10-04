@@ -613,8 +613,31 @@ class TestEquipmentAssign(unittest.TestCase):
         task = EquipmentTask(*args, **kwargs)
         return task, utils.handle_equipment(task)
 
-    def test_better_quality_goes_to_target(self):
+    def test_teammate_empty_beats_target_upgrade(self):
+        # 用户 10/03 定的顺序：队友这一格空着时先补队友，再轮到给主战员的品质升级
         task, _ = self.run_page("战斗服", "防御力", "传说", [EMPTY, ("", "稀有", ""), EMPTY])
+        self.assertEqual([1], task.chosen())
+
+    def test_target_upgrade_when_teammates_cannot_take_it(self):
+        task, _ = self.run_page("战斗服", "防御力", "传说",
+                                [("", "传说", ""), ("", "稀有", ""), ("", "传说", "")])
+        self.assertEqual([2], task.chosen())
+
+    def test_target_upgrade_beats_lower_quality_teammate(self):
+        # 队友只是「这一格比它差」而不是空的：升级仍归主战员（空位才压升级）
+        task, _ = self.run_page("战斗服", "防御力", "传说",
+                                [("", "稀有", ""), ("", "稀有", ""), ("", "稀有", "")])
+        self.assertEqual([2], task.chosen())
+
+    def test_empty_slot_tie_goes_to_target(self):
+        # 空位撞空位仍归主战员（用户 10/03 选 b）
+        task, _ = self.run_page("战斗服", "防御力", "稀有", [EMPTY, EMPTY, EMPTY])
+        self.assertEqual([2], task.chosen())
+
+    def test_configured_beats_teammate_empty(self):
+        # 装备列表永远第一优先：配置里的装备给主战员，哪怕队友这一格空着
+        task, _ = self.run_page("短刀", "攻击力", "稀有", [EMPTY, ("传说", "", ""), ("稀有", "", "")],
+                                config={"装备1号位优先级": ["短刀"]})
         self.assertEqual([2], task.chosen())
 
     def test_configured_unique_goes_to_target(self):
@@ -688,15 +711,32 @@ class TestEquipmentAssign(unittest.TestCase):
         utils.handle_equipment(task)
         self.assertEqual([2], task.chosen())
 
-    def test_purchase_only_for_target(self):
+    def test_sortie_teammate_empty_beats_first_member_upgrade(self):
+        # 出击（无刷存档主战员）：队友这一格空着时先补队友，再轮到第一主战员升级
+        task = self.sortie_task("变异：角斗士头盔", "防御力", "传说",
+                                [("", "稀有", ""), ("", "", "")])
+        utils.handle_equipment(task)
+        self.assertEqual([2], task.chosen())
+
+    def test_purchase_cancelled_when_nobody_needs_it(self):
         with unittest.mock.patch.object(utils, "_get_current_credit", lambda task: 300):
-            task, result = self.run_page("短刀", "攻击力", "稀有", [EMPTY, ("传说", "", ""), EMPTY], purchase=True)
+            task, result = self.run_page("短刀", "攻击力", "稀有",
+                                         [("稀有", "", ""), ("传说", "", ""), ("传说", "", "")], purchase=True)
         self.assertTrue(result)
         self.assertEqual(["取消"], task.chosen())
         # 实跑 10/01 12:09：认出了主战员、确实不值得买，商店本轮不再点它，免得商店 ↔ 购买页来回
         self.assertEqual(["短刀"], task.node_status["shop_cancelled"])
+
+    def test_purchase_buys_for_empty_teammate_slot(self):
+        # 用户 10/03：能补队友空位的也买
         with unittest.mock.patch.object(utils, "_get_current_credit", lambda task: 300):
-            task, _ = self.run_page("短刀", "攻击力", "传说", [EMPTY, ("稀有", "", ""), EMPTY], purchase=True)
+            task, _ = self.run_page("短刀", "攻击力", "稀有", [EMPTY, ("传说", "", ""), EMPTY], purchase=True)
+        self.assertEqual([1, "购买"], task.chosen())
+
+    def test_purchase_buys_for_target_upgrade(self):
+        with unittest.mock.patch.object(utils, "_get_current_credit", lambda task: 300):
+            task, _ = self.run_page("短刀", "攻击力", "传说",
+                                    [("传说", "", ""), ("稀有", "", ""), ("传说", "", "")], purchase=True)
         self.assertEqual([2, "购买"], task.chosen())
 
     def test_unknown_target_refetches_then_gives_up(self):

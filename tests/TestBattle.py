@@ -445,6 +445,18 @@ class TestEnemyBars(unittest.TestCase):
         self.assertEqual([(0.654, 8644)], [(e["x"], e["hp"]) for e in enemies])
 
 
+class TestBarStillThere(unittest.TestCase):
+    """记忆目标的血条复检：识别整帧漏掉某只敌人时，靠它决定「继续打」还是「换目标」。"""
+
+    def test_magenta_bar_at_remembered_position(self):
+        frame = np.zeros((1440, 2560, 3), np.uint8)
+        frame[int(0.30 * 1440):int(0.30 * 1440) + 8, int(0.70 * 2560):int(0.70 * 2560) + 120] = (255, 0, 255)
+        self.assertTrue(battle._bar_still_there(frame, 0.70, 0.30))
+        self.assertFalse(battle._bar_still_there(frame, 0.50, 0.30))  # 条在，但位置对不上这条
+        self.assertFalse(battle._bar_still_there(np.zeros((1440, 2560, 3), np.uint8), 0.70, 0.30))
+        self.assertFalse(battle._bar_still_there(None, 0.70, 0.30))
+
+
 class TestPostDrag(unittest.TestCase):
     """后台拖动（PostMessage）：分步移到落点、在落点松手。"""
 
@@ -763,6 +775,57 @@ class TestPlayTurn(unittest.TestCase):
         with mock.patch.object(battle, "read_hand", hand),                 mock.patch.object(battle, "_drag_card", lambda task, c, t: targets.append(t)):
             battle.play_turn(self.task, 1, True)
         self.assertEqual([500], [t.get("hp") for t in targets])  # 拖到敌人身上，不是场地中间
+
+    def _remembered_state(self):
+        battle.start_battle(self.task)
+        self.task._battle["sticky"] = (0.7, 0.3)
+        self.task._battle["sticky_full"] = dict(x=0.7, y=0.3, hp=267, countdown=7, intent="攻击", drop=(0.7, 0.5))
+        self.task.default_config["出牌优先级"] = ["破碎"]
+
+    def test_missing_target_kept_when_bar_still_there(self):
+        # 实跑 10/03 15:19：上一只还剩 267 血还活着，只是这一帧没被认出来，不该换目标
+        self._remembered_state()
+        others = [dict(enemy(300, 1, "攻击", x=0.3), drop=(0.3, 0.5))]  # 集火本来会挑这只
+        targets, records = [], []
+        with mock.patch.object(battle, "read_enemies", lambda task, frame: others), \
+                mock.patch.object(battle, "_bar_still_there", lambda frame, x, y: True), \
+                mock.patch.object(battle, "_drag_card", lambda task, c, t: targets.append(t)), \
+                mock.patch.object(battle.battle_log, "record", lambda task, event, **f: records.append((event, f))):
+            battle.play_turn(self.task, 2, True)
+        self.assertEqual([267], [t["hp"] for t in targets])           # 还是打记忆里那只
+        self.assertEqual([(0.7, 0.5)], [t["drop"] for t in targets])  # 用的是记住的落点
+        self.assertEqual((0.7, 0.3), self.task._battle["sticky"])     # 记忆没被换走
+        self.assertEqual("上一只还在（这一帧没认出来），继续打它",
+                         [f for e, f in records if e == "出牌"][0]["target_reason"])
+        self.assertEqual([], self.keys)  # 没走按键
+
+    def test_missing_target_switches_when_bar_gone(self):
+        self._remembered_state()
+        others = [dict(enemy(300, 1, "攻击", x=0.3), drop=(0.3, 0.5))]
+        targets = []
+        with mock.patch.object(battle, "read_enemies", lambda task, frame: others), \
+                mock.patch.object(battle, "_bar_still_there", lambda frame, x, y: False), \
+                mock.patch.object(battle, "_drag_card", lambda task, c, t: targets.append(t)):
+            battle.play_turn(self.task, 2, True)
+        self.assertEqual([300], [t["hp"] for t in targets])        # 真没了：按集火换目标
+        self.assertEqual((0.3, 0.3), self.task._battle["sticky"])  # 记忆换到新目标
+
+    def test_no_enemies_with_memory_drags_to_remembered(self):
+        # 「没有识别到敌人」的那一帧：有记忆就拖到记住的落点，按键+回车打的默认目标可能不是它
+        self._remembered_state()
+        targets = []
+        with mock.patch.object(battle, "read_enemies", lambda task, frame: []), \
+                mock.patch.object(battle, "_bar_still_there", lambda frame, x, y: True), \
+                mock.patch.object(battle, "_drag_card", lambda task, c, t: targets.append(t)):
+            battle.play_turn(self.task, 2, True)
+        self.assertEqual([(0.7, 0.5)], [t["drop"] for t in targets])
+        self.assertEqual([], self.keys)
+
+    def test_no_enemies_without_memory_keeps_key_play(self):
+        self.task.default_config["出牌优先级"] = ["破碎"]
+        with mock.patch.object(battle, "read_enemies", lambda task, frame: []):
+            battle.play_turn(self.task, 2, True)
+        self.assertEqual(["2", "enter"], self.keys)  # 没有记忆：保持按键+回车
 
     def test_card_type_remembered_by_name(self):
         hands = {2: [dict(card("电浆飞弹", 1, "攻击", key="1"), x=0.4, y=None),
