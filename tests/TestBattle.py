@@ -1568,6 +1568,39 @@ class TestFlash(unittest.TestCase):
             self.assertEqual("日破碎", utils._flash_fallback_card(flash_task(出牌优先级=["斗志", "破碎"]), seen))
             self.assertEqual("斩击", utils._flash_fallback_card(flash_task(出牌优先级=["斗志"]), seen))
 
+    def test_fallback_skips_card_picked_on_this_page(self):
+        # 10:34 实况：2 张页面只有 1 张候选，点掉后兜底又来找它，白滚 27 秒
+        task = flash_task()
+        task._select_card_memory = {"picked": [(0.367, 0.147, "定位雷射")]}
+        seen = {"定位雷射": {"type": "攻击"}, "电浆飞弹": {"type": "攻击"}}
+        with mock.patch.object(utils, "_get_game_text", lambda task, text: text):
+            self.assertEqual("电浆飞弹", utils._flash_fallback_card(task, seen))
+        task._select_card_memory["picked"].append((0.5, 0.1, "电浆飞弹"))
+        self.assertIsNone(utils._flash_fallback_card(task, seen))  # 都点过了：不挑，走跳过
+
+    def test_view_original_not_reclicked_within_retry_window(self):
+        """页面连续识别几帧、数字读法有抖动时，点过一次就不再换着点（19:56 实况：先点 3 号又改点 1 号）。"""
+        clicks = []
+        task = flash_task(闪光优先级=[])
+        prompt = SimpleNamespace(name="查看之前的闪光")
+        cards = [dict(version("钴蓝之光", "攻击", "造成168%×4的伤害"), x=0.2 + 0.2 * i, y=0.3)
+                 for i in range(3)]
+        with mock.patch.object(utils, "find_box_at_point", lambda task, x, y: prompt), \
+                mock.patch.object(utils, "_get_game_text", lambda task, text: text), \
+                mock.patch.object(utils, "recognize_cards", lambda task, page="": cards), \
+                mock.patch.object(utils, "_flash_rules", lambda task: []), \
+                mock.patch.object(utils, "find_target_card", lambda task: ([], [])), \
+                mock.patch.object(utils, "_matching_meditation_card_names", lambda task, cards: []), \
+                mock.patch.object(utils, "_move_and_click", lambda task, x, y: clicks.append((x, y))), \
+                mock.patch.object(battle_log, "record", lambda *a, **k: None):
+            self.assertTrue(utils.handle_view_original(task))
+            self.assertEqual(1, len(clicks))       # 第一次点了一个选项
+            self.assertTrue(utils.handle_view_original(task))
+            self.assertEqual(1, len(clicks))       # 刚点过：等页面响应，不换着点
+            task._flash_choice_clicked_at -= 5     # 页面一直没响应（那次点击可能被吞）
+            self.assertTrue(utils.handle_view_original(task))
+            self.assertEqual(2, len(clicks))       # 超过重试间隔才允许再点
+
 
 def read_frame(name):
     return cv2.imdecode(np.fromfile(os.path.join(IMAGES, name + ".jpg"), dtype=np.uint8), cv2.IMREAD_COLOR)

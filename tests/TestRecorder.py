@@ -95,6 +95,8 @@ class RecorderTestCase(unittest.TestCase):
                 mock.patch.object(scene, "SCENE_DIR", os.path.join(self.folder, "现场")),
                 mock.patch.object(recorder, "_schedule", lambda *args: None),
                 mock.patch.object(recorder, "_start_write", recorder._write),
+                # 采样线程在用例里手动调 _sample_once，不真起后台线程
+                mock.patch.object(recorder, "_start_sampler", lambda task, st: None),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -306,6 +308,63 @@ class TestRecording(RecorderTestCase):
         self.frames(5)
         self.assertEqual(0, len(self.task._recorder["frames"]))
         self.assertIsNone(recorder.trigger(self.task, "疑似循环"))
+
+
+class TestSampler(RecorderTestCase):
+    """画面采样：任务运行时另开一路抓画面（任务帧之外），画面没变化的不重复留。"""
+
+    def setUp(self):
+        super().setUp()
+        self.task.executor._frame = np.full((720, 1280, 3), 80, np.uint8)
+
+        def get_frame():
+            return self.task.executor._frame
+
+        self.task.executor.method = SimpleNamespace(get_frame=get_frame)
+        self.task._recorder["last_frame_t"] = self.now[0]
+
+    def sample(self):
+        recorder._sample_once(self.task, self.task._recorder)
+
+    def images(self):
+        return self.task._recorder["images"]
+
+    def test_unchanged_frames_are_not_kept_twice(self):
+        self.sample()
+        self.assertEqual(1, len(self.images()))
+        self.sample()  # 画面没变：不重复留
+        self.assertEqual(1, len(self.images()))
+        self.task.executor._frame = np.full((720, 1280, 3), 200, np.uint8)  # 画面变了
+        self.sample()
+        self.assertEqual(2, len(self.images()))
+
+    def test_sample_skipped_when_task_not_running(self):
+        self.task._recorder["last_frame_t"] = self.now[0] - 10  # 超过 RUNNING_GAP
+        self.sample()
+        self.assertEqual(0, len(self.images()))
+
+    def test_sample_errors_do_not_raise(self):
+        def boom():
+            raise RuntimeError("截图失败")
+
+        self.task.executor.method = SimpleNamespace(get_frame=boom)
+        self.sample()  # 采样失败静默跳过，不能影响任务
+        self.assertEqual(0, len(self.images()))
+
+    def test_sample_frames_go_into_scene_timeline(self):
+        self.frames(2)  # 正常跑几帧
+        self.task.executor._frame = np.full((720, 1280, 3), 200, np.uint8)
+        self.task._recorder["last_frame_t"] = self.now[0]
+        self.sample()  # 一张任务帧之外的采样画面
+        battle_log.anomaly(self.task, "疑似循环", "测试")
+        self.frames(32)
+        path = self.scene_path()
+        _, frames = scene.load(path)
+        samples = [f for f in frames if f.get("sample")]
+        self.assertTrue(samples)  # 采样帧作为「只有画面」的条目进了时间线
+        for sample in samples:
+            for image_id in sample["images"]:
+                self.assertTrue(os.path.exists(os.path.join(path, "frames", f"{image_id:05d}.jpg")))
 
 
 class TestSceneTool(RecorderTestCase):

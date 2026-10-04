@@ -622,7 +622,7 @@ class SelectCardPageTask:
     def move_relative(self, x, y):
         self.move(x, y)
 
-    scroll = mouse_down = mouse_up = send_key = move
+    scroll = scroll_relative = mouse_down = mouse_up = send_key = move
 
     def run(self):
         pass
@@ -1018,6 +1018,82 @@ class TestSpeedup(unittest.TestCase):
         self.assertNotIn("跳过", task.clicked)
         self.assertTrue(self.confirm_removal(task))
         self.assertEqual(2, task.node_status["removed_card_count"])
+
+    # ---------------- 选完即止：点过的卡不再被重新决策顶掉 ----------------
+    def test_first_pick_is_not_overridden_when_picked_card_falls_out_of_list(self):
+        """19:56 实况：点了「定位雷射」后它被点击光效盖住、识别掉出候选，下一帧不能改点别的卡。"""
+        self.use_real_removal_flow()
+        task = self.select_page("请选择1张要移除的卡牌", ["拍照时间", "粉丝福利"])
+        utils.handle_select_card(task)
+        self.assertEqual(["卡牌"], task.clicked)
+        self.assertEqual({"拍照时间"}, task.picked)
+        task.deck = [c for c in task.deck if c["name"] != "拍照时间"]  # 点过的卡识别失败掉出列表
+        task.show_title("请选择1张要移除的卡牌")  # 下一帧还停在这页，按钮还没亮
+        utils.handle_select_card(task)
+        self.assertEqual(["卡牌"], task.clicked)  # 没有改点「粉丝福利」
+
+    def test_pick_retried_when_click_never_lands(self):
+        """点了没生效（卡还在、没选中）：过了重试间隔按钮还没亮，解锁重新选一次。"""
+        self.use_real_removal_flow()
+        task = self.select_page("请选择1张要移除的卡牌", ["拍照时间"])
+        utils.handle_select_card(task)
+        self.assertEqual(["卡牌"], task.clicked)
+        task.picked.clear()  # 模拟点击被游戏吞掉：卡片没有变成已选中
+        task.show_title("请选择1张要移除的卡牌")
+        utils.handle_select_card(task)
+        self.assertEqual(["卡牌"], task.clicked)  # 重试窗口内先等按钮
+        task._select_card_memory["t"] -= 5
+        task.show_title("请选择1张要移除的卡牌")
+        utils.handle_select_card(task)
+        self.assertEqual(["卡牌", "卡牌"], task.clicked)  # 超时后重试
+
+    def test_multi_pick_keeps_choosing_until_count_filled(self):
+        """要求选2张：第一张选好后（哪怕识别不出选中状态），补第二张、不重复点第一张。"""
+        self.use_real_removal_flow()
+        task = self.select_page("请选择2张要移除的卡牌", ["拍照时间"])
+        utils.handle_select_card(task)
+        self.assertEqual({"拍照时间"}, task.picked)
+        task.picked.clear()  # 模拟第一张的选中状态识别不出来
+        second = dict(deck_cards(["粉丝福利"])[0], x=0.55)  # 第二张目标卡出现（翻页后），错开位置
+        task.deck = task.deck + [second]
+        task.show_title("请选择2张要移除的卡牌")
+        utils.handle_select_card(task)
+        self.assertEqual({"粉丝福利"}, task.picked)  # 补选第二张，没有回头把第一张点掉（取消）
+
+    def test_leaving_page_resets_memory_for_next_selection(self):
+        """离开选卡页后，紧接着的下一次删卡重新开始，不受上一页的记忆影响。"""
+        self.use_real_removal_flow()
+        task = self.select_page("请选择1张要移除的卡牌", ["拍照时间"])
+        utils.handle_select_card(task)
+        self.assertEqual(["卡牌"], task.clicked)
+        task.show_title("战斗页面文字")  # 经过别的页面：位置上有字但不是选卡页
+        self.assertFalse(utils.handle_select_card(task))
+        task.deck, task.picked = deck_cards(["粉丝福利"]), set()
+        task.show_title("请选择1张要移除的卡牌")
+        utils.handle_select_card(task)
+        self.assertEqual(["卡牌", "卡牌"], task.clicked)  # 新页面照常选，没有被上一页锁住
+
+    def test_two_pick_page_triggers_collection_scene(self):
+        """临时收集：检测到需选2张时自动触发一次现场包（素材收够后连同 recorder 的名单一起删）。"""
+        self.use_real_removal_flow()
+        task = self.select_page("请选择2张要移除的卡牌", ["拍照时间"])
+        utils.handle_select_card(task)
+        task.show_title("请选择2张要移除的卡牌")
+        utils.handle_select_card(task)
+        hits = [line for line in task.logs if "选2张页面" in line]
+        self.assertEqual(1, len(hits))  # 本轮只触发一次
+
+    def test_deck_bottom_remembered_across_frames(self):
+        """滚动到边界（画面没变化）判定到底后，同一页面的下一帧不再重复滚动。"""
+        self.use_real_removal_flow()
+        utils.region_white_ratio = lambda task, region: 0.5  # 多页（滚动条不是全白）
+        task = self.select_page("请选择2张要移除的卡牌", ["拍照时间"])
+        utils.handle_select_card(task)
+        self.assertIn("视为已到达底部", " ".join(task.logs))
+        task.show_title("请选择2张要移除的卡牌")
+        task.logs.clear()
+        utils.handle_select_card(task)
+        self.assertIn("之前已确认翻到底", " ".join(task.logs))
 
     # ---------------- 出击模式 ----------------
     def make_sortie(self, page, rules, handlers, enabled=True):

@@ -1378,11 +1378,75 @@ def _scroll_card_page(task: TriggerTask, x, y, amount, page, distance=0.25):
         task.sleep(0.5)
 
 
+_SELECT_CARD_SESSION_GAP = 10.0   # 中间没离开过，隔这么久没见本页才算换了新会话（一般靠离开标记重置）
+_SELECT_CARD_RETRY_SECONDS = 4.0  # 选满后按钮这么久还没把页面点走，解锁重新决策
+
+
+def _select_card_memory(task: TriggerTask, action, count):
+    """取本页面的选卡记忆；页面离开过（handle_select_card 不匹配时会清 seen）或换页了就重新开始记。"""
+    memory = getattr(task, "_select_card_memory", None)
+    now = time.time()
+    if (memory is None or memory["action"] != action or memory["count"] != count
+            or not memory["seen"] or now - memory["seen"] > _SELECT_CARD_SESSION_GAP):
+        memory = {"action": action, "count": count, "picked": [], "t": 0.0, "seen": now,
+                  "scrolls": 0, "at_top": False, "deck_bottom": False}
+        task._select_card_memory = memory
+    memory["seen"] = now
+    return memory
+
+
+def _note_select_card_pick(task: TriggerTask, x, y, name):
+    """记一次选卡点击（位置、牌名和时间）：选满后本页不再重新决策，续选时跳过已点过的位置。"""
+    memory = getattr(task, "_select_card_memory", None)
+    if memory is not None:
+        memory["picked"].append((x, y, name))
+        memory["t"] = time.time()
+
+
+def _card_picked_before(task: TriggerTask, card):
+    """这张牌是不是本页已经点过：位置相近且名字对得上（OCR 互相包含也算）。
+    光看位置会把下一个选卡页面同位置的另一张牌误当成点过的。"""
+    memory = getattr(task, "_select_card_memory", None)
+    if not memory:
+        return False
+    for x, y, name in memory["picked"]:
+        if abs(card["x"] - x) <= 0.06 and abs(card["y"] - y) <= 0.10 and _names_match(card["name"], name):
+            return True
+    return False
+
+
+def _deck_frame_gray(task: TriggerTask):
+    """牌库区域画面的粗灰度图，滚动前后不变说明滚不动了（到底/到顶）。"""
+    frame = getattr(task, "frame", None)
+    if frame is None:
+        return None
+    return frame[int(0.108 * task.height):int(0.874 * task.height):16,
+                 int(0.274 * task.width):int(0.929 * task.width):16, :3]
+
+
+def _deck_scrolled(task: TriggerTask, before):
+    """滚动后牌库画面变化没有；一路滚不动（和上一张一样）算已经到边界。"""
+    after = _deck_frame_gray(task)
+    if before is None or after is None or before.shape != after.shape:
+        return True
+    return float(np.mean(np.abs(after.astype(np.int16) - before.astype(np.int16)))) > 2.0
+
+
 def select_card(task: TriggerTask, card_names, count=1, action=""):
     """使用卡组特征识别选择卡牌，支持滚动查找、基础牌移除和兜底选择。"""
     selected = 0
     max_scrolls = 20
     page = f"select_card-{action}" if action else "select_card"
+    # 选满要求张数后本页不再重新决策：点过的卡变暗/被点击光效盖住后名字读不出，
+    # 重新决策会把刚选的顶掉（2026-10-04 19:56 实况：选了「定位雷射」，下一帧认不出又点「钴蓝之光」）。
+    # 锁定期间交给按钮 handler 把页面点走；4 秒后按钮还没亮，认为那次点击没生效，解锁重新决策。
+    memory = _select_card_memory(task, action, count)
+    if len(memory["picked"]) >= count:
+        if time.time() - memory["t"] < _SELECT_CARD_RETRY_SECONDS:
+            task.log_info(f"{page}: 本页已点过 {len(memory['picked'])} 张卡，等按钮响应，不重复选择")
+            return True
+        task.log_info(f"{page}: 选满后 {_SELECT_CARD_RETRY_SECONDS} 秒按钮还没亮，解锁重新决策")
+        memory["picked"] = []
     prefer_remove_base = (
         action == "移除"
         and _get_config_value(task, "优先移除基础牌", True)
@@ -1452,6 +1516,7 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
             card["selected"] = True
             selected += 1
             record_pending_removal()
+            _note_select_card_pick(task, card["x"], card["y"], card["name"])
             clicked = True
         return clicked
 
@@ -1481,6 +1546,7 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
                 card["selected"] = True
                 selected += 1
                 record_pending_removal()
+                _note_select_card_pick(task, card["x"], card["y"], card["name"])
                 clicked = True
         return clicked
 
@@ -1539,6 +1605,11 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
         else:
             task.log_info(f"{page}: 未识别到任何卡牌或操作按钮，终止选卡")
             return False
+    if memory["picked"]:
+        # 本页点过的位置当作已选中：续选和重新决策时都不再点它们（单选项重点=取消选中）
+        for card in cards:
+            if not card["selected"] and _card_picked_before(task, card):
+                card["selected"] = True
     sync_visible_selected(cards)
     scrollbar_white_ratio = region_white_ratio(
         task, (0.976, 0.119, 0.988, 0.858)
@@ -1549,7 +1620,6 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
         f"是否仅一页卡牌={single_page}"
     )
 
-    down_scrolls = 0
     while True:
         click_target_member_row_cards(cards)
         if selected >= count:
@@ -1564,16 +1634,22 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
             task.log_info(f"{page}: 当前仅一页卡牌，不执行向下滚动")
             break
 
+        if memory["deck_bottom"]:
+            task.log_info(f"{page}: 本页之前已确认翻到底，不再向下滚动")
+            break
+
         if _point_is_white(task, 0.982, 0.846, page):
+            memory["deck_bottom"] = True
             task.log_info(f"{page}: 检测到已到达卡牌底部")
             break
 
-        if down_scrolls >= max_scrolls:
+        if memory["scrolls"] >= max_scrolls:
             task.log_info(f"{page}: 向下滚动已达到{max_scrolls}次限制")
             break
 
+        before_gray = _deck_frame_gray(task)
         _scroll_card_page(task, 0.251, 0.735, -3, page)
-        down_scrolls += 1
+        memory["scrolls"] += 1
         cards = refresh_cards()
         if not cards:
             if find_action_button():
@@ -1584,6 +1660,10 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
                 continue
             task.log_info(f"{page}: 向下滚动后未识别到卡牌或操作按钮，终止选卡")
             return False
+        if not _deck_scrolled(task, before_gray):
+            memory["deck_bottom"] = True
+            task.log_info(f"{page}: 向下滚动后画面没有变化，视为已到达底部")
+            break
 
     if action == "移除" and selected < count:
         bottom_to_top_cards = sorted(
@@ -1618,7 +1698,12 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
 
         up_scrolls = 0
         while not single_page:
+            if memory["at_top"]:
+                task.log_info(f"{page}: 本页之前已确认翻到顶，不再向上滚动")
+                break
+
             if _point_is_white(task, 0.982, 0.128, page):
+                memory["at_top"] = True
                 task.log_info(f"{page}: 检测到已到达卡牌顶部")
                 break
 
@@ -1626,8 +1711,13 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
                 task.log_info(f"{page}: 向上滚动已达到{max_scrolls}次限制")
                 break
 
+            before_gray = _deck_frame_gray(task)
             _scroll_card_page(task, 0.252, 0.179, 3, page)
             up_scrolls += 1
+            if not _deck_scrolled(task, before_gray):
+                memory["at_top"] = True
+                task.log_info(f"{page}: 向上滚动后画面没有变化，视为已到达顶部")
+                break
             cards = refresh_cards()
             if not cards:
                 if find_action_button():
@@ -1721,36 +1811,62 @@ def flash_list_done(task: TriggerTask):
 
 
 def _flash_fallback_card(task: TriggerTask, seen_cards):
-    """列表里的牌都不在：按出牌优先级挑，再挑第一张攻击牌，再挑第一张牌。返回牌名。"""
+    """列表里的牌都不在：按出牌优先级挑，再挑第一张攻击牌，再挑第一张牌；本页点过的不再挑
+    （点过再点=取消选中，会把选择顶掉）。返回牌名。"""
+    memory = getattr(task, "_select_card_memory", None)
+    picked_names = [picked for _, _, picked in memory["picked"]] if memory else []
+    candidates = [seen for seen in seen_cards
+                  if not any(_names_match(seen, picked) for picked in picked_names)]
     for name in _get_card_list(task, "出牌优先级"):
         if not isinstance(name, str):
             continue
-        found = next((seen for seen in seen_cards if _names_match(name, seen)), None)
+        found = next((seen for seen in candidates if _names_match(name, seen)), None)
         if found:
             return found
     attack = _get_game_text(task, "攻击")
-    found = next((seen for seen, card in seen_cards.items() if attack in card.get("type", "")), None)
-    return found or next(iter(seen_cards), None)
+    found = next((seen for seen in candidates if attack in seen_cards[seen].get("type", "")), None)
+    return found or next(iter(candidates), None)
 
 
 def _click_card_from_top(task: TriggerTask, name, refresh_cards, page, max_scrolls=20):
-    """滚回选牌页顶部，再往下翻找到这张牌并点击。"""
+    """滚回选牌页顶部，再往下翻找到这张牌并点击；本页滚到过顶/底就不再重滚（跨帧）。"""
+    memory = getattr(task, "_select_card_memory", None)
+    at_top = bool(memory and memory["at_top"])
     for _ in range(max_scrolls):
-        if _point_is_white(task, 0.982, 0.128, page):
+        if at_top or _point_is_white(task, 0.982, 0.128, page):
+            at_top = True
             break
+        before_gray = _deck_frame_gray(task)
         _scroll_card_page(task, 0.252, 0.179, 3, page)
         task.next_frame()
+        if not _deck_scrolled(task, before_gray):
+            at_top = True
+            break
+    if memory is not None and at_top:
+        memory["at_top"] = True
     for _ in range(max_scrolls):
         cards = refresh_cards()
-        card = next((c for c in cards if _names_match(name, c["name"]) and not c["selected"]), None)
+        card = next((c for c in cards if _names_match(name, c["name"]) and not c["selected"]
+                     and not _card_picked_before(task, c)), None)
         if card:
             task.log_info(f"{page}: 闪光卡牌列表里的牌都不在，兜底选择「{card['name']}」")
             _move_and_click(task, card["x"], card["y"])
             task.sleep(0.3)
+            _note_select_card_pick(task, card["x"], card["y"], card["name"])
             return True
-        if _point_is_white(task, 0.982, 0.846, page):
+        if memory is not None and memory["deck_bottom"]:
             break
+        if _point_is_white(task, 0.982, 0.846, page):
+            if memory is not None:
+                memory["deck_bottom"] = True
+            break
+        before_gray = _deck_frame_gray(task)
         _scroll_card_page(task, 0.251, 0.735, -3, page)
+        if not _deck_scrolled(task, before_gray):
+            if memory is not None:
+                memory["deck_bottom"] = True
+            task.log_info(f"{page}: 兜底查找向下滚动时画面没有变化，视为已到达底部")
+            break
     task.log_info(f"{page}: 兜底没找回「{name}」")
     return False
 
@@ -3337,21 +3453,33 @@ def _scroll_to_target_member_for_card_removal(task: TriggerTask):
         scroll_count += 1
 
 
+def _note_select_card_page_left(task: TriggerTask):
+    """当前帧不在选卡页面：标记离开过，下次再进选卡页就是新的一页（"选完即止"的记忆要重置）。"""
+    memory = getattr(task, "_select_card_memory", None)
+    if memory is not None:
+        memory["seen"] = 0.0
+
+
 def handle_select_card(task: TriggerTask):
     """统一卡牌选择页面: 在(0.198,0.039)处检测文本，按移除/复制/闪光等关键字匹配配置并选择卡牌。"""
     box = find_box_at_point(task, 0.198, 0.039)
-    if not box:
-        return False
-    m = re.search(r'请选择(\d*)张*.*?(移除|复制|闪光|灵光).*?卡牌', box.name)
+    m = re.search(r'请选择(\d*)张*.*?(移除|复制|闪光|灵光).*?卡牌', box.name) if box else None
     if not m:
+        _note_select_card_page_left(task)
         return False
     count_text = m.group(1)
     action = m.group(2)
     count = int(count_text) if count_text else 1
     config_key = _SELECT_CARD_CONFIG_KEYS.get(action)
     if config_key is None:
+        _note_select_card_page_left(task)
         return False
     task.log_info(f"检测到卡牌{action}选择，需选择{count}张，配置key={config_key}")
+
+    # 临时收集（2026-10-04，用户要求）：遇到需选2张的选卡页面自动存现场包，验证 2 张页面的 UI 和行为。
+    # 素材收够后把这段和 recorder.TRIGGER_KINDS 里的「选2张页面」一起删掉。
+    if count >= 2 and battle_log.once(task, "选2张页面收集"):
+        battle_log.anomaly(task, "选2张页面", f"检测到{action}选择，需选择{count}张")
 
     # 日志打印右下角选牌操作提示
     action_tip = find_box_at_point(task, 0.945, 0.918)
@@ -4592,12 +4720,22 @@ def handle_shop(task: TriggerTask):
     return False
 
 
+_FLASH_CHOICE_RETRY_SECONDS = 4.0  # 点了灵光选项后这么久内不再换着点，等页面响应
+
+
 def handle_view_original(task: TriggerTask):
     """卡牌闪光（查看原件）事件: 按类型特征识别卡牌，并按闪光优先级选择。"""
     box1 = find_box_at_point(task, 0.890, 0.051)
     box2 = find_box_at_point(task, 0.896, 0.131)
     if not ((box1 and (_get_game_text(task, '查看原件') in box1.name or _get_game_text(task, '查看之前的闪光') in box1.name)) or (box2 and (_get_game_text(task, '查看原件') in box2.name or _get_game_text(task, '查看之前的闪光') in box2.name))):
         return False
+
+    # 这个页面会连续识别好几帧，描述里的数字每次 OCR 不完全一样（实况把「168%×4」读成 1168%，
+    # 下一帧又读回 168%），每帧重新决策会先选 3 号再改点 1 号，把选择顶掉。
+    # 点过选项后先等页面响应（详情弹窗/切页）；超过重试间隔页面还没动，说明可能没点上，才允许再点。
+    if time.time() - getattr(task, "_flash_choice_clicked_at", 0.0) < _FLASH_CHOICE_RETRY_SECONDS:
+        task.log_info("卡牌闪光页面: 刚点过灵光选项，等页面响应，不重复点击")
+        return True
 
     cards = recognize_cards(task, page="卡牌闪光页面")
     if not cards:
@@ -4637,6 +4775,7 @@ def handle_view_original(task: TriggerTask):
         task.log_info(
             f"卡牌闪光事件: 检测到target卡牌，点击位置{click_position}"
         )
+        task._flash_choice_clicked_at = time.time()
         _move_and_click(task, *click_position)
         return True
 
@@ -4651,6 +4790,7 @@ def handle_view_original(task: TriggerTask):
         battle_log.record(task, "闪光选择", card=chosen_card["name"], reason=choose_reason,
                           chosen=cards.index(chosen_card) + 1, options=options)
     task._last_flash_choice = (key, time.time())
+    task._flash_choice_clicked_at = time.time()
     _move_and_click(task, chosen_card['x'], chosen_card['y'])
     return True
 

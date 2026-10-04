@@ -17,6 +17,7 @@
 battle_log 调用本模块时会先确认能导入。
 注意：本文件不能定义顶层类，框架会把 ok_tasks 下含类的 .py 当作任务加载。
 """
+import bisect
 import collections
 import concurrent.futures
 import datetime
@@ -44,6 +45,11 @@ IMAGE_WIDTH = 1280
 _SMALL_QUALITY = 70
 _FULL_QUALITY = 85
 _SAME_PAGE = 0.6      # 没有接手的处理函数时，画面文字重合度达到这么多算同一个页面
+# 画面采样：任务运行时另开一路直接抓画面（任务循环 0.5~1 秒才一帧，两次点击之间的细节看不清）。
+# 采样帧只存小图，画面没变化的不重复留；出错静默跳过，绝不影响任务。
+SAMPLE_FPS = 15
+SAMPLE_INTERVAL = 1.0 / SAMPLE_FPS
+SAMPLE_DIFF_THRESHOLD = 2.0  # 粗灰度平均差小于这个就算画面没变化
 
 SCENE_DIR = os.path.join(battle_log.LOG_DIR, "现场")
 MARK_KEY = "标记现场"
@@ -55,7 +61,7 @@ HANDLER_ERROR = "处理函数出错"
 TRIGGER_KINDS = frozenset((
     "疑似循环", "未识别页面", "画面卡住", "出不掉牌", "按键无效", "按 E 无效", "结束回合按钮一直不出现",
     "手牌识别失败", "意外打开撤退菜单", "装备页读不到装备", "零式系统读不到存档价值", "赛季初始页读不到存档价值",
-    "记忆卡读不到文字", LOST_BATTLE, HANDLER_ERROR, MANUAL,
+    "记忆卡读不到文字", "选2张页面", LOST_BATTLE, HANDLER_ERROR, MANUAL,
 ))
 
 # 识别类调用：结果记下来，重放时按「方法 + 参数」查表
@@ -82,7 +88,7 @@ def install(task):
         "lock": threading.RLock(), "frames": collections.deque(), "images": collections.deque(), "next_image": 0,
         "current": None, "loose_events": [], "last_frame_obj": None, "last_image": None, "last_small_t": 0.0,
         "recording": None, "round_id": None, "count": 0, "seen": [], "mark": None, "hold": None,
-        "last_hit": None, "last_frame_t": 0.0,
+        "last_hit": None, "last_frame_t": 0.0, "sample_gray": None,
         "baseline": set(vars(task)),
     }
     task._recorder = st
@@ -93,6 +99,48 @@ def install(task):
         if callable(getattr(task, name, None)):
             setattr(task, name, _action(task, st, name, getattr(task, name)))
     task.run = _run(task, st, task.run)
+    _start_sampler(task, st)
+
+
+# ---------------- 画面采样（另开一路，任务帧之外的细节画面） ----------------
+
+def _start_sampler(task, st):
+    """后台采样线程：任务运行时按 SAMPLE_FPS 直接抓画面存小图。截图后端自带锁（WGC/BitBlt），
+    并发调用安全；采样只写自己的 images 条目，不碰任务用的帧。"""
+    def loop():
+        while True:
+            time.sleep(SAMPLE_INTERVAL)
+            _sample_once(task, st)
+
+    threading.Thread(target=loop, daemon=True, name="现场记录采样").start()
+
+
+def _sample_once(task, st):
+    """抓一张画面存下来（小图）；画面几乎没变的不重复留。任何失败都静默跳过，不能影响任务。"""
+    try:
+        if not enabled(task):
+            return
+        if time.time() - st["last_frame_t"] > RUNNING_GAP:
+            return  # 任务没在跑（没有任务帧），不采样
+        method = getattr(getattr(task, "executor", None), "method", None)
+        frame = method.get_frame() if method is not None else None
+        if frame is None or not getattr(frame, "size", 0):
+            return
+        gray = cv2.cvtColor(frame[::18, ::18, :3], cv2.COLOR_BGR2GRAY)
+        previous = st["sample_gray"]
+        if previous is not None and previous.shape == gray.shape:
+            diff = float(np.mean(np.abs(gray.astype(np.int16) - previous.astype(np.int16))))
+            if diff < SAMPLE_DIFF_THRESHOLD:
+                return  # 画面几乎没变，不重复留
+        st["sample_gray"] = gray
+        with st["lock"]:
+            st["images"].append({
+                "id": st["next_image"], "t": time.time(), "size": [int(frame.shape[1]), int(frame.shape[0])],
+                "small": _ENCODER.submit(_encode, frame, True), "full": None, "sample": True,
+            })
+            st["next_image"] += 1
+    except Exception:
+        pass
 
 
 # ---------------- 手动标记（侧边栏按钮，界面线程调用） ----------------
@@ -475,7 +523,22 @@ def _finish_if_due(task, st):
         first = rec["frames"][0]["t"] if rec["frames"] else rec["start"]
         ids = {i for f in rec["frames"] for i in f["images"]}
         images = [img for img in st["images"] if img["id"] in ids or first - 1 <= img["t"] <= rec["until"]]
+        _insert_sample_frames(rec, images)
     _start_write(task, rec, images)
+
+
+def _insert_sample_frames(rec, images):
+    """采样帧合成成「只有画面」的时间线条目，按时间插进帧列表：时间线和回放页能逐帧翻看
+    两次点击之间的画面；重放会按「没有全屏识别」跳过它们。"""
+    times = [f["t"] for f in rec["frames"]]
+    for image in images:
+        if not image.get("sample"):
+            continue
+        frame = {"t": image["t"], "hit": None, "gated": False, "texts": None, "calls": [], "actions": [],
+                 "events": [], "images": [image["id"]], "error": None, "state": None, "sample": True}
+        index = bisect.bisect_right(times, image["t"])
+        rec["frames"].insert(index, frame)
+        times.insert(index, image["t"])
 
 
 def _start_write(task, rec, images):
@@ -504,9 +567,10 @@ def _write(task, rec, images):
                 line = {k: v for k, v in frame.items() if k != "state"}
                 line.update(i=index, t=round(frame["t"] - start, 3), abs_t=frame["t"])
                 f.write(json.dumps(line, ensure_ascii=False, default=str) + "\n")
-        if rec["frames"]:
+        first_state = next((f["state"] for f in rec["frames"] if f.get("state")), None)
+        if first_state is not None:
             with open(os.path.join(path, "state.pkl"), "wb") as f:
-                pickle.dump(rec["frames"][0]["state"], f)
+                pickle.dump(first_state, f)
         meta = {
             "mode": getattr(task, "name", ""), "round": rec["round"], "battle": rec["battle"],
             "start": datetime.datetime.fromtimestamp(start).isoformat(timespec="seconds"),

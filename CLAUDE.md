@@ -58,8 +58,8 @@ python real_bugfix_check.py                           # 用官方安装目录里
 - `battle_log.py` 写结构化记录（`battle_logs/*.jsonl`）和异常截图，并按保留天数/总大小清理。两个模式共用：出击模式在 `SortieMode` 里装开关，卡厄思模式由 `speedup.install` 装。事件名和字段见 `CONTEXT.md`「详细日志」，查日志时按那张表过滤；新增决定时在点击处记一行，同一种决定两个模式用同一个事件名。
 
 **现场包 `ok_tasks/recorder.py` + `scripts/scene.py`**：排查自动化出的问题时先看这里，比 jsonl 和单张截图全。
-- `speedup.install` 末尾给两个模式装上记录器（包在加速补丁接管的 `run` 和点击/按键/识别方法外层），内存里留最近 50 秒的每一帧；出问题时写到 `battle_logs/现场/`（自动触发前后各 30 秒，手动标记前 50 秒、后 10 秒）。开关跟「详细战斗日志」+「异常截图」走，触发条件和去重规则见 `CONTEXT.md`「现场包」。加速关闭时记不到接手的处理函数。
-- 目录内容：`meta.json`（模式、轮次、触发列表、配置）、`timeline.jsonl`（每帧一行：`hit` 接手的处理函数、`gated` 闸门等待、`texts` 全屏文字、`calls` 识别调用 → 结果、`actions` 动作、`events` 这一帧写的 jsonl 事件、`images` 画面编号）、`frames/` 1280 宽画面、`full/` 有动作那几帧的原尺寸画面、`state.pkl` 第一帧的跨帧状态，看完后写 `诊断.md`。
+- `speedup.install` 末尾给两个模式装上记录器（包在加速补丁接管的 `run` 和点击/按键/识别方法外层），内存里留最近 50 秒的每一帧，另有后台线程每秒最多 15 张的采样画面（补上任务帧之间两次点击的细节）；出问题时写到 `battle_logs/现场/`（自动触发前后各 30 秒，手动标记前 50 秒、后 10 秒）。开关跟「详细战斗日志」+「异常截图」走，触发条件和去重规则见 `CONTEXT.md`「现场包」。加速关闭时记不到接手的处理函数。
+- 目录内容：`meta.json`（模式、轮次、触发列表、配置）、`timeline.jsonl`（每帧一行：`hit` 接手的处理函数、`gated` 闸门等待、`texts` 全屏文字、`calls` 识别调用 → 结果、`actions` 动作、`events` 这一帧写的 jsonl 事件、`images` 画面编号；采样画面是 `sample` 标记的「只有画面」条目，重放会跳过）、`frames/` 1280 宽画面、`full/` 有动作那几帧的原尺寸画面、`state.pkl` 第一个任务帧的跨帧状态，看完后写 `诊断.md`。
 - 排查流程（用户说「看一下现场」时）：
   1. `python scripts/scene.py list` 列出还没有 `诊断.md` 的现场包；
   2. `scene.py timeline <包>` 读精简时间线（页面切换、动作、决定、异常，重复帧已合并），先只看文字；
