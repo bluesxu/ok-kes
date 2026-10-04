@@ -335,11 +335,14 @@ def member_page(*members):
 
 
 class TestMemberSelection(unittest.TestCase):
-    """会合选主战员：优先级里的角色没有时，刷新留一个治疗/保护角色；刷新后仍没有就先选保护、再选治疗。"""
+    """会合选主战员：优先级里的角色没有时，按本局已选队友的职能保持盾奶平衡
+    （保护少优先保护、治疗少优先治疗，一样多优先保护），刷新时保留本轮优先的职能。"""
 
-    def run_page(self, before, after=None, config=None):
+    def run_page(self, before, after=None, config=None, recruited=None):
         task = PageTask(member_page(*before))
         task.config.update({"主战员优先级": ["蕾伊"], "拉黑主战员": ["黛安娜"], **(config or {})})
+        if recruited is not None:
+            task.member_status["recruit_roles"] = dict(recruited)
         task.ocr = lambda *a, **k: [text(*t, raw=True) for t in member_page(*(after or before))]
         self.assertTrue(utils_sortie.handle_member_selection(task))
         return task.clicked
@@ -369,6 +372,53 @@ class TestMemberSelection(unittest.TestCase):
     def test_priority_still_first(self):
         clicks = self.run_page([("米卡", "治療"), ("蕾伊", "支援"), ("凛", "核心")])
         self.assertEqual([self.pick(1)], clicks)
+
+    def test_second_pick_prefers_healer_after_shield(self):
+        # 本局已选到保护（玛莉贝尔）：这一轮治疗优先，保留治疗（米卡）、刷掉保护和核心
+        clicks = self.run_page([("菲", "核心"), ("米卡", "治療"), ("瑪莉貝爾", "保護")],
+                               [("凛", "核心"), ("米卡", "治療"), ("海德瑪麗", "核心")],
+                               recruited={"玛莉贝尔": "保护"})
+        self.assertEqual(3, len(clicks))  # 刷新 2 次 + 选人
+        self.assertEqual(self.pick(1), clicks[-1])
+
+    def test_third_pick_back_to_shield_when_even(self):
+        # 保护和治疗各一个：一样多优先保护，保留保护（玛莉贝尔）、刷掉治疗和核心
+        clicks = self.run_page([("米卡", "治療"), ("凛", "核心"), ("瑪莉貝爾", "保護")],
+                               [("凛", "核心"), ("海德瑪麗", "核心"), ("瑪莉貝爾", "保護")],
+                               recruited={"玛莉贝尔": "保护", "米卡": "治疗"})
+        self.assertEqual(3, len(clicks))  # 刷新 2 次 + 选人
+        self.assertEqual(self.pick(2), clicks[-1])
+
+    def test_blacklisted_preferred_role_falls_back(self):
+        # 本轮偏好治疗但治疗（米卡）被拉黑：退回保留保护（玛莉贝尔）
+        clicks = self.run_page([("米卡", "治療"), ("凛", "核心"), ("瑪莉貝爾", "保護")],
+                               [("凛", "核心"), ("海德瑪麗", "核心"), ("瑪莉貝爾", "保護")],
+                               config={"拉黑主战员": ["米卡"]},
+                               recruited={"玛莉贝尔": "保护"})
+        self.assertEqual(3, len(clicks))  # 刷新 2 次 + 选人
+        self.assertEqual(self.pick(2), clicks[-1])
+
+    def test_records_recruited_role_once(self):
+        # 兜底选到治疗会记进 recruit_roles；页面停留再跑一遍不会重复计数
+        page = (("米卡", "治療"), ("凛", "核心"), ("九", "核心"))
+        task = PageTask(member_page(*page))
+        task.config.update({"主战员优先级": ["蕾伊"], "拉黑主战员": ["黛安娜"]})
+        task.member_status["recruit_roles"] = {"玛莉贝尔": "保护"}
+        task.ocr = lambda *a, **k: [text(*t, raw=True) for t in member_page(*page)]
+        self.assertTrue(utils_sortie.handle_member_selection(task))
+        self.assertEqual({"玛莉贝尔": "保护", "米卡": "治疗"}, task.member_status["recruit_roles"])
+        self.assertTrue(utils_sortie.handle_member_selection(task))
+        self.assertEqual({"玛莉贝尔": "保护", "米卡": "治疗"}, task.member_status["recruit_roles"])
+
+    def test_unreadable_role_not_counted(self):
+        # 候选都认不出职能时随机选，不记账
+        page = (("菲", ""), ("凛", ""), ("九", ""))
+        task = PageTask(member_page(*page))
+        task.config.update({"主战员优先级": ["蕾伊"], "拉黑主战员": ["黛安娜"]})
+        task.member_status["recruit_roles"] = {}
+        task.ocr = lambda *a, **k: [text(*t, raw=True) for t in member_page(*page)]
+        self.assertTrue(utils_sortie.handle_member_selection(task))
+        self.assertEqual({}, task.member_status["recruit_roles"])
 
 
 # 事件剧情对话（截图 20260930-164914）：自动对话被关掉时停在同一句

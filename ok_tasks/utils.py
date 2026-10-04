@@ -4787,7 +4787,7 @@ def _initial_node_status():
 
 
 def _initial_member_status():
-    """返回目标主战员状态的初始副本。"""
+    """返回本局主战员状态（装备、卡组、会合选到的队友职能）的初始副本。"""
     return {
         "equipment": {
             "names": ["", "", ""],
@@ -4795,6 +4795,7 @@ def _initial_member_status():
             "qualities": ["", "", ""],
         },
         "deck": {},
+        "recruit_roles": {},
     }
 
 

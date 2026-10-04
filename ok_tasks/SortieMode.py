@@ -66,6 +66,7 @@ class SortieMode(TriggerTask):
                 "qualities": ["", "", ""],
             },
             "deck": {},
+            "recruit_roles": {},
         }
 
         self._last_upload_time = 0

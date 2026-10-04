@@ -620,22 +620,60 @@ def handle_battle_member_selection(task: TriggerTask):
     return _select_battle_member(task)
 
 
+def _recruited_roles(task: TriggerTask):
+    """本局会合已选到的队友职能（名字 → 保护/治疗），用于保持盾奶平衡。"""
+    member_status = getattr(task, "member_status", None)
+    roles = member_status.get("recruit_roles") if isinstance(member_status, dict) else None
+    return roles if isinstance(roles, dict) else {}
+
+
+def _survival_counts(task: TriggerTask):
+    """本局已选队友里 保护/治疗 各几个。"""
+    roles = _recruited_roles(task)
+    return tuple(sum(1 for role in roles.values() if role == name) for name in SURVIVAL_ROLES)
+
+
+def _survival_order(task: TriggerTask):
+    """这一轮保护/治疗的选择顺序：本局已选的职能里少的优先，一样多优先保护。"""
+    protect, heal = _survival_counts(task)
+    return SURVIVAL_ROLES if protect <= heal else tuple(reversed(SURVIVAL_ROLES))
+
+
+def _record_recruit_role(task: TriggerTask, slot):
+    """记下会合选到的队友职能；同一个名字只记一次，页面停留导致的重复识别不会重复计数。"""
+    role = (slot.get("role") or "").strip()
+    name = (slot.get("name") or "").strip()
+    member_status = getattr(task, "member_status", None)
+    if role not in SURVIVAL_ROLES or not name or not isinstance(member_status, dict):
+        return
+    roles = member_status.setdefault("recruit_roles", {})
+    if not isinstance(roles, dict):
+        roles = member_status["recruit_roles"] = {}
+    if name in roles:
+        return
+    roles[name] = role
+    protect, heal = _survival_counts(task)
+    task.log_info(f"主战员选择: {role}角色「{name}」加入，本局已选 保护x{protect}/治疗x{heal}")
+
+
 def handle_member_selection(task: TriggerTask):
     """主战员选择页面: 优先选配置角色（跳过拉黑角色）；没有则点击名字下方按钮刷新一次，
-    刷新时留一个治疗/保护角色不刷；仍没有配置角色就选保护、再选治疗，都没有才随机选（跳过拉黑角色）。"""
+    刷新时保留本轮优先的职能（本局已选队友里保护少就留保护、治疗少就留治疗，一样多留保护），
+    刷新后仍没有配置角色就按同一顺序选保护/治疗，都没有才随机选（跳过拉黑角色）。"""
     prompt = find_box_at_point(task, 0.500, 0.931)
     if not (prompt and _get_game_text(task, '主战员') in prompt.name):
         return False
     priority = _get_member_priority(task)
     blacklisted = _get_blacklisted_members(task)
-    task.log_info(f"主战员选择: 优先级={priority}, 拉黑列表={blacklisted}")
+    order = _survival_order(task)
+    task.log_info(f"主战员选择: 优先级={priority}, 拉黑列表={blacklisted}, 本轮优先{'/'.join(order)}")
 
     def not_blacklisted(slot):
         return not any(blk in slot["name"] for blk in blacklisted)
 
     def survival_slot(slots):
-        """按 SURVIVAL_ROLES 的顺序找第一个治疗/保护角色。"""
-        for role in SURVIVAL_ROLES:
+        """按本轮优先顺序找第一个保护/治疗角色。"""
+        for role in order:
             slot = next((s for s in slots if s.get("role") == role and s["name"] and not_blacklisted(s)), None)
             if slot:
                 return slot
@@ -679,6 +717,7 @@ def handle_member_selection(task: TriggerTask):
             task.log_info("主战员选择: 所有候选都被拉黑，从全部候选中随机选择")
         chosen = random.choice(valid_slots)
         task.log_info(f"主战员选择: 未找到优先角色，随机选择「{chosen['name']}」")
+    _record_recruit_role(task, chosen)
     _move_and_click(task, chosen["x"], chosen["y"])
     task.sleep(1)
     # _move_and_click(task, 0.884, 0.931)
