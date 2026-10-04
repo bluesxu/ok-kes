@@ -218,14 +218,15 @@ class TestRecording(RecorderTestCase):
         self.assertIn("卡在确认页", meta["triggers"][0]["detail"])
 
     def test_mark_counts_from_button_press_while_writing_note(self):
-        self.frames(40)
+        # 手动标记：按下按钮前 50 秒、后 10 秒（自动触发仍是前后各 30 秒，见上一条用例）
+        self.frames(70)
         self.assertIsNone(recorder.hold(self.task))
-        self.frames(20)  # 写说明花了 20 秒，任务照常在跑
+        self.frames(5)  # 写说明花了 5 秒，任务照常在跑
         recorder.mark(self.task, "说明")
-        self.frames(11)
-        self.assertEqual(1, len(self.scenes()))  # 录到按下按钮后 30 秒
+        self.frames(8)
+        self.assertEqual(1, len(self.scenes()))  # 录到按下按钮后 10 秒
         meta, _ = scene.load(self.scene_path())
-        self.assertAlmostEqual(30, meta["triggers"][0]["t"], delta=1)  # 按下按钮前的 30 秒都在
+        self.assertAlmostEqual(50, meta["triggers"][0]["t"], delta=1)  # 按下按钮前的 50 秒都在
         self.assertAlmostEqual(60, meta["seconds"], delta=1.5)
 
     def test_cancel_note_saves_nothing(self):
@@ -234,7 +235,7 @@ class TestRecording(RecorderTestCase):
         recorder.unhold(self.task)
         self.frames(40)
         self.assertEqual([], self.scenes())
-        self.assertLessEqual(len(self.task._recorder["frames"]), recorder.PRE_SECONDS / 0.5 + 1)
+        self.assertLessEqual(len(self.task._recorder["frames"]), recorder.KEEP_SECONDS / 0.5 + 1)
 
     def test_background_drag_is_recorded(self):
         original = self.task.click_box
@@ -247,6 +248,15 @@ class TestRecording(RecorderTestCase):
 
     def test_mark_when_not_running_says_so(self):
         self.assertIn("没在运行", recorder.hold(self.task))
+        self.assertIsNone(self.task._recorder["hold"])
+
+    def test_mark_says_log_off_when_running_but_disabled(self):
+        # 实跑：关掉「详细战斗日志」后任务照跑，running() 却一直 False，标记按钮误报「任务没在运行」
+        self.task.config[battle_log.LOG_KEY] = False
+        self.frames(5)
+        self.assertEqual(0, len(self.task._recorder["frames"]))  # 照旧不记帧
+        self.assertTrue(recorder.running(self.task))
+        self.assertIn("没开", recorder.hold(self.task))
         self.assertIsNone(self.task._recorder["hold"])
 
     def test_handled_frame_resets_unhandled_timer(self):

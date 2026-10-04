@@ -22,7 +22,7 @@ class Globals(QObject):
             routeKey="mark_scene", icon=FluentIcon.FLAG, text=og.app.tr(MARK_TEXT),
             onClick=lambda: self._mark_scene(main_window), selectable=False,
             position=NavigationItemPosition.BOTTOM,
-            tooltip="把按下按钮前后各 30 秒的画面、识别结果和动作存成现场包，供事后排查")
+            tooltip="把按下按钮前 50 秒、后 10 秒的画面、识别结果和动作存成现场包，供事后排查")
 
     def _mark_scene(self, main_window):
         recorder = sys.modules.get("recorder")  # ok_tasks 下的模块，任务加载时已导入；热重载后取最新的
@@ -58,9 +58,9 @@ class _NoteDialog(MessageBoxBase):
     def __init__(self, parent):
         super().__init__(parent)
         self.viewLayout.addWidget(SubtitleLabel(MARK_TEXT, self))
-        intro = BodyLabel("自动化出了问题（卡住、点错、选错牌等）时用：把按下按钮前后各 30 秒的画面、"
+        intro = BodyLabel("自动化出了问题（卡住、点错、选错牌等）时用：把按下按钮前 50 秒、后 10 秒的画面、"
                           "识别结果和动作存成现场包，放在 battle_logs/现场，供事后排查。\n"
-                          "按下按钮时就已经开始记了，写说明不耽误；点「保存现场」后再录到按下按钮后 30 秒，"
+                          "按下按钮时就已经开始记了，写说明不耽误；点「保存现场」后再录到按下按钮后 10 秒，"
                           "点「取消」不存。", self)
         intro.setWordWrap(True)
         self.viewLayout.addWidget(intro)

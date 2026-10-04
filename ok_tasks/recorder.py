@@ -1,12 +1,13 @@
 """
-现场记录（出击模式、卡厄思模式共用）：内存里一直保留最近 30 秒的每一帧，出了问题把前后各 30 秒写成「现场包」，
-事后用 scripts/scene.py 看文字时间线、画框、生成回放页、离线重放。术语和事件见 CONTEXT.md「现场包」。
+现场记录（出击模式、卡厄思模式共用）：内存里一直保留最近 50 秒的每一帧，出了问题写成「现场包」（自动触发前后各
+30 秒，手动标记按下按钮前 50 秒、后 10 秒），事后用 scripts/scene.py 看文字时间线、画框、生成回放页、离线重放。
+术语和事件见 CONTEXT.md「现场包」。
 
 - 每帧记：全屏 OCR 文字、接手的处理函数（加速关闭时记不到）、所有识别调用的「方法 + 参数 → 结果」（重放时查表）、
   动作（点击坐标、按键）、这一帧写的战斗记录（出牌等决定和当时的识别结果）。
 - 画面：1280 宽 JPEG 每秒最多 2 张；有动作的那一帧一定存，并另存一份原尺寸（重放时复现识别）。编码在后台线程做。
 - 触发：TRIGGER_KINDS 里的异常、战斗输了、处理函数出错、主窗口侧边栏的「标记现场」按钮（src/globals.py，要写说明）。
-  录制中又触发就从新触发起再录 30 秒并入同一个包，单个包最长 3 分钟；同类异常每轮只完整保存一次，每轮最多 5 个包
+  录制中又触发就从新触发起再录（自动 30 秒、手动标记 10 秒）并入同一个包，单个包最长 3 分钟；同类异常每轮只完整保存一次，每轮最多 5 个包
   （手动标记不受这两条限制）。
 - 开关复用「详细战斗日志」+「异常截图」，与异常截图相同；清理复用 battle_logs 的保留天数和总大小上限，
   但手动标记的包不受自动清理（超天数/超大小都不删），只有先清完其余文件仍超限时，才从最旧的手动包删起
@@ -31,8 +32,11 @@ import numpy as np
 
 import battle_log
 
-PRE_SECONDS = 30      # 触发前保留多久
-POST_SECONDS = 30     # 触发后再录多久
+PRE_SECONDS = 30        # 自动触发前保留多久
+POST_SECONDS = 30       # 自动触发后再录多久
+MARK_PRE_SECONDS = 50   # 手动标记：按下按钮前保留多久
+MARK_POST_SECONDS = 10  # 手动标记：按下按钮后再录多久
+KEEP_SECONDS = max(PRE_SECONDS, MARK_PRE_SECONDS)  # 内存里一直保留最近多少秒
 MAX_SECONDS = 180     # 单个现场包最长多久
 MAX_PER_ROUND = 5     # 每轮最多几个现场包（手动标记不计）
 IMAGE_GAP = 0.5       # 没有动作的帧，两张画面至少隔这么久
@@ -99,7 +103,7 @@ def running(task):
 
 
 def hold(task):
-    """按下「标记现场」：先记下这一刻，写说明期间不裁掉这一刻之前 PRE_SECONDS 秒的帧。返回无法标记的原因，能标记返回 None。"""
+    """按下「标记现场」：先记下这一刻，写说明期间不裁掉这一刻之前 MARK_PRE_SECONDS 秒的帧。返回无法标记的原因，能标记返回 None。"""
     st = getattr(task, "_recorder", None)
     if st is None:
         return "任务没装现场记录"
@@ -112,11 +116,11 @@ def hold(task):
 
 
 def mark(task, note):
-    """说明写好了：下一帧开始录，录到按下按钮后 POST_SECONDS 秒。马上弹提示，不然要等录完才有动静。"""
+    """说明写好了：下一帧开始录，录到按下按钮后 MARK_POST_SECONDS 秒。马上弹提示，不然要等录完才有动静。"""
     st = task._recorder
     at = st["hold"] or time.time()
     st["mark"] = (at, note)
-    _notify(task, f"已标记，录到按下按钮后 {POST_SECONDS} 秒存好现场包")
+    _notify(task, f"已标记，录到按下按钮后 {MARK_POST_SECONDS} 秒存好现场包")
 
 
 def unhold(task):
@@ -148,6 +152,7 @@ def _run(task, st, inner):
                 st["frames"].clear()
                 st["images"].clear()
                 st["current"] = None
+                st["last_frame_t"] = time.time()  # 不记帧也要表明任务在跑，否则标记按钮会误报「任务没在运行」
             return inner()
         _begin_frame(task, st)
         try:
@@ -206,11 +211,11 @@ def _end_frame(task, st):
 
 
 def _prune(st, now):
-    """不在录制中时只留最近 PRE_SECONDS 秒；录制中的帧已放进 recording，这里照样裁掉。"""
+    """不在录制中时只留最近 KEEP_SECONDS 秒；录制中的帧已放进 recording，这里照样裁掉。"""
     frames, images = st["frames"], st["images"]
-    cutoff = now - PRE_SECONDS
-    if st["hold"] is not None and now - st["hold"] < MAX_SECONDS:  # 正在写说明：留住按下按钮前 PRE_SECONDS 秒
-        cutoff = min(cutoff, st["hold"] - PRE_SECONDS)
+    cutoff = now - KEEP_SECONDS
+    if st["hold"] is not None and now - st["hold"] < MAX_SECONDS:  # 正在写说明：留住按下按钮前 MARK_PRE_SECONDS 秒
+        cutoff = min(cutoff, st["hold"] - MARK_PRE_SECONDS)
     while frames and frames[0]["t"] < cutoff:
         frames.popleft()
     oldest = frames[0]["t"] if frames else now
@@ -397,6 +402,9 @@ def trigger(task, kind, detail="", at=None, note=None):
         return None
     now = time.time()
     at = now if at is None else min(at, now)
+    manual = kind == MANUAL
+    pre = MARK_PRE_SECONDS if manual else PRE_SECONDS
+    post = MARK_POST_SECONDS if manual else POST_SECONDS
     entry = {"kind": kind, "detail": detail, "t": at}
     if note:
         entry["note"] = note
@@ -405,7 +413,7 @@ def trigger(task, kind, detail="", at=None, note=None):
         rec = st["recording"]
         if rec is not None:
             rec["triggers"].append(entry)
-            rec["until"] = min(max(rec["until"], at + POST_SECONDS), rec["start"] + MAX_SECONDS)
+            rec["until"] = min(max(rec["until"], at + post), rec["start"] + MAX_SECONDS)
             _schedule(task, st, rec)
             return rec["path"]
         if kind != MANUAL:
@@ -424,10 +432,9 @@ def trigger(task, kind, detail="", at=None, note=None):
             st["count"] += 1
         stamp = datetime.datetime.fromtimestamp(now).strftime("%Y%m%d-%H%M%S")
         path = os.path.join(SCENE_DIR, f"{stamp}_{getattr(task, 'name', '')}_{kind}")
-        frames = list(st["frames"])
-        if kind == MANUAL:  # 按下按钮前 PRE_SECONDS 秒起（写说明期间多留的帧里更早的不要）
-            frames = [f for f in frames if f["t"] >= at - PRE_SECONDS]
-        rec = {"path": path, "start": frames[0]["t"] if frames else at, "until": at + POST_SECONDS,
+        # 缓冲留得比窗口久：自动触发取触发前 PRE_SECONDS 秒，手动标记取按下按钮前 MARK_PRE_SECONDS 秒
+        frames = [f for f in st["frames"] if f["t"] >= at - pre]
+        rec = {"path": path, "start": frames[0]["t"] if frames else at, "until": at + post,
                "triggers": [entry], "frames": frames, "timer": None,
                "round": battle_log._state(task)["round_id"], "battle": battle_log._state(task)["battle_id"]}
         rec["until"] = min(rec["until"], rec["start"] + MAX_SECONDS)
@@ -435,7 +442,7 @@ def trigger(task, kind, detail="", at=None, note=None):
             st["seen"].append({"kind": kind, "hit": st["last_hit"], "texts": texts, "times": 1, "path": path})
         st["recording"] = rec
         _schedule(task, st, rec)
-    task.log_info(f"现场记录：「{kind}」，记录前后 {PRE_SECONDS}+{POST_SECONDS} 秒到 {path}")
+    task.log_info(f"现场记录：「{kind}」，记录前后 {pre}+{post} 秒到 {path}")
     return path
 
 
