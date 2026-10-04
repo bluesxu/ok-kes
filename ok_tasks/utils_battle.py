@@ -317,12 +317,16 @@ def hp_bar_collapsed(frame):
     return rows >= 2
 
 
-def is_zero_hp(hp, last_hp, frame):
+def is_zero_hp(hp, last_hp, frame, was_zero=False):
     """我方血量是否为 0：读到 0 就是；实跑中血量打到 0 后血量文字读不出来（记录里 hp 为 null），
     这时要本场上一次读到的血量已经很低、且血条上没有绿色，才当成 0（文字被别的界面挡住时不误判）。
-    带着 0 血进入下一场战斗时本场没有读到过血量（实跑 17:48 战斗 4），血条变紫也算 0。"""
+    带着 0 血进入下一场战斗时本场没有读到过血量（实跑 17:48 战斗 4），血条变紫也算 0。
+    was_zero（上一帧就是 0 血）时只认血量文字：实跑 10/04 11:00 战斗 30 里血条判色每隔几秒抖一帧，
+    一抖就当成缓过来了去打 Boss，0 血期间的目标记忆跟着反复被打断。"""
     if hp:
         return hp[0] == 0
+    if was_zero:
+        return True
     if frame is None or not hp_bar_empty(frame):
         return False
     if last_hp and last_hp[0] <= last_hp[1] * _ZERO_HP_LAST_RATIO:
@@ -905,24 +909,33 @@ def update_head(state, enemies):
         state["head"], state["head_hp"] = (top["x"], top["y"]), top["hp"]
 
 
+def _sticky_match(enemies, sticky):
+    """记忆位置（0.04 内）命中的敌人，没有就返回 None。"""
+    if sticky is None:
+        return None
+    return next((e for e in enemies if abs(e["x"] - sticky[0]) < 0.04 and abs(e["y"] - sticky[1]) < 0.04), None)
+
+
 def choose_target(enemies, boss_battle, sticky, head=None, urgent=False):
     """攻击牌的目标，返回 (敌人, 理由)。
     Boss 战打 Boss；否则集火：沿用上一个目标直到它死，没有时挑有攻击意图（认不出按攻击算）的敌人里血量 + 护盾最少的，
-    少打死一个就少挨一个的打。urgent（我方血量为 0）：先打有攻击意图、行动倒计时小的。"""
+    少打死一个就少挨一个的打。urgent（我方血量为 0）：先打有攻击意图、行动倒计时小的，同样沿用上一个目标直到它死
+    （实跑 10/04 11:00 战斗 30 每帧重挑，敌人漏检一帧就换人，目标在 1/2/4 号之间乱跳，一个都没打死）。"""
     if not enemies:
         return None, "没有识别到敌人"
+    remembered = _sticky_match(enemies, sticky)
     if urgent:
+        if remembered is not None:
+            return remembered, "继续打同一个敌人"
         return min(enemies, key=_threat_rank), "攻击意图、行动倒计时小、血少的优先"
     if boss_battle:
         if head is not None:
-            same = [e for e in enemies if abs(e["x"] - head[0]) < 0.04 and abs(e["y"] - head[1]) < 0.04]
-            if same:
-                return same[0], "Boss 战继续打 Boss"
+            same = _sticky_match(enemies, head)
+            if same is not None:
+                return same, "Boss 战继续打 Boss"
         return max(enemies, key=lambda e: e["hp"]), "Boss 战优先打血量最多的 Boss"
-    if sticky is not None:
-        same = [e for e in enemies if abs(e["x"] - sticky[0]) < 0.04 and abs(e["y"] - sticky[1]) < 0.04]
-        if same:
-            return same[0], "继续打同一个敌人"
+    if remembered is not None:
+        return remembered, "继续打同一个敌人"
     return min(enemies, key=_focus_rank), "集火：攻击意图、血量加护盾最少的优先"
 
 
@@ -1007,7 +1020,8 @@ def start_battle(task):
     state = _state(task)
     state.clear()
     _new_turn(state)
-    state.update(sticky=None, sticky_full=None, drag_fail={}, last_remaining=None, last_seen=time.time(), zero_frames=0)
+    state.update(sticky=None, sticky_full=None, drag_fail={}, last_remaining=None, last_seen=time.time(),
+                 zero_frames=0, zero_hp=False)
     state["not_zero"] = set()  # AP 用完时试过、确认要花 AP 的牌名，这一场不再试（见 play_turn）
     state["probe_fails"] = {}  # 上面那些牌各自试失败了几次
     session = _session(task)
@@ -1351,7 +1365,9 @@ def play_turn(task, hand_count, finish_turn_visible):
     defense = _get_config_value(task, DEFENSE_KEY, [])
     hp = read_hp(task)
     # 血量为 0：再挨一次打就输，不出护盾牌、崩溃牌，攻击先打马上要动手的敌人
-    zero_hp = is_zero_hp(hp, state.get("last_hp"), frame)
+    was_zero = state.get("zero_hp", False)
+    zero_hp = is_zero_hp(hp, state.get("last_hp"), frame, was_zero=was_zero)
+    state["zero_hp"] = zero_hp
     if hp:
         state["last_hp"] = hp
     lethal, after = False, 1.0
@@ -1393,8 +1409,11 @@ def play_turn(task, hand_count, finish_turn_visible):
     if use_drag or untyped:
         use_drag = True
         if zero_hp:
-            # 不再优先打 Boss、也不沿用上一个目标：先打有攻击意图、行动倒计时小、血少的
-            target, target_reason = choose_target(enemies, False, None, urgent=True)
+            if not was_zero:
+                # 刚进入 0 血：不沿用之前的目标（可能是一直打不动的 Boss），重挑马上要动手的；之后沿用记忆
+                state["sticky"] = state["sticky_full"] = None
+            target, target_reason = choose_target(enemies, False, state["sticky"], urgent=True)
+            target, target_reason = _keep_remembered_target(frame, state, target, target_reason)
             target_reason = target_reason and "血量为 0，" + target_reason
         else:
             if boss_battle:

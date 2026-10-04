@@ -426,6 +426,12 @@ class TestChooseTarget(unittest.TestCase):
         enemies = [enemy(300, 2, "增益", x=0.3), enemy(900, 1, "攻击", x=0.5), enemy(500, 5, "攻击", x=0.7)]
         self.assertEqual(900, battle.choose_target(enemies, True, None, (0.3, 0.3), urgent=True)[0]["hp"])
 
+    def test_urgent_keeps_sticky_target(self):
+        # 实跑 10/04 11:00 战斗 30：0 血时每帧重挑，目标漏检一帧就换人，4 号打了两发又去打 1 号
+        enemies = [enemy(300, 0, "攻击", x=0.3), enemy(900, 3, "攻击", x=0.9)]
+        self.assertEqual(900, battle.choose_target(enemies, False, (0.91, 0.3), urgent=True)[0]["hp"])  # 记忆命中：接着打
+        self.assertEqual(300, battle.choose_target(enemies, False, (0.61, 0.3), urgent=True)[0]["hp"])  # 不在列表：按威胁挑
+
     def test_sticky_target_until_gone(self):
         enemies = [enemy(300, 1, "攻击", x=0.3), enemy(900, 5, "攻击", x=0.7)]
         self.assertEqual(900, battle.choose_target(enemies, False, (0.71, 0.3))[0]["hp"])
@@ -715,7 +721,27 @@ class TestPlayTurn(unittest.TestCase):
                 mock.patch.object(battle, "read_enemies", lambda task, frame: enemies), \
                 mock.patch.object(battle, "_drag_card", lambda task, c, t: targets.append(t["hp"])):
             battle.play_turn(self.task, 2, True)
-        self.assertEqual([900], targets)
+            self.task._battle["sticky"] = (0.7, 0.3)          # 模拟 0 血前一直在打 Boss
+            self.task._battle["sticky_full"] = dict(enemies[0])
+            self.task._battle["zero_hp"] = False              # 模拟这一帧刚进 0 血
+            battle.play_turn(self.task, 2, True)
+        self.assertEqual([900, 900], targets)  # 进入 0 血不沿用之前的目标（Boss），重挑马上要动手的
+
+    def test_zero_hp_keeps_sticky_target_when_missed(self):
+        # 实跑 10/04 11:00 战斗 30：0 血时每帧重挑，打了一半的 4 号漏检一帧就被换掉，一个都没打死
+        targets = []
+        first = [dict(enemy(2633, 0, "攻击", x=0.85), drop=(0.85, 0.5)),
+                 dict(enemy(858, 3, "攻击", x=0.3), drop=(0.3, 0.5))]
+        missed = [first[1]]  # 4 号这一帧没认出来
+        frames = iter([first, missed])
+        self.task.default_config["出牌优先级"] = ["破碎"]
+        with mock.patch.object(battle, "read_hp", lambda task: (0, 1700)), \
+                mock.patch.object(battle, "read_enemies", lambda task, frame: next(frames)), \
+                mock.patch.object(battle, "_bar_still_there", lambda frame, x, y: True), \
+                mock.patch.object(battle, "_drag_card", lambda task, c, t: targets.append(t["hp"])):
+            battle.play_turn(self.task, 2, True)  # 挑倒计时 0 的 4 号
+            battle.play_turn(self.task, 2, True)  # 漏检：血条复查还在，继续打它
+        self.assertEqual([2633, 2633], targets)
 
     def test_attack_card_is_dragged(self):
         self.task.default_config["出牌优先级"] = ["破碎"]
@@ -1429,6 +1455,10 @@ class TestStuckScreens(unittest.TestCase):
         self.assertFalse(battle.is_zero_hp(None, (177, 1583), full))      # 血条上还有绿色：只是文字被挡住
         self.assertFalse(battle.is_zero_hp(None, (1200, 1583), empty))    # 上次还剩很多血：不可能一下到 0
         self.assertFalse(battle.is_zero_hp(None, None, empty))
+        # 已经 0 血时血条判色抖了一帧（这张截图判出绿色）、血量文字又读不到：保持 0 血，不再看血条
+        # （实跑 10/04 11:00 战斗 30：抖一下就去打 Boss，目标记忆被打断）
+        self.assertTrue(battle.is_zero_hp(None, (177, 1583), full, was_zero=True))
+        self.assertFalse(battle.is_zero_hp((400, 1583), None, full, was_zero=True))  # 读到血量了：正常判断
 
     def test_zero_hp_carried_into_new_battle(self):
         # 实跑 17:48 战斗 4：带着 0 血进场，本场一次血量都没读到，血条是紫色乱码；没认出 0 血，去按崩溃牌「衝動」
