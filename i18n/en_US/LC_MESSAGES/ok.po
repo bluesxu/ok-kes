@@ -302,8 +302,8 @@ msgstr "When battle_logs grows beyond this size, the oldest files are deleted fi
 msgid "要刷存档的主战员名字。好装备、冥想、移除卡牌都优先给这个人，结算时存进存档的也是这个人"
 msgstr "Name of the member whose archive you are farming. Good equipment, meditation and card removal go to this member first, and this member's data is what gets saved."
 
-msgid "打完第一层就结束本轮（到第一层 boss 前直接撤退），本轮记成功"
-msgstr "End the run after the first layer (retreat right before the first-layer boss) and count it as a success."
+msgid "打完第一层 boss 就结束本轮（打完 boss 撤退），本轮记成功"
+msgstr "End the run after beating the first-layer boss (retreat once the boss is defeated) and count it as a success."
 
 msgid "跑完这么多轮后自动停止，0 为一直跑"
 msgstr "Stop automatically after this many runs; 0 runs forever."

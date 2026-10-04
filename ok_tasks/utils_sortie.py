@@ -560,7 +560,24 @@ def handle_sortie_reward_settlement(task: TriggerTask):
         task.sleep(1)
         return True
     task.log_info("检测到出击模式奖励结算页面，关闭页面")
-    return _finish_only_first_layer(task) if not task.node_status.get('is_escaped', False) else False
+    if task.node_status.get('is_escaped', False):
+        return False
+    _mark_sortie_boss_cleared(task)
+    return _finish_only_first_layer(task)
+
+
+def _mark_sortie_boss_cleared(task: TriggerTask):
+    """出击模式走到奖励结算页，说明本轮的首领已经打完，把它补记到通关层数上。
+    正常路径是 reach_final_boss → 结算按钮让 pass_final_boss_count + 1，但 reach_final_boss 会因为
+    工具重启（实跑 10/03 21:20 点完首领节点就重启，21:21 打完首领没退）、或首领节点被识别成普通节点
+    而丢掉，只打第一层就不会退出（实跑 10/03 18:53、21:21 两轮都是到了结算页却没退）。
+    只在「只打第一层」开启时补记，连打多层时不影响层数统计和初始节点判断。"""
+    if not _get_config_value(task, '只打第一层', False):
+        return
+    if task.node_status.get('pass_final_boss_count', 0) > 0:
+        return
+    task.node_status['pass_final_boss_count'] = 1
+    task.log_info("只打第一层：已到本轮奖励结算页，补记通关层数 1")
 
 
 def handle_sortie_reward_claim(task: TriggerTask):

@@ -1304,23 +1304,54 @@ class TestRoundSuccessCount(unittest.TestCase):
             utils._finish_only_first_layer(task)
         self.assertEqual(1, task.node_status["success_rounds"])
 
-    def test_only_first_layer_retreats_at_boss(self):
-        clicks, escaped = [], []
+    def test_only_first_layer_enters_boss_node(self):
+        # 用户 10/03：只打第一层也要打完 boss 再退出，不再到 boss 前撤退
+        clicks = []
         task = mock.MagicMock()
         task.node_status = utils._initial_node_status()
         task.default_config = {"只打第一层": True}
         task.config = {}
-        task._boss_retreat_click_time = 0
-        menu_open = {"value": False}
+        task._route_node_click_time = 0
+        task.find_feature.side_effect = lambda feature_name=None, box=None: (
+            [object()] if feature_name == "position" else [])
         with mock.patch.object(utils, "_move_and_click", lambda t, x, y: clicks.append((x, y))), \
-                mock.patch.object(utils, "handle_escape", lambda t: menu_open["value"] and not escaped.append(1)):
-            for _ in range(3):  # 菜单还没弹出，路线页连续识别三帧：只点一次右上角
-                self.assertTrue(utils._retreat_before_boss(task))
-            menu_open["value"] = True
-            self.assertTrue(utils._retreat_before_boss(task))
-        self.assertEqual([(0.959, 0.053)], clicks)
-        self.assertEqual([1], escaped)
+                mock.patch.object(utils, "_log_route_choice", lambda *a, **k: None), \
+                mock.patch.object(utils, "handle_escape", lambda t: self.fail("打完 boss 前不该撤退")):
+            self.assertTrue(utils.handle_route_selection(task))
+        self.assertEqual([(0.815, 0.492)], clicks)
+        self.assertTrue(task.node_status["reach_final_boss"])
+        self.assertEqual(0, task.node_status["success_rounds"])
+
+    def test_sortie_reward_settlement_marks_boss_cleared(self):
+        # 实跑 10/03 18:53、21:21：打完第一层 boss 走到奖励结算页，但 reach_final_boss 因重启
+        # 或首领节点被识别成普通节点而丢失，pass_final_boss_count 没加上，只打第一层不退出；
+        # 结算页出现时直接补记通关层数
+        title = Box(1400, 90, 130, 30, name="结算")
+        task = mock.MagicMock()
+        task.node_status = utils._initial_node_status()
+        task.default_config = {"只打第一层": True}
+        task.config = {}
+        escaped = []
+        with mock.patch.object(utils_sortie, "find_box_at_point",
+                               lambda t, x, y: title if (x, y) == (0.550, 0.068) else None), \
+                mock.patch.object(utils, "_open_escape_menu", lambda t, y: escaped.append(y)):
+            self.assertTrue(utils_sortie.handle_sortie_reward_settlement(task))
+        self.assertEqual(1, task.node_status["pass_final_boss_count"])
         self.assertEqual(1, task.node_status["success_rounds"])
+        self.assertEqual([0.051], escaped)
+
+    def test_sortie_reward_settlement_no_mark_without_first_layer(self):
+        # 没开「只打第一层」时不动层数，连打多层的统计和初始节点判断保持原样
+        title = Box(1400, 90, 130, 30, name="结算")
+        task = mock.MagicMock()
+        task.node_status = utils._initial_node_status()
+        task.default_config = {"只打第一层": False}
+        task.config = {}
+        with mock.patch.object(utils_sortie, "find_box_at_point",
+                               lambda t, x, y: title if (x, y) == (0.550, 0.068) else None):
+            self.assertFalse(utils_sortie.handle_sortie_reward_settlement(task))
+        self.assertEqual(0, task.node_status["pass_final_boss_count"])
+        self.assertEqual(0, task.node_status["success_rounds"])
 
     def test_escape_menu_only_clicked_after_deciding_to_retreat(self):
         # 实跑 22:05：关卡牌弹窗的 ESC 落到战斗里打开了菜单，看到「撤退」就点了，满血放弃一轮
