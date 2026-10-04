@@ -1437,6 +1437,47 @@ class TestStuckScreens(unittest.TestCase):
         for name in ("boss_full_hp", "hand_lowered", "preview_hit", "intent_panel"):
             self.assertFalse(battle.hp_bar_collapsed(screenshot_task(name).frame), name)
 
+    def test_wipe_stuck_retreats_from_top_right_menu(self):
+        # 实跑 10/04 10:11 战斗 14（精英尼希隆）：敌方回合打死全队后游戏停在战斗画面不动，
+        # 结束回合按钮变灰、点场地中间几百次都没用，用户 13 分钟后从右上角菜单手动撤退
+        task = screenshot_task("wipe_stuck")
+        task._last_change_time = time.time() - 61
+        task._escape_requested_at = 0
+        done = []
+        with mock.patch.object(utils, "is_frame_stuck", lambda task, **k: True), \
+                mock.patch.object(utils.battle_log, "anomaly", lambda *a, **k: None), \
+                mock.patch.object(utils.battle_log, "record", lambda t, event, **k: done.append(event)), \
+                mock.patch.object(utils, "_open_escape_menu", lambda t, y: done.append(y)):
+            self.assertTrue(utils.handle_stuck_log(task))
+        self.assertEqual(["全灭撤退", 0.053], done)      # 记一笔后点右上角菜单，handle_escape 接着点「撤退」
+
+    def test_wipe_stuck_waits_before_retreating(self):
+        # 卡住 30 秒还不到撤退门槛：先走老兜底（点场地中间放牌），别把拿在手里的牌当成全灭
+        task = screenshot_task("wipe_stuck")
+        task._last_change_time = time.time() - 30
+        task._escape_requested_at = 0
+        task.find_one = lambda **k: None
+        task.box_of_screen = lambda *a: None
+        task.log_info = lambda m: None
+        done = []
+        with mock.patch.object(utils, "is_frame_stuck", lambda task, **k: True), \
+                mock.patch.object(utils.battle_log, "anomaly", lambda *a, **k: None), \
+                mock.patch.object(utils, "recognize_cards", lambda t, **k: []), \
+                mock.patch.object(utils, "handle_unknown_page", lambda t: False), \
+                mock.patch.object(utils, "_esc_fallback", lambda t, reason: done.append(reason)), \
+                mock.patch.object(utils, "_open_escape_menu", lambda t, y: done.append("escape")), \
+                mock.patch.object(utils_sortie, "handle_secret_enemy", lambda t: False):
+            self.assertFalse(utils.handle_stuck_log(task))
+        self.assertNotIn("escape", done)
+        self.assertEqual(1, len(done))                   # 走的是 _esc_fallback
+
+    def test_wipe_lock_requires_empty_collapsed_bar(self):
+        # 全灭软锁的三个条件缺一不可：战斗页面（手牌数压着）+ 血条绿色全空 + 血条紫色。
+        # 弹窗盖住血条的战斗页（monster_panel_stuck）只算「空」不算「紫」，正常战斗页一个都不算
+        self.assertTrue(utils._battle_wipe_locked(screenshot_task("wipe_stuck")))
+        for name in ("boss_full_hp", "card_selected_stuck", "monster_panel_stuck", "intent_panel"):
+            self.assertFalse(utils._battle_wipe_locked(screenshot_task(name)), name)
+
     def test_collect_intent_does_not_click_close_when_panel_never_opened(self):
         # 意图采集点开敌人后没读到面板：不能去点「关闭」位置（大 Boss 身上）
         task = screenshot_task("boss_full_hp")

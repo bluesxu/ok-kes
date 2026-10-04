@@ -1917,6 +1917,17 @@ def handle_stuck_log(task: TriggerTask):
         task._stuck_reported = task._last_change_time
         battle_log.anomaly(task, "画面卡住", f"画面已 {stuck_seconds} 秒没有变化",
                            texts=[box.name for box in (getattr(task, "all_texts", None) or [])][:120])
+
+    # 全员死亡后的软锁（见 _battle_wipe_locked）：点场地中间（_esc_fallback）对拿在手里的牌有用，
+    # 对软锁没用——实跑点了几百次画面一动不动，只有右上角菜单的「撤退」能出来。距上次请求不到 30 秒
+    # 就不重复点，给 handle_escape 留出点「撤退」的时间（那个窗口也是 30 秒）。
+    if (stuck_seconds >= _BATTLE_WIPE_RETREAT_AFTER and _battle_wipe_locked(task)
+            and time.time() - getattr(task, "_escape_requested_at", 0) > _ESCAPE_INTENT_SECONDS):
+        task.log_info(f"画面卡住已持续{stuck_seconds}秒，我方血条紫色空掉（全员死亡后软锁），点右上角菜单撤退")
+        battle_log.record(task, "全灭撤退", reason=f"全员死亡后画面卡死{stuck_seconds}秒")
+        _open_escape_menu(task, 0.053)
+        return True
+
     close_page = task.find_one(
         feature_name="close_page",
         box=task.box_of_screen(0.921, 0.003, 0.998, 0.100),
@@ -2038,6 +2049,7 @@ def log_node_status(task: TriggerTask):
 
 _ESC_FALLBACK_AFTER = 20  # 没有处理函数认领画面 / 画面卡住且别的兜底都没动作，持续这么多秒就兜底一次
 _ESC_FALLBACK_GAP = 10    # 两次兜底至少间隔这么久，给页面留出响应时间
+_BATTLE_WIPE_RETREAT_AFTER = 60  # 战斗页面 + 我方血条紫色空掉又卡住这么久：全员死亡后软锁，点右上角菜单撤退
 _CARD_HELD_POINT = (0.5, 0.45)           # 战斗里「把拿在手里的牌放下」的点击位置（和拖牌打空地的落点一致）
 _CARD_HELD_TEXT = re.compile(r"\d+/10")  # 手牌数「N/10」就压在战斗页下方中央，读到它说明是战斗页面
 # 卡死兜底时按文字找的安全按钮：点一下只会推进/关闭页面，不会消费或做不可逆操作（命运结算页的「跳过」不在内）
@@ -2049,6 +2061,20 @@ def _on_battle_page(task: TriggerTask) -> bool:
     牌的拖动松手消息丢了、或数字键选中后回车没跟上时，牌会一直拿在手里、结束回合按钮变灰，见 _esc_fallback。"""
     box = find_box_at_point(task, 0.509, 0.972)
     return bool(box and _CARD_HELD_TEXT.search(box.name))
+
+
+def _battle_wipe_locked(task: TriggerTask) -> bool:
+    """全员死亡后游戏不再推进的软锁：画面还是战斗页面（手牌数压着），但我方血条已经变紫、绿色全空。
+    实跑 10/04 10:11 战斗 14（精英尼希隆）：打完最后一手后敌方回合打死全队，游戏就停在战斗画面
+    （结束回合按钮变灰、点场地中间几百次都没用），用户 13 分钟后从右上角菜单手动撤退才出来。
+    血条用 utils_battle 那套判断（弹窗盖住血条只算「空」不算「紫」）：只有真 0 血才是两行都紫。"""
+    frame = getattr(task, "frame", None)
+    if frame is None:
+        return False
+    if not _on_battle_page(task):
+        return False
+    from utils_battle import hp_bar_collapsed, hp_bar_empty
+    return hp_bar_empty(frame) and hp_bar_collapsed(frame)
 
 
 def _esc_fallback(task: TriggerTask, reason: str) -> bool:
