@@ -1318,6 +1318,88 @@ class TestBattleLogEvents(unittest.TestCase):
         self.assertEqual("获得法典", row["event"], row)
         self.assertEqual(("获得法典", [None, None, "150pt"], 3), (row["event"], row["options"], row["chosen"]))
 
+    def test_process_step_records_wait_and_already_read_numbers(self):
+        self.task._read_hp = (80, 100)
+        self.task._read_credit = 40
+        self.task._gate_report = True
+        battle_log.observe_frame(self.task, "handle_shop")
+        self.now[0] += 2.5
+        self.task._gate_report = False
+        battle_log.observe_frame(self.task, "handle_rest")
+        shop, rest = [row for row in self.rows() if row["event"] == "过程"]
+        self.assertEqual("handle_shop", shop["handler"])
+        self.assertNotIn("waited", shop)
+        self.assertEqual([80, 100], shop["hp"])
+        self.assertEqual(40, shop["credit"])
+        self.assertTrue(shop["gate_early"])
+        self.assertEqual(2.5, rest["waited"])
+        self.assertFalse(rest["gate_early"])
+        self.assertNotIn("hp", rest)
+        self.assertNotIn("credit", rest)
+
+    def test_process_skips_auto_battle_frames_and_other_modes(self):
+        battle_log.observe_frame(self.task, "handle_battle_auto_check")
+        self.task.name = "自动出击模式"
+        battle_log.observe_frame(self.task, "handle_shop")
+        self.assertEqual([], [row["event"] for row in self.rows()])
+
+    def test_unclaimed_screen_is_one_span(self):
+        battle_log.observe_frame(self.task, None)
+        self.now[0] += 0.4
+        battle_log.observe_frame(self.task, None)
+        self.now[0] += 2
+        self.task.all_texts = [Box(0, 0, 10, 10, name="另一页")]
+        battle_log.observe_frame(self.task, None)
+        self.now[0] += 0.2
+        battle_log.observe_frame(self.task, "handle_shop")
+        events = [row["event"] for row in self.rows()]
+        self.assertEqual(["无人接手", "过程"], events)
+        self.assertGreaterEqual(self.rows()[0]["seconds"], 2)
+        self.assertIn("奇怪的页面", self.rows()[0]["texts"])
+
+    def test_short_unclaimed_gap_is_not_recorded(self):
+        battle_log.observe_frame(self.task, None)
+        self.now[0] += 0.3
+        battle_log.observe_frame(self.task, "handle_shop")
+        self.assertEqual(["过程"], [row["event"] for row in self.rows()])
+
+    def test_process_shot_is_1280_wide_and_follows_the_log_switch(self):
+        self.task.frame = np.zeros((1000, 2000, 3), np.uint8)
+        path = battle_log.process_shot(self.task, "进入节点")
+        image = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+        self.assertEqual(1280, image.shape[1])
+        self.task.config = {battle_log.LOG_KEY: False}
+        self.assertIsNone(battle_log.process_shot(self.task, "进入节点"))
+
+    def test_archive_keep_and_delete_are_logged(self):
+        import utils_chaos
+        clicks = []
+        feature = Box(1000, 400, 40, 40, name="delete")
+        title = Box(1200, 100, 200, 40, name="存储数据收集完成")
+        task = SimpleNamespace(**vars(self.task))
+        task.config = {"保留大于多少TB的存档": 60000, "游戏语言": "简体中文", battle_log.LOG_KEY: True}
+        task.default_config = {battle_log.LOG_KEY: True}
+        task.sleep = lambda s: None
+        task.click_box = clicks.append
+        task.find_feature = lambda feature_name=None, **kwargs: [feature] if feature_name == "deletecards" else []
+        task.frame = None
+        values = iter([Box(800, 360, 80, 30, name="70000"), Box(800, 360, 80, 30, name="10000")])
+
+        def find_box(task, x, y):
+            if abs(x - 0.505) < 0.01 and abs(y - 0.111) < 0.01:
+                return title
+            return next(values)
+
+        with mock.patch.object(utils_chaos, "find_box_at_point", find_box), \
+                mock.patch.object(utils_chaos, "_get_game_text", lambda task, text: text):
+            self.assertFalse(utils_chaos.handle_data_collected(task))
+            self.assertTrue(utils_chaos.handle_data_collected(task))
+        rows = [row for row in self.rows() if row["event"] == "存档取舍"]
+        self.assertEqual(["保留", "删除"], [row["decision"] for row in rows])
+        self.assertEqual([70000, 10000], [row["value"] for row in rows])
+        self.assertEqual(60000, rows[0]["threshold"])
+        self.assertEqual(1, len(clicks))
+
 
 class TestRoundSuccessCount(unittest.TestCase):
 
@@ -1600,6 +1682,33 @@ class TestFlash(unittest.TestCase):
             task._flash_choice_clicked_at -= 5     # 页面一直没响应（那次点击可能被吞）
             self.assertTrue(utils.handle_view_original(task))
             self.assertEqual(2, len(clicks))       # 超过重试间隔才允许再点
+
+    def test_view_original_unlocks_when_the_page_changes(self):
+        """加速模式下页面已经变了就解除 4 秒锁定，把这一帧交给后面的处理函数。"""
+        clicks = []
+        task = flash_task(加速模式=True)
+        task.width, task.height = 2560, 1440
+        task.all_texts = [Box(100, 100, 80, 30, name="查看之前的闪光")]
+        prompt = SimpleNamespace(name="查看之前的闪光")
+        cards = [dict(version("钴蓝之光", "攻击", "造成168%×4的伤害"), x=0.2, y=0.3)]
+        with mock.patch.object(utils, "find_box_at_point", lambda task, x, y: prompt), \
+                mock.patch.object(utils, "_get_game_text", lambda task, text: text), \
+                mock.patch.object(utils, "recognize_cards", lambda task, page="": cards), \
+                mock.patch.object(utils, "_flash_rules", lambda task: []), \
+                mock.patch.object(utils, "find_target_card", lambda task: ([], [])), \
+                mock.patch.object(utils, "_matching_meditation_card_names", lambda task, cards: []), \
+                mock.patch.object(utils, "_move_and_click", lambda task, x, y: clicks.append((x, y))), \
+                mock.patch.object(battle_log, "record", lambda *a, **k: None), \
+                mock.patch.object(battle_log, "process_shot", lambda *a, **k: None):
+            self.assertTrue(utils.handle_view_original(task))
+            self.assertEqual(1, len(clicks))
+            self.assertTrue(utils.handle_view_original(task))   # 画面没变：继续等，不改点
+            self.assertEqual(1, len(clicks))
+            task.all_texts = [Box(100 + i * 200, 800, 80, 30, name=name) for i, name in enumerate(
+                ["确认", "详情一", "详情二", "详情三", "详情四"])]
+            self.assertFalse(utils.handle_view_original(task))  # 页面变了：这一帧不再占住
+            self.assertFalse(utils.handle_view_original(task))  # 锁定还在，不会改点
+            self.assertEqual(1, len(clicks))
 
 
 def read_frame(name):

@@ -12,6 +12,7 @@ from config_io import (
     migrate_game_language_config_file,
 )
 from config_sync import check_upload_if_needed, show_hot_configs_dialog
+import battle_log
 from utils import (
     reset_all_status,
     _migrate_route_boss_to_elite,
@@ -146,10 +147,17 @@ class ChaosMode(TriggerTask):
 
     def run(self):
         # 每帧执行一次 OCR 并转简体, 供各页面处理函数复用
+        self._read_hp = None
+        self._read_credit = None
         self.all_texts = _simplify_texts(self.ocr())
         # 依次尝试各页面处理函数, 命中(返回 True)即结束本次循环
+        hit = None
         for handle_page in utils_chaos.PAGE_HANDLERS:
             if handle_page(self):
-                return
+                hit = handle_page.__name__
+                break
+        battle_log.observe_frame(self, hit)
+        if hit is not None:
+            return
         # 帧末尾检查是否需要上传配置
         self._check_upload_if_needed()

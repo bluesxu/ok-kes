@@ -931,6 +931,11 @@ def handle_data_collected(task: TriggerTask):
                         f"{feature_name}对应存档价值{archive_value}TB高于保留阈值"
                         f"{retain_threshold}TB，跳过删除"
                     )
+                    if battle_log.once(task, ("存档取舍", feature_name, archive_value, "保留")):
+                        battle_log.record(
+                            task, "存档取舍", feature=feature_name, value=archive_value,
+                            threshold=retain_threshold, decision="保留",
+                        )
                     continue
                 if archive_value is None:
                     task.log_info(
@@ -941,6 +946,13 @@ def handle_data_collected(task: TriggerTask):
                         f"{feature_name}对应存档价值{archive_value}TB不高于阈值"
                         f"{retain_threshold}TB，点击删除"
                     )
+                decision = "删除"
+                if battle_log.once(task, ("存档取舍", feature_name, archive_value, decision)):
+                    battle_log.record(
+                        task, "存档取舍", feature=feature_name, value=archive_value,
+                        threshold=retain_threshold, decision=decision,
+                    )
+                battle_log.process_shot(task, "结算删存档")
                 task.click_box(feature)
                 task.sleep(1)
                 return True

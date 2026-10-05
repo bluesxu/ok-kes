@@ -201,7 +201,17 @@ def _get_current_credit(task: TriggerTask):
             val = int(box.name)
             if val > credit:
                 credit = val
+    if credit > 0:
+        task._read_credit = credit  # 过程账只用这一帧已经读到的数，不再为记账重读
     return credit
+
+
+def _acceleration_on(task: TriggerTask):
+    """加速模式开着才改等待。配置里没有这一项时保持原时序（测试和未装补丁的任务）。"""
+    config = getattr(task, "config", None)
+    if not isinstance(config, dict):
+        return False
+    return bool(config.get("加速模式", False))
 
 
 def _neutral_card_limit(task: TriggerTask):
@@ -265,7 +275,9 @@ def _get_current_hp(task: TriggerTask):
     hp_match = hp_box and re.search(r'(\d+)/(\d+)', hp_box.name)
     if not hp_match or int(hp_match.group(2)) <= 0:
         return None
-    return int(hp_match.group(1)), int(hp_match.group(2))
+    hp = int(hp_match.group(1)), int(hp_match.group(2))
+    task._read_hp = hp  # 过程账只用这一帧已经读到的数，不再为记账重读
+    return hp
 
 
 def _get_current_hp_percent(task: TriggerTask):
@@ -1511,6 +1523,7 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
                 continue
             task.log_info(f"{page}: {reason}「{card['name']}」")
             log_pick(card, reason)
+            battle_log.process_shot(task, "选牌")
             _move_and_click(task, card["x"], card["y"])
             task.sleep(0.3)
             card["selected"] = True
@@ -1518,6 +1531,11 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
             record_pending_removal()
             _note_select_card_pick(task, card["x"], card["y"], card["name"])
             clicked = True
+            if _acceleration_on(task) and any(
+                not later["selected"] and predicate(later) for later in cards[cards.index(card) + 1:]
+            ):
+                # 下一张也在这一页：这一帧先停，0.3 秒交给文字闸门。后面没有要连点的牌就继续翻页。
+                return "pause"
         return clicked
 
     def click_priority_cards(cards):
@@ -1541,6 +1559,7 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
                     f"{page}: 命中优先级「{target}」，点击目标卡牌「{card['name']}」"
                 )
                 log_pick(card, f"命中优先级「{target}」")
+                battle_log.process_shot(task, "选牌")
                 _move_and_click(task, card["x"], card["y"])
                 task.sleep(0.3)
                 card["selected"] = True
@@ -1548,7 +1567,25 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
                 record_pending_removal()
                 _note_select_card_pick(task, card["x"], card["y"], card["name"])
                 clicked = True
+                if _acceleration_on(task) and _another_priority_card(target, card):
+                    return "pause"
         return clicked
+
+    def _another_priority_card(current_target, clicked_card):
+        """这一页上还有没有下一张马上要点的优先级牌。有的话这一帧先停，没有就继续翻页。"""
+        targets = [name.strip() for name in card_names if isinstance(name, str) and name.strip()]
+        try:
+            start = targets.index(current_target.strip())
+        except ValueError:
+            start = 0
+        for name in targets[start:]:
+            for later in cards:
+                if later is clicked_card or later["selected"]:
+                    continue
+                later_name = later["name"].strip()
+                if name in later_name or later_name in name:
+                    return True
+        return False
 
     def click_target_member_row_cards(cards):
         """刷空档时优先移除目标主战员同一排的卡牌。"""
@@ -1620,12 +1657,21 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
         f"是否仅一页卡牌={single_page}"
     )
 
+    def _paused(result):
+        """加速时一帧只点一张，把连点之间的等待交给文字闸门。"""
+        if result == "pause":
+            task.log_info(f"{page}: 已点一张，等页面响应后再点下一张")
+            return True
+        return False
+
     while True:
-        click_target_member_row_cards(cards)
+        if _paused(click_target_member_row_cards(cards)):
+            return True
         if selected >= count:
             task.log_info(f"{page}: 已选中{selected}/{count}张卡牌")
             return True
-        click_priority_cards(cards)
+        if _paused(click_priority_cards(cards)):
+            return True
         if selected >= count:
             task.log_info(f"{page}: 已选中{selected}/{count}张卡牌")
             return True
@@ -1671,14 +1717,15 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
             key=lambda card: (card["y"], card["x"]),
             reverse=True,
         )
-        click_cards(
+        if _paused(click_cards(
             bottom_to_top_cards,
             lambda card: card["feature_name"] in {
                 "hex_in_deck",
                 "hex_in_deck_tw",
             },
             "底部页面优先移除咒术卡牌，点击",
-        )
+        )):
+            return True
         if selected >= count:
             return True
 
@@ -1688,11 +1735,12 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
             key=lambda card: (card["y"], card["x"]),
             reverse=True,
         )
-        click_cards(
+        if _paused(click_cards(
             bottom_to_top_cards,
             lambda card: base_card_type in card["type"],
             "底部页面优先移除基础牌，点击",
-        )
+        )):
+            return True
         if selected >= count:
             return True
 
@@ -1728,7 +1776,8 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
                     continue
                 task.log_info(f"{page}: 向上滚动后未识别到卡牌或操作按钮，终止选卡")
                 return False
-            click_target_member_row_cards(cards)
+            if _paused(click_target_member_row_cards(cards)):
+                return True
             if selected >= count:
                 task.log_info(f"{page}: 已选中{selected}/{count}张卡牌")
                 return True
@@ -1737,11 +1786,12 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
                 key=lambda card: (card["y"], card["x"]),
                 reverse=True,
             )
-            click_cards(
+            if _paused(click_cards(
                 bottom_to_top_cards,
                 lambda card: base_card_type in card["type"],
                 "向上翻页找到基础牌，点击",
-            )
+            )):
+                return True
             if selected >= count:
                 return True
 
@@ -1778,7 +1828,8 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
         key=lambda card: (card["y"], card["x"]),
         reverse=True,
     )
-    click_cards(fallback_cards, lambda card: True, "兜底补选卡牌，点击")
+    if _paused(click_cards(fallback_cards, lambda card: True, "兜底补选卡牌，点击")):
+        return True
     task.log_info(f"{page}: 兜底处理完成，已选中{selected}/{count}张卡牌")
     return True
 
@@ -3079,6 +3130,7 @@ def handle_equipment(task: TriggerTask):
     """装备选择/安装界面: 按装备位优先级选择，并维护目标主战员的装备状态。"""
     title = find_box_at_point(task, 0.499, 0.126)
     if not (title and title.name == "装备"):
+        task._equipment_purchase_pending = None
         return False
 
     task.log_info("检测到装备页面")
@@ -3105,6 +3157,22 @@ def handle_equipment(task: TriggerTask):
             None,
         )
         is_purchase_page = bool(cancel_box and purchase_box)
+        pending_purchase = getattr(task, "_equipment_purchase_pending", None)
+        if (
+            is_purchase_page
+            and pending_purchase
+            and _acceleration_on(task)
+            and time.time() - pending_purchase["time"] < _EQUIPMENT_DECISION_KEEP
+        ):
+            # 上一帧已经选好主战员。这一帧只点购买，不重新选人。
+            task.log_info("购买装备已选定主战员，点击「购买」")
+            task._equipment_purchase_pending = None
+            battle_log.process_shot(task, "装备分配")
+            task.click_box(purchase_box)
+            task.sleep(1)
+            return True
+        if not is_purchase_page:
+            task._equipment_purchase_pending = None
         equipment_price = None
         current_credit = None
         if is_purchase_page:
@@ -3124,6 +3192,7 @@ def handle_equipment(task: TriggerTask):
                 task.log_info(
                     f"装备价格{equipment_price}大于当前信用点{current_credit}，点击「取消」"
                 )
+                battle_log.process_shot(task, "装备分配")
                 task.click_box(cancel_box)
                 task.sleep(1)
                 return True
@@ -3137,6 +3206,7 @@ def handle_equipment(task: TriggerTask):
         refine_boxes = [box for box in bottom_buttons if "提炼" in box.name]
         if refine_boxes and len(refine_boxes) == len(bottom_buttons):
             task.log_info("安装装备界面只有提炼按钮，直接点击提炼")
+            battle_log.process_shot(task, "装备分配")
             task.click_box(refine_boxes[0])
             return True
 
@@ -3152,6 +3222,7 @@ def handle_equipment(task: TriggerTask):
                 battle_log.anomaly(task, "装备页读不到装备", "未能识别待安装装备的名称或类型")
             if is_purchase_page:
                 task.log_info("购买装备无法识别装备信息，点击「取消」")
+                battle_log.process_shot(task, "装备分配")
                 task.click_box(cancel_box)
                 task.sleep(1)
                 return True
@@ -3266,12 +3337,15 @@ def handle_equipment(task: TriggerTask):
                            is_purchase_page, equipment_price)
             if tracks_target_member and target_member_index is None:
                 if _target_member_missing(task, new_equipment):
+                    battle_log.process_shot(task, "装备分配")
                     task.send_key("esc")
                 else:
+                    battle_log.process_shot(task, "装备分配")
                     task.click_box(cancel_box)
             else:
                 # 认出了主战员、确实不值得买：本轮商店不再点它
                 task.node_status.setdefault("shop_cancelled", []).append(new_equipment["ocr_name"])
+                battle_log.process_shot(task, "装备分配")
                 task.click_box(cancel_box)
             task.sleep(1)
             return True
@@ -3314,6 +3388,7 @@ def handle_equipment(task: TriggerTask):
                 _log_equipment(task, new_equipment, "提炼", None, f"{install_reason}；{other_reason}",
                                current_name, current_quality, is_purchase_page, equipment_price,
                                other_slots=other_slots)
+                battle_log.process_shot(task, "装备分配")
                 task.click_box(refine_box)
                 task.sleep(1)
                 return True
@@ -3326,19 +3401,26 @@ def handle_equipment(task: TriggerTask):
                            other_slots=other_slots)
 
         chosen = lv_texts[chosen_index]
+        battle_log.process_shot(task, "装备分配")
         _move_and_click(task, 0.756, (chosen.y + chosen.height / 2) / task.height)
         task.sleep(1)
+        if is_purchase_page and _acceleration_on(task):
+            # 点一下就结束这一帧。下一帧只点购买，不再重新选主战员。
+            task._equipment_purchase_pending = {"time": time.time()}
+            return True
         if is_purchase_page:
             task.log_info(
                 f"购买装备分配完成，价格={equipment_price}，"
                 f"当前信用点={current_credit}，点击「购买」"
             )
+            battle_log.process_shot(task, "装备分配")
             task.click_box(purchase_box)
             task.sleep(1)
             return True
         task._equipment_decision = {"key": decision_key, "member": chosen_index, "time": time.time()}
         return False
 
+    task._equipment_purchase_pending = None
     candidates = []
     candidate_specs = [
         (
@@ -4738,6 +4820,28 @@ def handle_shop(task: TriggerTask):
 _FLASH_CHOICE_RETRY_SECONDS = 4.0  # 点了灵光选项后这么久内不再换着点，等页面响应
 
 
+def _flash_page_signature(task):
+    """和文字闸门同一套画面签名，用来判断闪光页是不是已经变了。"""
+    import speedup
+    return speedup._signature(task, getattr(task, "all_texts", None) or [])
+
+
+def _flash_page_moved(task):
+    """加速模式下，点过的闪光页文字布局已经变了（详情弹出或离开）就不再干等那 4 秒。"""
+    previous = getattr(task, "_flash_choice_sig", None)
+    if not previous or not _acceleration_on(task):
+        return False
+    import speedup
+    current = _flash_page_signature(task)
+    return speedup._similarity(previous, current) < speedup._SAME_PAGE
+
+
+def _remember_flash_click(task):
+    task._flash_choice_clicked_at = time.time()
+    if _acceleration_on(task):
+        task._flash_choice_sig = _flash_page_signature(task)
+
+
 def handle_view_original(task: TriggerTask):
     """卡牌闪光（查看原件）事件: 按类型特征识别卡牌，并按闪光优先级选择。"""
     box1 = find_box_at_point(task, 0.890, 0.051)
@@ -4749,6 +4853,10 @@ def handle_view_original(task: TriggerTask):
     # 下一帧又读回 168%），每帧重新决策会先选 3 号再改点 1 号，把选择顶掉。
     # 点过选项后先等页面响应（详情弹窗/切页）；超过重试间隔页面还没动，说明可能没点上，才允许再点。
     if time.time() - getattr(task, "_flash_choice_clicked_at", 0.0) < _FLASH_CHOICE_RETRY_SECONDS:
+        if _flash_page_moved(task):
+            # 锁定还留着，避免下一帧又重新选；这一帧不再占住，后面的处理函数可以点确认。
+            task.log_info("卡牌闪光页面: 页面已变化，解除等待")
+            return False
         task.log_info("卡牌闪光页面: 刚点过灵光选项，等页面响应，不重复点击")
         return True
 
@@ -4790,7 +4898,8 @@ def handle_view_original(task: TriggerTask):
         task.log_info(
             f"卡牌闪光事件: 检测到target卡牌，点击位置{click_position}"
         )
-        task._flash_choice_clicked_at = time.time()
+        _remember_flash_click(task)
+        battle_log.process_shot(task, "闪光选择")
         _move_and_click(task, *click_position)
         return True
 
@@ -4805,7 +4914,8 @@ def handle_view_original(task: TriggerTask):
         battle_log.record(task, "闪光选择", card=chosen_card["name"], reason=choose_reason,
                           chosen=cards.index(chosen_card) + 1, options=options)
     task._last_flash_choice = (key, time.time())
-    task._flash_choice_clicked_at = time.time()
+    _remember_flash_click(task)
+    battle_log.process_shot(task, "闪光选择")
     _move_and_click(task, chosen_card['x'], chosen_card['y'])
     return True
 

@@ -976,6 +976,8 @@ class TestSpeedup(unittest.TestCase):
         self.use_real_removal_flow()
         task = self.select_page("请选择3张要移除的卡牌", ["拍照时间", "粉丝福利"])
         utils.handle_select_card(task)
+        task.show_title("请选择3张要移除的卡牌")  # 选卡过程会改写画面文字，下一帧页面还在
+        utils.handle_select_card(task)  # 加速时一帧只点一张，第二张在下一帧
         self.assertNotIn("跳过", task.clicked)
         self.assertTrue(self.confirm_removal(task))
         self.assertEqual(2, task.node_status["removed_card_count"])

@@ -789,6 +789,17 @@ class TestEquipmentAssign(unittest.TestCase):
                                     [("传说", "", ""), ("稀有", "", ""), ("传说", "", "")], purchase=True)
         self.assertEqual([2, "购买"], task.chosen())
 
+    def test_accelerated_purchase_confirms_on_the_next_frame(self):
+        # 加速时一帧只点主战员，下一帧再点购买，不再在同一帧里把人选重来一遍
+        task = EquipmentTask("短刀", "攻击力", "稀有", [EMPTY, ("传说", "", ""), EMPTY], purchase=True)
+        task.config["加速模式"] = True
+        with unittest.mock.patch.object(utils, "_get_current_credit", lambda task: 300):
+            self.assertTrue(utils.handle_equipment(task))
+            self.assertEqual([1], task.chosen())
+            self.now += 0.2
+            self.assertTrue(utils.handle_equipment(task))
+        self.assertEqual([1, "购买"], task.chosen())
+
     def test_unknown_target_refetches_then_gives_up(self):
         # 实跑 10/01 11:02：开局头像没取准，购买页认不出刷存档主战员一直取消，商店又一直去点同一件
         task = EquipmentTask("短刀", "攻击力", "传说", [EMPTY, EMPTY, EMPTY], purchase=True,

@@ -143,6 +143,9 @@ _Avoid_: 选两次
 | 路线选择 | 两者 | `nodes`、`chosen`、`reason`、`plan` |
 | 战斗开始 / 战斗结束 | 两者 | 结束带 `seconds`；离开战斗画面 8 秒才算结束（出击模式战斗中会弹出选择页） |
 | 一轮结束 | 两者 | `success`、`result`、`escaped`、`reached_boss`、`passed_boss`、`nodes`、`rerolls`、`seconds`、`rounds` |
+| 过程 | 卡厄思 | `handler`、`waited`（距上一步的秒数）、`gate_early`（文字闸门是否提前结束）；`hp`、`credit` 仅这一帧已经读到时才有。自动战斗不逐帧记 |
+| 无人接手 | 卡厄思 | `seconds`、`texts`（这段时间画面上的文字）。同一种画面合并成一段，短于 1 秒不记 |
+| 存档取舍 | 卡厄思 | `feature`、`value`（TB）、`threshold`、`decision`（保留/删除） |
 | 重开 | 卡厄思 | `page` 以及当时读到的值和门槛 |
 | 零式系统 / 赛季初始页 / 获得法典 | 卡厄思 | `value`/`options`、`unit`（pt 或层级）、`required`、`decision`/`chosen` |
 | 记忆卡选择 / 记忆卡刷新 | 卡厄思 | `options`（三张卡的文字）、`chosen`、`reason`；刷新带 `slot`、`remaining` |

@@ -26,6 +26,10 @@ MAX_MB_KEY = "战斗日志总大小上限(MB)"
 
 LOG_DIR = "battle_logs"
 SHOT_DIR = os.path.join(LOG_DIR, "截图")
+_CHAOS_MODE = "自动卡厄思模式"
+_PROCESS_WIDTH = 1280          # 过程画面缩到这个宽度，比例不变
+_UNCLAIMED_MIN = 1.0           # 没人认领短于这么多秒的不记，避免每帧一行
+_BATTLE_HANDLER = "handle_battle_auto_check"  # 卡厄思自动战斗：不逐帧记过程
 _CLEANUP_EVERY = 3600
 _JPG_QUALITY = 80
 _BATTLE_GONE = 8        # 离开战斗画面这么多秒才算战斗结束（出击模式战斗中会弹出选择页面）
@@ -143,6 +147,8 @@ def anomaly(task, kind, detail, frame=None, **fields):
 def end_round(task, **fields):
     """一轮结束：记一条带用时的「一轮结束」，之后的记录算下一轮。"""
     state = _state(task)
+    _flush_unclaimed(task, time.time())
+    state["step_at"] = None
     if state["in_battle"]:
         # 输掉的战斗直接进结算页，等不到离开战斗画面 8 秒：先在本轮记上「战斗结束」，不然会算到下一轮
         state["in_battle"] = False
@@ -176,6 +182,7 @@ def node_entered(task, hp=None, **fields):
     change = hp[0] - state["last_hp"][0] if hp and state["last_hp"] else None
     if hp:
         state["last_hp"] = hp
+    process_shot(task, "进入节点")
     record(task, "进入节点", hp=hp and list(hp), hp_change=change, **fields)
 
 
@@ -252,6 +259,105 @@ def unhandled_seconds(task):
     if state["in_battle"] or state["unhandled_since"] is None or time.time() - state["unhandled_last"] > _UNHANDLED_GAP:
         return 0
     return state["unhandled_last"] - state["unhandled_since"]
+
+
+def _chaos(task):
+    return getattr(task, "name", "") == _CHAOS_MODE
+
+
+def _clear_reads(task):
+    task._read_hp = None
+    task._read_credit = None
+
+
+def observe_frame(task, handler):
+    """卡厄思过程账。handler 是这一帧接手的处理函数名，没有人接手就传 None。
+
+    有人接手记一条「过程」（等了多久、文字闸门有没有提前结束；血量和信用点只用这一帧已经读到的）。
+    没人接手时，同一种画面合并成一段「无人接手」。自动战斗不逐帧记。跟着「详细战斗日志」开关。
+    """
+    if not _chaos(task) or not enabled(task):
+        task._gate_report = None
+        return
+    state = _state(task)
+    now = time.time()
+    if handler == _BATTLE_HANDLER:
+        _flush_unclaimed(task, now)
+        state["step_at"] = now
+        _clear_reads(task)
+        return
+    if handler:
+        _flush_unclaimed(task, now)
+        fields = {"handler": handler}
+        if state.get("step_at") is not None:
+            fields["waited"] = round(now - state["step_at"], 2)
+        gate_early = getattr(task, "_gate_report", None)
+        if gate_early is not None:
+            fields["gate_early"] = bool(gate_early)
+            task._gate_report = None
+        hp = getattr(task, "_read_hp", None)
+        if hp:
+            fields["hp"] = list(hp)
+        credit = getattr(task, "_read_credit", None)
+        if credit:
+            fields["credit"] = credit
+        state["step_at"] = now
+        _clear_reads(task)
+        record(task, "过程", **fields)
+        return
+    texts = []
+    for box in getattr(task, "all_texts", None) or []:
+        name = getattr(box, "name", "") or ""
+        name = name.strip()
+        if name:
+            texts.append(name)
+    sig = tuple(sorted(set(texts)))
+    span = state.get("unclaimed")
+    if span is None:
+        state["unclaimed"] = {"start": now, "sig": sig, "texts": texts[:80]}
+        return
+    if span["sig"] == sig:
+        return
+    _flush_unclaimed(task, now)
+    state["unclaimed"] = {"start": now, "sig": sig, "texts": texts[:80]}
+
+
+def _flush_unclaimed(task, now):
+    """把正在合并的「无人接手」写出来。短于 _UNCLAIMED_MIN 的丢掉。"""
+    state = _state(task)
+    span = state.pop("unclaimed", None)
+    if not span:
+        return
+    seconds = now - span["start"]
+    if seconds < _UNCLAIMED_MIN:
+        return
+    record(task, "无人接手", seconds=round(seconds, 2), texts=span["texts"])
+    state["step_at"] = now
+
+
+def process_shot(task, kind):
+    """卡厄思过程画面：点下去之前存一张，宽 _PROCESS_WIDTH。没开详细日志、不是卡厄思、没有画面时不存。"""
+    if not _chaos(task) or not enabled(task):
+        return None
+    frame = getattr(task, "frame", None)
+    if frame is None or not getattr(frame, "size", 0):
+        return None
+    try:
+        height, width = frame.shape[:2]
+        if width > _PROCESS_WIDTH:
+            new_height = max(1, int(round(height * _PROCESS_WIDTH / width)))
+            frame = cv2.resize(frame, (_PROCESS_WIDTH, new_height), interpolation=cv2.INTER_AREA)
+        folder = os.path.join(LOG_DIR, "过程")
+        os.makedirs(folder, exist_ok=True)
+        shot = os.path.join(folder, f"{datetime.datetime.now():%Y%m%d-%H%M%S-%f}_{kind}.jpg")
+        ok, data = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, _JPG_QUALITY])
+        if not ok:
+            return None
+        data.tofile(shot)
+        return shot
+    except (OSError, AttributeError, ValueError) as e:
+        task.log_info(f"过程画面保存失败：{e}")
+        return None
 
 
 def save_shot(task, kind, frame, force=False):

@@ -437,20 +437,28 @@ def _move_archive_before_stuck(handlers):
 
 def _gated_run(task, st):
     """与原版 run() 相同，只在交给页面处理函数前多一道文字闸门。"""
+    task._read_hp = None
+    task._read_credit = None
     texts = utils._simplify_texts(task.ocr())
     if _gate_blocks(task, st, texts):
         st["gated"] = True  # 现场记录据此标出这一帧没交给页面处理函数
         return
     task.all_texts = texts
+    hit = None
     for handle_page in st["handlers"].PAGE_HANDLERS:
         if handle_page(task):
-            st["hit"] = handle_page.__name__
-            if st["hit"] != "log_unhandled_page" and hasattr(battle_log, "handled_frame"):  # ESC 兜底不算接手
+            hit = handle_page.__name__
+            st["hit"] = hit
+            if hit != "log_unhandled_page" and hasattr(battle_log, "handled_frame"):  # ESC 兜底不算接手
                 battle_log.handled_frame(task)
             check_loop = getattr(utils, "check_loop", None)  # 官方原版 utils 没有通用循环检测
             if check_loop is not None:
                 check_loop(task, st["hit"])
-            return
+            break
+    if hasattr(battle_log, "observe_frame"):
+        battle_log.observe_frame(task, hit)
+    if hit is not None:
+        return
     task._check_upload_if_needed()
 
 
@@ -507,6 +515,7 @@ def _close_gate(task, st, now):
     gate, st["gate"] = st["gate"], None
     planned = gate["until"] - gate["start"]
     actual = now - gate["start"]
+    task._gate_report = actual + 0.05 < planned  # 过程账：闸门有没有在原时长之前放开
     st["planned"] += planned
     st["actual"] += actual
     st["count"] += 1
