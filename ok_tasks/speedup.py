@@ -227,6 +227,7 @@ def install(task):
                      "find_feature")
     }
     handlers = _handlers_module(task)
+    _move_archive_before_stuck(handlers)
     st = {
         "orig_sleep": orig["sleep"], "active": False, "handlers": handlers, "gate_ok": handlers is not None,
         "in_run": False, "in_action": False, "owed_until": 0.0, "actions": 0,
@@ -352,6 +353,11 @@ def install(task):
         st.update(active=enabled, in_run=enabled, in_action=False, owed_until=0.0, actions=0,
                   moved=False, held=False, hit=None, action_sig=None, action_box=None, match_cache=None,
                   prefetch_cache=None, pay_hook=None, battle_play=False, battle_left=False, gated=False)
+        # 每帧更新画面变化计时（结果由 handle_stuck_log 使用）：卡住判定不能只在它被走到时才做——
+        # 点击后的闸门会挡住成片的任务帧，被前面的处理函数接手时又轮不到它，采样点可能全部落在
+        # 同一相位的画面上（实跑 10/05 10:02：在「点开信息页 ↔ 卡住兜底关掉」的循环里每次采样
+        # 都是信息页，相邻两次差 0.0%，卡住计时 95 秒没重置，循环无法自愈）
+        utils.is_frame_stuck(task)
         if not enabled:
             st.update(gate=None, prev_sig=None, battle=False)
             task.trigger_interval = 1
@@ -409,6 +415,24 @@ def _handlers_module(task):
     module = sys.modules.get(type(task).__module__)
     handlers = getattr(module, match.group(1), None)
     return handlers if hasattr(handlers, "PAGE_HANDLERS") else None
+
+
+def _move_archive_before_stuck(handlers):
+    """把 handle_archive_target_member 挪到 handle_stuck_log 前面：信息统计页面有专门的归档处理函数
+    （handle_save_target_member 点开它、归档完再关掉），卡住兜底排前面时会先找到右上的关闭按钮把页面
+    关掉，两边来回点（实跑 10/05 10:02 死循环）。本仓库源码里已排好，这里再调整一次，让只装补丁的
+    官方版也生效；已经是这个顺序或缺少任一函数时什么都不做。"""
+    page_handlers = getattr(handlers, "PAGE_HANDLERS", None)
+    if not page_handlers:
+        return
+    names = [handle.__name__ for handle in page_handlers]
+    if "handle_archive_target_member" not in names or "handle_stuck_log" not in names:
+        return
+    archive_at = names.index("handle_archive_target_member")
+    stuck_at = names.index("handle_stuck_log")
+    if archive_at < stuck_at:
+        return
+    page_handlers.insert(stuck_at, page_handlers.pop(archive_at))
 
 
 def _gated_run(task, st):

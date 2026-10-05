@@ -525,11 +525,17 @@ def cmd_replay(args):
             images = list(frame["images"]) or ([last_image] if last_image is not None else [])
             if frame["images"]:
                 last_image = frame["images"][-1]
+            if frame.get("sample"):
+                skipped += 1
+                continue
+            # 真实运行时加速补丁的 run 包装每帧都更新卡住计时（闸门帧也一样），ReplayTask 不经过补丁：
+            # 这里补上同样的采样，handle_stuck_log 的卡住判定才和实跑一致
+            clock[0] = frame["abs_t"]
+            task._start_frame(frame, images)
+            utils.is_frame_stuck(task)
             if frame["gated"] or frame["texts"] is None:
                 skipped += 1
                 continue
-            clock[0] = frame["abs_t"]
-            task._start_frame(frame, images)
             events.clear()
             hit, error = None, None
             try:

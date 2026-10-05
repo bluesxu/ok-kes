@@ -1988,6 +1988,11 @@ def is_button_active(task: TriggerTask, button_box):
 
 # ------------------------- 帧卡住检测 -------------------------
 
+# 两次卡住检查间隔超过这么多秒，说明任务被禁用/暂停过，或长时间没有帧走到这里：
+# 中间的画面有没有变过无从得知，接着旧计时算「卡住」会误报
+_STUCK_CHECK_GAP = 5
+
+
 def is_frame_stuck(task: TriggerTask, stuck_threshold_seconds=30, change_threshold=0.08):
     """
     基于像素变化检测画面是否卡住。
@@ -1998,6 +2003,16 @@ def is_frame_stuck(task: TriggerTask, stuck_threshold_seconds=30, change_thresho
     """
     if not hasattr(task, '_last_change_time'):
         task._last_change_time = time.time()
+        task._prev_frame_gray = None
+
+    now = time.time()
+    last_check = getattr(task, '_stuck_check_at', 0.0)
+    task._stuck_check_at = now
+    if now - last_check > _STUCK_CHECK_GAP:
+        # 实跑 10/05 10:02：任务被禁用 1.5 分钟再启用，重启后第一次检查的画面（刚点开的信息统计页面）
+        # 和禁用前最后一帧（同一个信息统计页面）几乎一样，中间 95 秒的空白被当成「画面95秒没变」，
+        # 卡住兜底每帧抢先把信息页关掉，和「获取主战员头像」来回循环
+        task._last_change_time = now
         task._prev_frame_gray = None
 
     frame = task.frame

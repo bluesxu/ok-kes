@@ -1124,6 +1124,7 @@ PAGE_HANDLERS = [
     # handle_stage_clear,
     log_credit,
     log_node_status,
+    handle_archive_target_member, #信息统计页面，记录刷存档目标主战员；排在卡住兜底前面，否则误报卡住时会被先点右上角关闭
     handle_stuck_log, #画面卡住检测及兜底处理
     handle_close_page, #点击屏幕关闭页面，优先于其他普通页面处理
     handle_threat_detection, #威胁侦测过场页，按 ESC 关闭
@@ -1132,7 +1133,6 @@ PAGE_HANDLERS = [
     handle_refine_equipment_credit, #提炼装备信用点页面，优先于确认按钮
     handle_dont_show_again, #带「今天不再显示 / 下次登入前不再显示」的确认框：先勾上再确认
     handle_center_confirm, #页面中央确认按钮
-    handle_archive_target_member, #信息统计页面，记录刷存档目标主战员
     handle_chaos_mask_engraving, #面具卡牌刻印获取页面
     handle_memory_carving, #记忆雕琢页：一直雕琢到完成或按钮变灰，完成后做一次记忆加工，再离开，优先于离开按钮
     handle_memory_processing, #记忆加工页：选百分比最大的一张再确认

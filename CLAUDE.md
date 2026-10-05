@@ -72,6 +72,7 @@ python real_bugfix_check.py                           # 用官方安装目录里
 **加速模式 `ok_tasks/speedup.py`**：`ChaosMode` / `SortieMode` 在 `__init__` 末尾调用 `speedup.install(self)`，它通过猴子补丁接管任务的 `sleep`/`click*`/`run` 等方法，以及 `utils*` 里的部分处理函数：
 - 延迟支付处理函数里的 sleep；点击后用“文字闸门”判断页面已响应就继续，最长不超过原时长。
 - 并行模板匹配、路线页/牌库滚动“停稳即识别”、出击出牌按手牌变化继续。
+- run 包装每帧更新画面变化计时（`utils.is_frame_stuck`），卡住判定不依赖 `handle_stuck_log` 被走到；`install` 时把 `handle_archive_target_member` 挪到 `handle_stuck_log` 前面（官方版文件里也一样），卡住误报时不再抢先关掉信息统计页面。
 - 替换处理函数时要同时替换各模块里按名字导入的引用和 `PAGE_HANDLERS` 列表里的函数对象，统一走 `_replace_function`。
 - `_EXPECTED_RUN_SOURCE` / `_handlers_module` 通过读 `run()` 源码来确认结构没变。**修改 `ChaosMode.run` / `SortieMode.run` 时要同步 `speedup._gated_run`**，`TestSpeedup` 里的 `test_real_*_run_matches_gated_run` 会检查这一点。
 - 其中几项与速度无关的修正（按钮文字被 OCR 切成两个框、国际服 BOSS 页/休息区、分解存档确认框、零式系统法典卡片改为按存档储存上限 pt 判断）在源码里也已修好。补丁里保留同样的逻辑，是为了用 `speedup_patch/install_speedup.py` 装进未修改的官方版时同样生效；两边同时存在不冲突。

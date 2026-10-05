@@ -1131,6 +1131,7 @@ PAGE_HANDLERS = [
     # handle_stage_clear,
     log_credit,
     log_node_status,
+    handle_archive_target_member, #信息统计页面，避免出击模式卡住；排在卡住兜底前面，否则误报卡住时会被先点右上角关闭
     handle_stuck_log,
     handle_event_dialog, #事件剧情对话停住时按空格翻页
     handle_close_page, #点击屏幕关闭页面，优先于其他普通页面处理
@@ -1139,7 +1140,6 @@ PAGE_HANDLERS = [
     handle_refine_equipment_credit, #提炼装备信用点页面，优先于确认按钮
     handle_dont_show_again, #带「今天不再显示」的确认框：先勾上再确认，优先于页面中央确认
     handle_center_confirm,
-    handle_archive_target_member, #信息统计页面，避免出击模式卡住
     handle_equipment, #装备选择
     handle_card_assign,
     handle_confirm, #确认按钮

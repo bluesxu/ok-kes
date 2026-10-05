@@ -1183,6 +1183,61 @@ class TestSpeedup(unittest.TestCase):
         self.assertTrue(getattr(entry, "_speedup_wrapped", False))
         self.assertIn("handle_battle_page", speedup._BATTLE_HANDLERS)
 
+    # ---------------- 卡住判定与信息统计页面 ----------------
+    def test_stuck_check_runs_every_frame(self):
+        """加速补丁每帧更新画面变化计时：卡住判定不能只等 handle_stuck_log 被走到时才采样
+        （闸门帧和被前面处理函数接手的帧都轮不到它，采样点会漏掉整段画面变化）。"""
+        game, task = self.make("EMPTY", {}, [handle_page_b])
+        self.assertFalse(hasattr(task, "_stuck_check_at"))
+        run_executor(task, 1.0)
+        self.assertTrue(hasattr(task, "_stuck_check_at"))
+
+    def test_stuck_timer_restarts_after_pause(self):
+        """任务被禁用/暂停过一段时间再重启：空白期里画面有没有变过无从得知，不能接着旧计时算卡住。"""
+        game, task = self.make("EMPTY", {}, [])
+        frame = task.frame
+        small = cv2.resize(frame, (frame.shape[1] // 4, frame.shape[0] // 4))
+        same_gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        now = time.time()
+        # 对照：距上次检查只过了 1 秒，计时已 95 秒且画面没变 → 判定卡住
+        task._prev_frame_gray = same_gray
+        task._last_change_time = now - 95
+        task._stuck_check_at = now - 1
+        self.assertTrue(self._is_frame_stuck(task, stuck_threshold_seconds=10))
+        # 任务停过：距上次检查 95 秒 → 重新开始计时，不判定卡住
+        task._prev_frame_gray = same_gray
+        task._last_change_time = now - 95
+        task._stuck_check_at = now - 95
+        self.assertFalse(self._is_frame_stuck(task, stuck_threshold_seconds=10))
+
+    def test_archive_handler_ordered_before_stuck_log(self):
+        """信息统计页面（handle_archive_target_member）要排在卡住兜底前面：
+        卡住误报时兜底会先找到右上的关闭按钮把页面关掉，两边来回点（实跑 10/05 10:02 死循环）。"""
+        for handlers in (utils_chaos.PAGE_HANDLERS, utils_sortie.PAGE_HANDLERS):
+            names = [handle.__name__ for handle in handlers]
+            self.assertLess(names.index("handle_archive_target_member"), names.index("handle_stuck_log"))
+
+    def test_move_archive_before_stuck(self):
+        """只装补丁不换 utils_chaos/utils_sortie 的官方版：运行时也把归档函数挪到卡住兜底前面。"""
+        def handle_archive_target_member(task):
+            return False
+
+        def handle_stuck_log(task):
+            return False
+
+        def other(task):
+            return False
+
+        handlers = SimpleNamespace(PAGE_HANDLERS=[other, handle_stuck_log, other, handle_archive_target_member])
+        speedup._move_archive_before_stuck(handlers)
+        self.assertEqual(["other", "handle_archive_target_member", "handle_stuck_log", "other"],
+                         [handle.__name__ for handle in handlers.PAGE_HANDLERS])
+        speedup._move_archive_before_stuck(handlers)  # 已经就位时不重复挪动
+        self.assertEqual(["other", "handle_archive_target_member", "handle_stuck_log", "other"],
+                         [handle.__name__ for handle in handlers.PAGE_HANDLERS])
+        speedup._move_archive_before_stuck(None)
+        speedup._move_archive_before_stuck(SimpleNamespace(PAGE_HANDLERS=[]))
+
     # ---------------- 与真实 ChaosMode 的兼容性 ----------------
     def test_real_chaos_mode_run_matches_gated_run(self):
         import ChaosMode
