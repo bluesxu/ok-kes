@@ -150,6 +150,9 @@ def _variants(crop):
     white = ((hsv[:, :, 2] > 200) & (hsv[:, :, 1] < 70)).astype(np.uint8) * 255
     white = cv2.resize(white, None, fx=3, fy=3, interpolation=cv2.INTER_NEAREST)
     yield cv2.cvtColor(255 - white, cv2.COLOR_GRAY2BGR)
+    # 发光卡面上的「1」笔画很细，上面三种常常一种都认不出；放大到 6 倍彩色才看得到
+    # （实跑 16:52 两张安可，1 费那张费用区里明明白白一个 1，三种预处理都是空的，先出了 3 费的）
+    yield cv2.resize(crop, None, fx=6, fy=6, interpolation=cv2.INTER_CUBIC)
 
 
 def _ocr_texts(task, image):
@@ -166,7 +169,11 @@ def _ocr_texts(task, image):
 
 def _read_digit(task, frame, region, pattern=_DIGITS, votes=1):
     """对一块区域依次尝试几种预处理，读出整段都是数字的读数；读不到返回 None。
-    votes > 1 时要有这么多种预处理读出同一个数才算数（单张牌的费用读错代价大：出得起的牌会被整回合跳过）。"""
+    votes > 1 时，同一个数字出现这么多次就采信。
+    收尾时如果只出现过「1」、没有别的数字，哪怕只有一次也采信：「1」笔画细，常常只有一种预处理读得出，
+    凑不齐两次就会变成「读不到」，挑牌时按最贵算，同名牌里读到的高费反而排到前面
+    （实跑 16:52：1 费安可没读到，先出了旁边 3 费的安可）。
+    只出现过一次、且不是「1」的数字不采信（测试图上单独一次会把 1 费读成 7）。"""
     readings = []
     for image in _variants(_crop(frame, region)):
         value = next((int(t) for t in (s.replace(" ", "") for s in _ocr_texts(task, image)) if pattern.match(t)), None)
@@ -177,6 +184,8 @@ def _read_digit(task, frame, region, pattern=_DIGITS, votes=1):
         readings.append(value)
         if readings.count(value) >= votes:
             return value
+    if len(set(readings)) == 1 and readings[0] == 1:
+        return 1
     return None
 
 
@@ -1148,6 +1157,21 @@ def _use_drag(task, state, card):
     return not (card["name"] in failed or (not card["name"].startswith("未识别") and _matches(card["name"], failed)))
 
 
+def _zero_cost_still_possible(card, cards):
+    """同名牌里还有一张是 0 费、或费用没读到：这张的正费用不能把牌名从「可以是 0 费」里删掉。"""
+    name = card["name"]
+    for other in cards:
+        if other is card:
+            continue
+        other_name = other["name"]
+        if other_name.startswith("未识别") or len(other_name) < 2:
+            continue
+        if name in other_name or other_name in name:
+            if other.get("cost") in (0, None):
+                return True
+    return False
+
+
 def _read_costs(task, state, frame, cards, pending):
     """并行读还没读过费用的牌；牌名读到的按牌名缓存到本回合结束。
     手里有同名牌时每张都现读、不缓存：同名牌费用可能不同（实跑 11:44 两张暗黑之刃一张 1 费、一张 3 费，
@@ -1173,7 +1197,11 @@ def _read_costs(task, state, frame, cards, pending):
             card["cost"] = state["costs"][card["name"]]
     # 0 费牌的「0」大多读不出来（逆转之刃在有 AP 时读到 0 的不到一成），AP 用完后手牌变暗更读不到，
     # 而 AP 为 0 时读不到费用的牌一律不出，0 费牌就被留在手里结束了回合。
-    # 所以记住本次运行读到过 0 费的牌名，之后读不到费用时按 0 费算；读到过别的费用就不再这样算
+    # 所以记住本次运行读到过 0 费的牌名，之后读不到费用时按 0 费算。
+    # 同名牌费用可以不同（泰尼抽出的同名牌会降费，甚至变成 0）。同名牌里只要还有 0 费、
+    # 或费用没读到的，看见另一张的正费用也不能把牌名忘掉，否则读不到的 0 费会按最贵算、正费用先出。
+    # 从左到右扫时，正费用在左边会先清掉记忆，0 费在左边则还能套上，看起来像随机出。
+    # 这一张单独出现、并且读到了正费用，才说明它本来就要花 AP，把牌名忘掉。
     zero = _session(task)["zero_cost"]
     for card in cards:
         name = card["name"]
@@ -1181,9 +1209,11 @@ def _read_costs(task, state, frame, cards, pending):
             continue
         if card["cost"] == 0:
             zero.add(name)
-        elif card["cost"] is not None:
+        elif card["cost"] is not None and not _zero_cost_still_possible(card, cards):
             zero.difference_update({n for n in zero if n in name or name in n})
-        elif _matches(name, zero):
+    for card in cards:
+        name = card["name"]
+        if card.get("cost") is None and not name.startswith("未识别") and len(name) >= 2 and _matches(name, zero):
             card["cost"] = 0
 
 

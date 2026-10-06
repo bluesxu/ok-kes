@@ -262,6 +262,18 @@ class TestChoosePlay(unittest.TestCase):
         self.assertEqual("破碎", battle.choose_play(cards, 3, ["破碎"], [], False, set())[0]["name"])
         self.assertEqual("斩击", battle.choose_play(cards, 3, [], [], False, set())[0]["name"])
 
+    def test_same_name_prefers_lower_cost(self):
+        # 泰尼抽出的同名牌会降费。两张都读到费用时，出便宜的那张，不看出在左边还是右边
+        cards = [card("安可", 3, "技能", key="3"), card("安可", 1, "攻击", key="4")]
+        chosen, _ = battle.choose_play(cards, 3, ["安可"], [], False, set())
+        self.assertEqual("4", chosen["key"])
+        cards = [card("节奏：琶音", 1, "攻击", key="4"), card("节奏：琶音", 3, "攻击", key="5")]
+        chosen, _ = battle.choose_play(cards, 3, ["节奏"], [], False, set())
+        self.assertEqual("4", chosen["key"])
+        cards = [card("节奏：琶音", 2, "攻击", key="5"), card("节奏：琶音", 0, "攻击", key="2")]
+        chosen, _ = battle.choose_play(cards, 3, ["节奏"], [], False, set())
+        self.assertEqual("2", chosen["key"])
+
     def test_lethal_plays_defense_first(self):
         cards = [card("破碎", 2, "攻击"), card("孢子", 0), card("刀背格挡", 1)]
         chosen, reason = battle.choose_play(cards, 3, ["破碎"], ["刀背格挡"], True, set())
@@ -517,6 +529,62 @@ class TestReadCosts(unittest.TestCase):
             battle._read_costs(task, state, None, cards, {})
         self.assertEqual([3, 1, 1], [c["cost"] for c in cards])
         self.assertEqual({"暗黑之刃": 1, "磁场": 1}, state["costs"])  # 同名牌不写缓存
+
+    def test_zero_cost_twin_survives_positive_sibling(self):
+        # 实跑：泰尼同名牌一张 0 费（空心方框，经常读不到）、一张正费用。
+        # 正费用在左边时会先把「这个牌名可以是 0」清掉，右边读不到的 0 费就按最贵算，先出了贵的。
+        state = {"costs": {}}
+        cards = [{"name": "节奏：琶音", "slot": "1/2"}, {"name": "节奏：琶音", "slot": "2/2"}]
+        task = SimpleNamespace(_battle_session={"zero_cost": {"节奏：琶音"}})
+        read = {"1/2": 3, "2/2": None}
+        with mock.patch.object(battle, "_card_cost", lambda task, frame, card: read[card["slot"]]):
+            battle._read_costs(task, state, None, cards, {})
+        self.assertEqual([3, 0], [c["cost"] for c in cards])
+        self.assertIn("节奏：琶音", task._battle_session["zero_cost"])
+        # 0 费在左边也同样，而且不能被右边的正费用清掉记忆
+        cards = [{"name": "节奏：琶音", "slot": "1/2"}, {"name": "节奏：琶音", "slot": "2/2"}]
+        read = {"1/2": None, "2/2": 2}
+        with mock.patch.object(battle, "_card_cost", lambda task, frame, card: read[card["slot"]]):
+            battle._read_costs(task, state, None, cards, {})
+        self.assertEqual([0, 2], [c["cost"] for c in cards])
+        self.assertIn("节奏：琶音", task._battle_session["zero_cost"])
+
+    def test_lone_positive_cost_forgets_zero(self):
+        # 没有同名牌、读到了正费用：它本来就要花 AP，以后读不到别再当成 0 费
+        state = {"costs": {}}
+        cards = [{"name": "逆转之刃", "slot": "1/1"}]
+        task = SimpleNamespace(_battle_session={"zero_cost": {"逆转之刃"}})
+        with mock.patch.object(battle, "_card_cost", lambda task, frame, card: 1):
+            battle._read_costs(task, state, None, cards, {})
+        self.assertEqual(1, cards[0]["cost"])
+        self.assertNotIn("逆转之刃", task._battle_session["zero_cost"])
+
+    def test_thin_one_kept_when_only_one_preprocessing_reads_it(self):
+        # 实跑 16:52：1 费只有一种预处理读出「1」。凑不齐两次就当成没读到，同名的 3 费排到前面
+        frame = np.zeros((20, 20, 3), np.uint8)
+        task = SimpleNamespace()
+        images = [np.zeros((4, 4, 3), np.uint8) for _ in range(4)]
+
+        def texts(task, image):
+            return {id(images[0]): ["1"], id(images[1]): [], id(images[2]): [], id(images[3]): []}[id(image)]
+
+        with mock.patch.object(battle, "_variants", lambda crop: images), \
+                mock.patch.object(battle, "_ocr_texts", texts):
+            self.assertEqual(1, battle._read_digit(task, frame, (0, 0, 0.5, 0.5), battle._ONE_DIGIT, votes=2))
+        # 两种预处理读出的数字不一样：不采信
+        def conflict(task, image):
+            return {id(images[0]): ["1"], id(images[1]): ["3"], id(images[2]): [], id(images[3]): []}[id(image)]
+
+        with mock.patch.object(battle, "_variants", lambda crop: images), \
+                mock.patch.object(battle, "_ocr_texts", conflict):
+            self.assertIsNone(battle._read_digit(task, frame, (0, 0, 0.5, 0.5), battle._ONE_DIGIT, votes=2))
+        # 单独一次读成别的数字不采信：测试图上 1 费曾被放大后读成 7
+        def stray(task, image):
+            return {id(images[0]): ["7"], id(images[1]): [], id(images[2]): [], id(images[3]): []}[id(image)]
+
+        with mock.patch.object(battle, "_variants", lambda crop: images), \
+                mock.patch.object(battle, "_ocr_texts", stray):
+            self.assertIsNone(battle._read_digit(task, frame, (0, 0, 0.5, 0.5), battle._ONE_DIGIT, votes=2))
 
 
 class TestPlayTurn(unittest.TestCase):
