@@ -1778,6 +1778,26 @@ class TestFlash(unittest.TestCase):
             self.assertFalse(utils.handle_view_original(task))  # 锁定还在，不会改点
             self.assertEqual(1, len(clicks))
 
+    def test_view_original_waits_when_cards_not_visible(self):
+        """效果页白闪时牌还没出来：占住这一帧，不能把「跳过」交给后面的处理函数。"""
+        clicks = []
+        task = flash_task(闪光优先级=["音乐开始:琶音"])
+        task.width, task.height = 2560, 1440
+        task.all_texts = [
+            Box(1021, 154, 515, 68, name="请选择灵光一闪效果。"),
+            Box(2224, 161, 168, 56, name="查看内容"),
+            Box(2381, 1308, 107, 61, name="跳过"),
+        ]
+        with mock.patch.object(utils, "_get_game_text", lambda task, text: {
+                "查看原件": "查看内容", "查看之前的闪光": "查看先前的灵光一闪"}.get(text, text)), \
+                mock.patch.object(utils, "recognize_cards", lambda task, page="": []), \
+                mock.patch.object(utils, "_move_and_click", lambda task, x, y: clicks.append((x, y))):
+            self.assertTrue(utils.handle_view_original(task))
+            self.assertEqual([], clicks)
+            task._flash_choice_empty_since -= 5
+            self.assertFalse(utils.handle_view_original(task))  # 等不及了才放手
+            self.assertEqual([], clicks)
+
 
 def read_frame(name):
     return cv2.imdecode(np.fromfile(os.path.join(IMAGES, name + ".jpg"), dtype=np.uint8), cv2.IMREAD_COLOR)

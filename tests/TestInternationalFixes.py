@@ -125,6 +125,40 @@ class TestFlashButton(unittest.TestCase):
     def test_other_button_is_ignored(self):
         self.assertFalse(utils.handle_flash(PageTask([("跳過", 0.945, 0.918)])))
 
+    def test_select_card_page_does_not_click_before_pick(self):
+        # 现场包 20261006-171000：选卡页标题还在，没选牌就点了「赋予灵光一闪」
+        task = PageTask([
+            ("請選擇1張欲賦予靈光一閃的卡牌。", 0.198, 0.039, 0.30, 0.04),
+            ("賦豫靈光一閃", 0.945, 0.918, 0.10),
+        ])
+        with unittest.mock.patch.object(utils, "is_button_active", lambda task, box: True):
+            self.assertFalse(utils.handle_flash(task))
+        self.assertEqual([], task.clicked)
+
+    def test_select_card_page_clicks_after_pick(self):
+        task = PageTask([
+            ("請選擇1張欲賦予靈光一閃的卡牌。", 0.198, 0.039, 0.30, 0.04),
+            ("賦豫靈光一閃", 0.945, 0.918, 0.10),
+        ])
+        title = next(b.name for b in task.all_texts if "请选择" in b.name)
+        task._select_card_memory = {"action": "灵光", "count": 1, "picked": [(0.35, 0.15, "音乐开始")],
+                                    "t": 0.0, "seen": 0.0, "ready": True, "prompt": title}
+        with unittest.mock.patch.object(utils, "is_button_active", lambda task, box: True):
+            self.assertTrue(utils.handle_flash(task))
+        self.assertEqual(1, len(task.clicked))
+        self.assertFalse(task._select_card_memory["ready"])
+
+    def test_stale_ready_from_other_page_does_not_click(self):
+        task = PageTask([
+            ("請選擇1張欲賦予靈光一閃的卡牌。", 0.198, 0.039, 0.30, 0.04),
+            ("賦豫靈光一閃", 0.945, 0.918, 0.10),
+        ])
+        task._select_card_memory = {"action": "灵光", "count": 1, "picked": [(0.3, 0.2, "音乐开始")],
+                                    "ready": True, "prompt": "请选择1张要移除的卡牌"}
+        with unittest.mock.patch.object(utils, "is_button_active", lambda task, box: True):
+            self.assertFalse(utils.handle_flash(task))
+        self.assertEqual([], task.clicked)
+
 
 class TestGetCardEnhance(unittest.TestCase):
 

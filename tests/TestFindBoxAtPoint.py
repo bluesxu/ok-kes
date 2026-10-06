@@ -91,6 +91,18 @@ class TestFindBoxAtPoint(unittest.TestCase):
         self.assertFalse(utils.handle_flash(task))
         self.assertEqual([], task.clicked)
 
+    def test_select_card_title_blocks_flash_until_ready(self):
+        # 按钮已亮、标题还在：先交给 handle_select_card，不能抢先点「赋予灵光一闪」
+        utils.is_button_active = lambda task, box: True
+        title = ("請選擇1張欲賦予靈光一閃的卡牌。", 0.10, 0.40, 0.02, 0.07)
+        task = FlashPageTask((title,) + SPLIT_BUTTON)
+        self.assertFalse(utils.handle_flash(task))
+        self.assertEqual([], task.clicked)
+        task._select_card_memory = {"action": "灵光", "count": 1, "picked": [(0.3, 0.2, "音乐开始")],
+                                    "ready": True, "prompt": task.all_texts[0].name}
+        self.assertTrue(utils.handle_flash(task))
+        self.assertEqual(1, len(task.clicked))
+
     def test_box_containing_point_is_returned_unchanged(self):
         task = FlashPageTask((("賦予靈光一閃", 0.862, 0.973, 0.902, 0.949),))
         box = utils.find_box_at_point(task, 0.945, 0.918)

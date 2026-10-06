@@ -1392,6 +1392,7 @@ def _scroll_card_page(task: TriggerTask, x, y, amount, page, distance=0.25):
 
 _SELECT_CARD_SESSION_GAP = 10.0   # 中间没离开过，隔这么久没见本页才算换了新会话（一般靠离开标记重置）
 _SELECT_CARD_RETRY_SECONDS = 4.0  # 选满后按钮这么久还没把页面点走，解锁重新决策
+_SELECT_CARD_PROMPT = re.compile(r'请选择(\d*)张*.*?(移除|复制|闪光|灵光).*?卡牌')
 
 
 def _select_card_memory(task: TriggerTask, action, count):
@@ -1401,7 +1402,7 @@ def _select_card_memory(task: TriggerTask, action, count):
     if (memory is None or memory["action"] != action or memory["count"] != count
             or not memory["seen"] or now - memory["seen"] > _SELECT_CARD_SESSION_GAP):
         memory = {"action": action, "count": count, "picked": [], "t": 0.0, "seen": now,
-                  "scrolls": 0, "at_top": False, "deck_bottom": False}
+                  "scrolls": 0, "at_top": False, "deck_bottom": False, "ready": False}
         task._select_card_memory = memory
     memory["seen"] = now
     return memory
@@ -1413,6 +1414,8 @@ def _note_select_card_pick(task: TriggerTask, x, y, name):
     if memory is not None:
         memory["picked"].append((x, y, name))
         memory["t"] = time.time()
+        if len(memory["picked"]) >= memory["count"]:
+            memory["ready"] = True
 
 
 def _card_picked_before(task: TriggerTask, card):
@@ -1454,11 +1457,13 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
     # 锁定期间交给按钮 handler 把页面点走；4 秒后按钮还没亮，认为那次点击没生效，解锁重新决策。
     memory = _select_card_memory(task, action, count)
     if len(memory["picked"]) >= count:
+        memory["ready"] = True
         if time.time() - memory["t"] < _SELECT_CARD_RETRY_SECONDS:
             task.log_info(f"{page}: 本页已点过 {len(memory['picked'])} 张卡，等按钮响应，不重复选择")
             return True
         task.log_info(f"{page}: 选满后 {_SELECT_CARD_RETRY_SECONDS} 秒按钮还没亮，解锁重新决策")
         memory["picked"] = []
+        memory["ready"] = False
     prefer_remove_base = (
         action == "移除"
         and _get_config_value(task, "优先移除基础牌", True)
@@ -1664,16 +1669,22 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
             return True
         return False
 
+    def finish_if_full():
+        """选满了：记下 ready，下一帧才允许 handle_flash 点右下角按钮。"""
+        if selected < count:
+            return False
+        memory["ready"] = True
+        task.log_info(f"{page}: 已选中{selected}/{count}张卡牌")
+        return True
+
     while True:
         if _paused(click_target_member_row_cards(cards)):
             return True
-        if selected >= count:
-            task.log_info(f"{page}: 已选中{selected}/{count}张卡牌")
+        if finish_if_full():
             return True
         if _paused(click_priority_cards(cards)):
             return True
-        if selected >= count:
-            task.log_info(f"{page}: 已选中{selected}/{count}张卡牌")
+        if finish_if_full():
             return True
 
         if single_page:
@@ -1726,7 +1737,7 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
             "底部页面优先移除咒术卡牌，点击",
         )):
             return True
-        if selected >= count:
+        if finish_if_full():
             return True
 
     if prefer_remove_base and selected < count:
@@ -1741,7 +1752,7 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
             "底部页面优先移除基础牌，点击",
         )):
             return True
-        if selected >= count:
+        if finish_if_full():
             return True
 
         up_scrolls = 0
@@ -1778,8 +1789,7 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
                 return False
             if _paused(click_target_member_row_cards(cards)):
                 return True
-            if selected >= count:
-                task.log_info(f"{page}: 已选中{selected}/{count}张卡牌")
+            if finish_if_full():
                 return True
             bottom_to_top_cards = sorted(
                 cards,
@@ -1792,7 +1802,7 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
                 "向上翻页找到基础牌，点击",
             )):
                 return True
-            if selected >= count:
+            if finish_if_full():
                 return True
 
     if sortie_flash and selected < count:
@@ -1800,6 +1810,7 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
         # 点进闪光时已经扣了信用点，跳过也不退：按出牌优先级、再按攻击牌兜底选一张（2026-09-29 实跑中白跳过十几次）
         fallback = _flash_fallback_card(task, seen_cards)
         if fallback and _click_card_from_top(task, fallback, refresh_cards, page):
+            memory["ready"] = True
             return True
 
     task.all_texts = _simplify_texts(task.ocr())
@@ -1831,6 +1842,8 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
     if _paused(click_cards(fallback_cards, lambda card: True, "兜底补选卡牌，点击")):
         return True
     task.log_info(f"{page}: 兜底处理完成，已选中{selected}/{count}张卡牌")
+    if selected >= count:
+        memory["ready"] = True
     return True
 
 
@@ -3560,7 +3573,7 @@ def _note_select_card_page_left(task: TriggerTask):
 def handle_select_card(task: TriggerTask):
     """统一卡牌选择页面: 在(0.198,0.039)处检测文本，按移除/复制/闪光等关键字匹配配置并选择卡牌。"""
     box = find_box_at_point(task, 0.198, 0.039)
-    m = re.search(r'请选择(\d*)张*.*?(移除|复制|闪光|灵光).*?卡牌', box.name) if box else None
+    m = _SELECT_CARD_PROMPT.search(box.name) if box else None
     if not m:
         _note_select_card_page_left(task)
         return False
@@ -3590,6 +3603,9 @@ def handle_select_card(task: TriggerTask):
         _scroll_to_target_member_for_card_removal(task)
 
     select_card(task, _get_card_list(task, config_key), count=count, action=action)
+    memory = getattr(task, "_select_card_memory", None)
+    if memory is not None:
+        memory["prompt"] = box.name
     return True
 
 
@@ -3816,13 +3832,43 @@ def _without_yi(text):
     return re.sub(r'[一\-—_－]', '', text)
 
 
+def _select_card_prompt_box(task: TriggerTask):
+    """选卡页标题框；探针落空时按整页文字找。"""
+    box = find_box_at_point(task, 0.198, 0.039)
+    if box and _SELECT_CARD_PROMPT.search(box.name or ""):
+        return box
+    return next((text_box for text_box in getattr(task, "all_texts", None) or []
+                 if _SELECT_CARD_PROMPT.search(text_box.name or "")), None)
+
+
+def _select_card_ready_for_flash(task: TriggerTask):
+    """选卡页已经选满，而且是这一页的记忆（上一页的 ready 不能拿来点「赋予灵光一闪」）。"""
+    memory = getattr(task, "_select_card_memory", None)
+    prompt = _select_card_prompt_box(task)
+    if not memory or prompt is None or memory.get("action") not in ("闪光", "灵光"):
+        return False
+    if memory.get("prompt") != prompt.name:
+        return False
+    if memory.get("ready"):
+        return True
+    count = memory.get("count") or 1
+    return len(memory.get("picked") or []) >= count
+
+
 def handle_flash(task: TriggerTask):
-    """通用"闪光"按钮。"""
+    """通用"闪光"按钮。选卡页上这个按钮写的是「赋予灵光一闪」，必须等选牌逻辑选满再点
+    （现场包 20261006-171000：没选牌就点下去，效果页白闪时又被跳过接走）。"""
     box = find_box_at_point(task, 0.945, 0.918)
     if box and _without_yi(_get_game_text(task, '闪光')) in _without_yi(box.name):
+        if _select_card_prompt_box(task) is not None and not _select_card_ready_for_flash(task):
+            task.log_info("选卡页还没选牌，不点「赋予灵光一闪」")
+            return False
         if is_button_active(task, box):
             task.log_info("检测到闪光操作，点击闪光")
             task.click_box(box)
+            memory = getattr(task, "_select_card_memory", None)
+            if memory is not None:
+                memory.update(ready=False, prompt=None, picked=[], seen=0.0)
             task.sleep(1)
             return True
         else:
@@ -4818,6 +4864,7 @@ def handle_shop(task: TriggerTask):
 
 
 _FLASH_CHOICE_RETRY_SECONDS = 4.0  # 点了灵光选项后这么久内不再换着点，等页面响应
+_FLASH_CHOICE_TITLE_REGION = (0.30, 0.08, 0.70, 0.18)  # 「请选择灵光一闪效果」标题带
 
 
 def _flash_page_signature(task):
@@ -4842,11 +4889,20 @@ def _remember_flash_click(task):
         task._flash_choice_sig = _flash_page_signature(task)
 
 
-def handle_view_original(task: TriggerTask):
-    """卡牌闪光（查看原件）事件: 按类型特征识别卡牌，并按闪光优先级选择。"""
+def _is_flash_choice_page(task: TriggerTask):
+    """卡牌闪光三选一页：右上「查看原件 / 查看内容 / 查看之前的闪光」，或标题「请选择灵光一闪效果」。"""
     box1 = find_box_at_point(task, 0.890, 0.051)
     box2 = find_box_at_point(task, 0.896, 0.131)
-    if not ((box1 and (_get_game_text(task, '查看原件') in box1.name or _get_game_text(task, '查看之前的闪光') in box1.name)) or (box2 and (_get_game_text(task, '查看原件') in box2.name or _get_game_text(task, '查看之前的闪光') in box2.name))):
+    labels = (_get_game_text(task, "查看原件"), _get_game_text(task, "查看之前的闪光"))
+    if any(box and any(label in box.name for label in labels) for box in (box1, box2)):
+        return True
+    title = _get_region_text(task, _FLASH_CHOICE_TITLE_REGION)
+    return "请选择" in title and "效果" in title and ("灵光" in title or "闪光" in title)
+
+
+def handle_view_original(task: TriggerTask):
+    """卡牌闪光（查看原件）事件: 按类型特征识别卡牌，并按闪光优先级选择。"""
+    if not _is_flash_choice_page(task):
         return False
 
     # 这个页面会连续识别好几帧，描述里的数字每次 OCR 不完全一样（实况把「168%×4」读成 1168%，
@@ -4862,7 +4918,20 @@ def handle_view_original(task: TriggerTask):
 
     cards = recognize_cards(task, page="卡牌闪光页面")
     if not cards:
+        since = getattr(task, "_flash_choice_empty_since", None)
+        now = time.time()
+        if since is None:
+            task._flash_choice_empty_since = now
+            since = now
+        waited = now - since
+        if waited < _FLASH_CHOICE_RETRY_SECONDS:
+            # 效果页入场白闪：牌还没出来时点「跳过」会把闪光优先级（如琶音）直接跳掉
+            task.log_info(f"卡牌闪光页面: 牌面还没出来，等下一帧（已 {waited:.1f} 秒）")
+            return True
+        task._flash_choice_empty_since = None
+        task.log_info("卡牌闪光页面: 等牌面超时，交给后面的处理函数")
         return False
+    task._flash_choice_empty_since = None
 
     flash_rules = _flash_rules(task)
     first_rule = next((re.sub(r"\s+", "", k) for k in _get_card_list(task, '闪光优先级')
