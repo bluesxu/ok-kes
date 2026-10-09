@@ -319,6 +319,20 @@ class TestChoosePlay(unittest.TestCase):
                     self.assertNotEqual(0, cost, f"{label} 是 {true_cost} 费，认成了 0 费")
         self.assertGreaterEqual(zeros, 3)
 
+    def test_zero_cost_arpeggio(self):
+        """实跑 10/08 21:16（用户标记：同名节奏卡没按费用最低的出）：0 费的节奏：琶音读成没读到，先出了 1 费那张。
+        streak：方框角上搭着卡面的斜光线；leftmost：扇形最左边那张费用偏低，方框下半截在范围外。"""
+        for name, costs in (("arpeggio_zero_streak", {"1": 0, "2": 0, "3": 0, "4": 3, "5": 1}),
+                            ("arpeggio_zero_leftmost", {"1": 0, "2": 1, "3": 3, "4": 4, "5": 5})):
+            task = screenshot_task(name)
+            for card in battle.read_hand(task, 5):
+                with self.subTest(name=name, key=card["key"]):
+                    cost = battle._card_cost(task, task.frame, card)
+                    if costs[card["key"]] == 0:
+                        self.assertEqual(0, cost)
+                    else:
+                        self.assertNotEqual(0, cost)
+
     def test_unknown_cost_is_tried_even_without_ap_left(self):
         # 实跑 21:34：AP 用完时手里 4 张定位雷射（0 费）读不到费用，一张不出就结束了回合。
         # 0 费牌不花 AP，所以没有费用时也要挑一张读不到费用的试试，出不掉时调用方会把它记进 unplayable
@@ -548,6 +562,17 @@ class TestReadCosts(unittest.TestCase):
             battle._read_costs(task, state, None, cards, {})
         self.assertEqual([0, 2], [c["cost"] for c in cards])
         self.assertIn("节奏：琶音", task._battle_session["zero_cost"])
+
+    def test_zero_shape_beats_ocr_digit(self):
+        # 实跑 10/08 21:16：0 费琶音的空心方框被两种预处理都读成「3」，按 3 费排到 1 费后面
+        card = {"x": 0.5, "y": 0.75}
+        frame = np.zeros((100, 100, 3), np.uint8)
+        with mock.patch.object(battle, "_looks_like_zero", lambda crop: True), \
+                mock.patch.object(battle, "_read_digit", lambda *a, **k: 3):
+            self.assertEqual(0, battle._card_cost(SimpleNamespace(), frame, card))
+        with mock.patch.object(battle, "_looks_like_zero", lambda crop: False), \
+                mock.patch.object(battle, "_read_digit", lambda *a, **k: 3):
+            self.assertEqual(3, battle._card_cost(SimpleNamespace(), frame, card))
 
     def test_lone_positive_cost_forgets_zero(self):
         # 没有同名牌、读到了正费用：它本来就要花 AP，以后读不到别再当成 0 费
@@ -1881,6 +1906,52 @@ class TestHandSelect(unittest.TestCase):
         task.all_texts = []                                           # 页面关了
         self.assertFalse(utils_sortie.handle_battle_hand_select(task))
         self.assertEqual(set(), task._hand_select_tried)
+
+
+class TestPileSelect(unittest.TestCase):
+    """战斗中所有牌堆选牌页（handle_battle_pile_select）：0/1 时先点牌，选满后交给 handle_select
+    （实跑 10/08 15:42「暗黑凝聚」弹出该页，没人选牌卡了 14 分钟）。"""
+
+    # 现场包 20261008-155646 第 11 帧的实际 OCR（2538x1428），只取用到的几个
+    PAGE = [("所有牌堆", 87, 168, 217, 55), ("请选择1张欲赋豫的卡牌。", 1018, 131, 579, 53),
+            ("0/1", 1216, 215, 95, 50), ("技能", 160, 407, 100, 37), ("基本攻击", 1102, 407, 178, 37),
+            ("攻击", 656, 1058, 113, 47), ("选择", 2353, 1297, 103, 60)]
+
+    def setUp(self):
+        self.clicks = []
+        patcher = mock.patch.object(utils_sortie, "_move_and_click",
+                                    lambda task, x, y: self.clicks.append((round(x, 2), round(y, 2))))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def make_task(self, page):
+        task = SimpleNamespace(width=2538, height=1428, log_info=lambda message: None, sleep=lambda s: None)
+        task.all_texts = [Box(x, y, w, h, name=name) for name, x, y, w, h in page]
+        return task
+
+    def test_picks_attack_then_next_when_count_unchanged(self):
+        task = self.make_task(self.PAGE)
+        self.assertTrue(utils_sortie.handle_battle_pile_select(task))
+        self.assertEqual((0.47, 0.36), self.clicks[0])             # 上排攻击牌优先于技能牌
+        self.assertTrue(utils_sortie.handle_battle_pile_select(task))
+        self.assertEqual((0.28, 0.82), self.clicks[1])             # 计数没变：换下排攻击牌
+
+    def test_full_hands_over_to_select_button(self):
+        page = [p if p[0] != "0/1" else ("1/1",) + p[1:] for p in self.PAGE]
+        self.assertFalse(utils_sortie.handle_battle_pile_select(self.make_task(page)))
+        self.assertEqual([], self.clicks)
+
+    def test_hand_select_page_not_claimed(self):
+        page = [p for p in self.PAGE if p[0] != "所有牌堆"]
+        self.assertFalse(utils_sortie.handle_battle_pile_select(self.make_task(page)))
+
+    def test_counts_as_battle_screen(self):
+        """这个页面没有手牌栏，也要算战斗画面，不然卡 8 秒就误记「战斗结束」。"""
+        seen = []
+        with mock.patch.object(utils.battle_log, "battle_frame", lambda task, in_battle: seen.append(in_battle)):
+            utils.log_node_status(self.make_task(self.PAGE))
+            utils.log_node_status(self.make_task([p for p in self.PAGE if p[0] != "0/1"]))
+        self.assertEqual([True, False], seen)
 
 
 if __name__ == "__main__":

@@ -47,6 +47,7 @@ _HP_BAR_ROWS = (0.034, 0.038, 0.042)               # 我方血条取样的行
 _HP_BAR_LEFT = 0.022                               # 我方血条左端
 _ENEMY_AREA = (0.30, 0.0, 1.0, 0.62)               # 敌人血条可能出现的范围
 _CARD_COST_BOX = (-0.030, -0.016, 0.004, 0.050)    # 费用数字相对牌名左上角的范围
+_CARD_COST_LOWER = 0.025                            # 认 0 费方框时范围再往下挪这么多试一次
 _CARD_TYPE_BOX = (-0.012, 0.004, 0.05, 0.055)     # 类型标签相对牌名左上角的范围；右边界太宽会拿到相邻牌的标签
 _PANEL_REGION = (0.02, 0.02, 0.46, 0.46)           # 怪物信息面板
 _WEAKNESS_REGION = (0.30, 0.07, 0.45, 0.15)        # 怪物信息面板标题栏右侧的「弱点」：看到它说明面板开着
@@ -66,6 +67,9 @@ _ZERO_CONTRAST = 25        # 描边要比周围亮这么多
 _ZERO_HOLE = 0.25          # 中间空心占外接矩形的比例（实心数字没有洞，实测 0.32~0.42）
 _ZERO_FILL = 0.7           # 描边围成的形状几乎填满外接矩形
 _ZERO_SOLID = 0.85         # 与凸包的填充率（卡面干扰会让描边有缺口）
+_RING_HOLE_HEIGHT = 0.22   # 从空心认 0：空心至少占费用范围这么高（6/9 的洞矮）
+_RING_HOLE_RECT = 0.7      # 空心填满自己外接矩形的比例（4 的洞是三角形）
+_RING_COVER = 0.85         # 空心外一圈（约 1/4 空心宽）是笔画的比例
 _AP_SHORT = re.compile(r"AP\s*不足", re.IGNORECASE)
 # 牌名里带这些字的非攻击牌算保命牌（加护盾、回血）
 _SHIELD_WORDS = ("盾", "格挡", "壁", "屏障", "防御", "防护", "守护")
@@ -232,7 +236,35 @@ def _looks_like_zero(crop):
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV).astype(np.float32)
     whiteness = hsv[:, :, 2] * (255.0 - hsv[:, :, 1]) / 255.0
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    return _has_empty_box(_strokes(gray)) or _has_empty_box(_strokes(whiteness))
+    return any(_has_empty_box(s) or _has_ringed_hole(s) for s in (_strokes(gray), _strokes(whiteness)))
+
+
+def _has_ringed_hole(strokes):
+    """从方框中间的空心认 0：节奏：琶音的卡面有一道斜光线搭在方框角上（和方框笔画一样粗），
+    外轮廓连上光线就不像方框了，_has_empty_box 认不出（实跑 10/08 21:16）。
+    空心本身还是一个干净的竖长方块，四周一圈都是笔画；外面搭着什么不影响。
+    钥匙数字的圆角框是横长的，6/8/9 的洞矮，4 的洞是三角形，都过不了。"""
+    height, width = strokes.shape[:2]
+    contours, hierarchy = cv2.findContours(strokes, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return False
+    for index, contour in enumerate(contours):
+        if hierarchy[0][index][3] == -1:  # 只看洞
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        if not (0.1 * width <= w <= 0.5 * width and _RING_HOLE_HEIGHT * height <= h <= 0.6 * height):
+            continue
+        if not 0.4 <= w / h <= 1.0 or x == 0 or y == 0 or x + w >= width or y + h >= height:
+            continue
+        hole = np.zeros_like(strokes)
+        cv2.drawContours(hole, [contour], -1, 255, -1)
+        if cv2.contourArea(contour) / (w * h) < _RING_HOLE_RECT:
+            continue
+        thickness = max(2, round(0.25 * w))
+        ring = cv2.dilate(hole, np.ones((2 * thickness + 1, 2 * thickness + 1), np.uint8)) & ~hole
+        if (strokes[ring > 0] > 0).mean() >= _RING_COVER:
+            return True
+    return False
 
 
 def read_remaining_cost(task, frame):
@@ -537,9 +569,14 @@ def _card_cost(task, frame, card):
         return card.get("cost_hint")
     dx1, dy1, dx2, dy2 = _CARD_COST_BOX
     region = (card["x"] + dx1, card["y"] + dy1, card["x"] + dx2, card["y"] + dy2)
+    # 先按形状认 0，认出来就不用 OCR：空心方框会被 OCR 读成别的数字，两种预处理都读成「3」就采信了，
+    # 0 费琶音当成 3 费，先出了 1 费那张（实跑 10/08 21:16）。1 费以上是实心笔画，认不成 0
+    # （旧现场包里 OCR 读得出正费用的 507 张牌，没有一张认成 0）。
+    # 扇形最左边那张牌转得多，费用比牌名低一截，方框下半截落在范围外，范围往下挪一点再认一次。
+    lower = (region[0], region[1] + _CARD_COST_LOWER, region[2], region[3] + _CARD_COST_LOWER)
+    if _looks_like_zero(_crop(frame, region)) or _looks_like_zero(_crop(frame, lower)):
+        return 0
     cost = _read_digit(task, frame, region, _ONE_DIGIT, votes=2)
-    if cost is None and _looks_like_zero(_crop(frame, region)):
-        return 0  # 读不到数字又画着空心方框：0 费（1 费以上都读得出数字）
     return cost if cost is not None else card.get("cost_hint")
 
 

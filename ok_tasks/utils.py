@@ -2191,7 +2191,12 @@ def log_credit(task: TriggerTask):
 def log_node_status(task: TriggerTask):
     """记录当前胜率（仅记录, 不拦截后续处理）；顺带告诉详细日志这一帧是不是战斗画面（记战斗开始/结束）。"""
     hand = find_box_at_point(task, 0.512, 0.969)
-    battle_log.battle_frame(task, bool(hand and re.search(r'\d+/10', hand.name)))
+    in_battle = bool(hand and re.search(r'\d+/10', hand.name))
+    if not in_battle and any("所有牌堆" in b.name for b in task.all_texts):
+        # 战斗中从所有牌堆选牌的页面没有手牌栏，卡久了会误记「战斗结束」（10/08 15:42 实况）
+        counter = find_box_at_point(task, 0.5, 0.168)
+        in_battle = bool(counter and re.search(r'\d+\s*/\s*\d+', counter.name))
+    battle_log.battle_frame(task, in_battle)
     ns = getattr(task, 'node_status', None)
     if ns:
         try:

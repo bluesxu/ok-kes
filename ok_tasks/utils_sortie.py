@@ -857,6 +857,58 @@ def handle_battle_hand_select(task: TriggerTask):
     return True
 
 
+_PILE_CARD_TYPE = re.compile(r'(攻击|技能|强化|咒术)$')
+
+
+def handle_battle_pile_select(task: TriggerTask):
+    """战斗中从所有牌堆选牌的页面（左上「所有牌堆」，标题下方计数 0/1，右下「选择」）：点一张牌，选满后交给 handle_select。
+    实跑 10/08 15:42 打出「暗黑凝聚」后弹出「请选择1张欲赋予的卡牌」，没人选牌，handle_select 在 0/1 时点了「选择」没反应，
+    之后卡了 14 分钟。和手牌选择页同一个标题，区别是没有底部手牌数。优先攻击牌，点了计数没变就换下一张。"""
+    prompt = find_box_at_point(task, 0.5, 0.111)
+    m = re.search(r'请选择(?=.*卡牌).*?(\d+)张', prompt.name) if prompt else None
+    counter = find_box_at_point(task, 0.5, 0.168)
+    c = re.search(r'(\d+)\s*/\s*(\d+)', counter.name) if counter else None
+    if not (m and c and any("所有牌堆" in b.name for b in task.all_texts)):
+        task._pile_select_tried, task._pile_select_pending = set(), None
+        return False
+    picked, need = int(c.group(1)), int(c.group(2))
+    if picked >= need:
+        return False  # 选满了，交给 handle_select 点「选择」
+
+    tried = getattr(task, "_pile_select_tried", None)
+    if tried is None:
+        tried = task._pile_select_tried = set()
+    pending = getattr(task, "_pile_select_pending", None)
+    if pending:
+        tried.add(pending)  # 上次点的牌没让计数增加：换别的
+        task._pile_select_pending = None
+
+    candidates = []
+    for b in task.all_texts:
+        name = b.name.strip()
+        cx, cy = (b.x + b.width / 2) / task.width, (b.y + b.height / 2) / task.height
+        if 0.2 <= cy <= 0.8 and _PILE_CARD_TYPE.search(name):
+            key = (round(cx * 10), round(cy * 10))
+            candidates.append((not name.endswith("攻击"), cy > 0.5, cx, key, name, (cx, cy + 0.06)))
+    candidates.sort()
+    fresh = [c for c in candidates if c[3] not in tried]
+    if not fresh and candidates:
+        tried.clear()
+        fresh = candidates
+    task.log_info(f"检测到战斗中所有牌堆选牌页面（{picked}/{need}）: {prompt.name}")
+    if not fresh:
+        task.log_info("所有牌堆选牌页面没读到卡牌类型，点第一张牌的位置")
+        _move_and_click(task, 0.12, 0.35)
+        task.sleep(0.5)
+        return True
+    *_, key, name, (px, py) = fresh[0]
+    task.log_info(f"所有牌堆选牌: 点「{name}」那张牌")
+    _move_and_click(task, px, py)
+    task._pile_select_pending = key
+    task.sleep(0.5)
+    return True
+
+
 def handle_card_info_popup(task: TriggerTask):
     """确认卡牌资讯弹窗（带「使用卡牌 / 取消选择」按钮）: 取消选择关掉。
     这个弹窗盖住手牌区时手牌会识别成 0 张，没有它时曾经在同一个画面空转了近 10 小时。
@@ -1156,6 +1208,7 @@ PAGE_HANDLERS = [
     handle_leave, #离开按钮
     handle_expedition_result, #探险结果页面，优先级高于下一步
     handle_next_step, #下一步按钮
+    handle_battle_pile_select, #战斗中所有牌堆选牌，没选满前不让 handle_select 点「选择」
     handle_select, #选择按钮
 
     handle_equipment_recast, #装备重铸按钮
