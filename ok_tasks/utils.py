@@ -1447,6 +1447,16 @@ def _deck_scrolled(task: TriggerTask, before):
     return float(np.mean(np.abs(after.astype(np.int16) - before.astype(np.int16)))) > 2.0
 
 
+def _card_blacklist(task: TriggerTask):
+    """「拉黑卡牌」里填了的牌名（去掉空白和空项）。"""
+    return [name.strip() for name in _get_card_list(task, "拉黑卡牌") if isinstance(name, str) and name.strip()]
+
+
+def _card_blacklisted(card_name, blacklist):
+    """牌名和拉黑项互相包含就算命中（OCR 常多读或漏读一两个字）；没读到牌名的牌不算。"""
+    return any(_names_match(card_name, name) for name in blacklist)
+
+
 def select_card(task: TriggerTask, card_names, count=1, action=""):
     """使用卡组特征识别选择卡牌，支持滚动查找、基础牌移除和兜底选择。"""
     selected = 0
@@ -1477,6 +1487,7 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
     flash_rules = _flash_rules(task) if action in ("闪光", "灵光") else []
     # 出击模式闪光：选牌页里只列出还能闪光的牌，记下看到过的牌名，用来判断列表里的牌是否已经闪完
     sortie_flash = action in ("闪光", "灵光") and task.name == "自动出击模式"
+    blacklist = _card_blacklist(task) if action in ("闪光", "灵光") else []
     seen_cards = {}
 
     def log_pick(card, reason):
@@ -1509,10 +1520,23 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
             filtered_cards.append(card)
         return filtered_cards
 
+    def filter_blacklisted_cards(cards):
+        """闪光选牌页不选「拉黑卡牌」里的牌：闪光卡牌列表和兜底选牌都绕开它们。整页都被拉黑时照常选。"""
+        if not blacklist:
+            return cards
+        kept = [card for card in cards if not _card_blacklisted(card["name"], blacklist)]
+        if cards and not kept:
+            task.log_info(f"{page}: 本页的牌都被拉黑了，照常选")
+            return cards
+        if len(kept) < len(cards):
+            task.log_info(f"{page}: 拉黑卡牌，排除{'、'.join(c['name'] for c in cards if c not in kept)}")
+        return kept
+
     def refresh_cards():
         task.all_texts = _simplify_texts(task.ocr())
         cards = recognize_cards_in_deck(task, page=page)
         cards = filter_flash_priority_cards(cards)
+        cards = filter_blacklisted_cards(cards)
         for card in cards:
             if card["name"].strip():
                 seen_cards.setdefault(card["name"].strip(), card)
@@ -1834,6 +1858,7 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
 
     cards = recognize_cards_in_deck(task, page=f"{page}-兜底")
     cards = filter_flash_priority_cards(cards)
+    cards = filter_blacklisted_cards(cards)
     fallback_cards = sorted(
         cards,
         key=lambda card: (card["y"], card["x"]),

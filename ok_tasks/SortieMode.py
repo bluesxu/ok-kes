@@ -40,6 +40,7 @@ class SortieMode(TriggerTask):
         self.default_config["移除卡牌列表"] = ["剑幕"]
         self.default_config["复制卡牌列表"] = ["剑雨", "展开极光", "一缕光芒","缕光芒"]
         self.default_config["闪光卡牌列表"] = ["剑雨", "展开极光", "一缕光芒","缕光芒"]
+        self.default_config["拉黑卡牌"] = []
         self.default_config["闪光优先级"] = []
         self.default_config["装备1号位优先级"] = ["蚀化臂铠"]
         self.default_config["装备2号位优先级"] = ["拷问工具箱"]
