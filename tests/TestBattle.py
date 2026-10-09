@@ -1820,6 +1820,36 @@ class TestFlash(unittest.TestCase):
             self.assertTrue(utils.handle_view_original(task))
             self.assertEqual(2, len(clicks))       # 超过重试间隔才允许再点
 
+    def pick_version(self, cards, **config):
+        """在三选一页上跑一遍 handle_view_original，返回点击位置。"""
+        clicks = []
+        task = flash_task(**config)
+        prompt = SimpleNamespace(name="查看之前的闪光")
+        cards = [dict(c, x=(0.2, 0.4, 0.6)[i], y=0.3) for i, c in enumerate(cards)]
+        with mock.patch.object(utils, "find_box_at_point", lambda task, x, y: prompt),                 mock.patch.object(utils, "_get_game_text", lambda task, text: text),                 mock.patch.object(utils, "recognize_cards", lambda task, page="": cards),                 mock.patch.object(utils, "find_target_card", lambda task: ([], [])),                 mock.patch.object(utils, "_matching_meditation_card_names", lambda task, cards: []),                 mock.patch.object(utils, "_move_and_click", lambda task, x, y: clicks.append((x, y))),                 mock.patch.object(battle_log, "record", lambda *a, **k: None),                 mock.patch.object(battle_log, "process_shot", lambda *a, **k: None):
+            self.assertTrue(utils.handle_view_original(task))
+        return clicks
+
+    THREE = [version("音乐开始", "技能", "获得极强效果"), version("音乐开始", "技能", "获得断奏效果"),
+             version("音乐开始", "技能", "获得AP3")]
+
+    def test_blacklisted_versions_are_not_chosen(self):
+        """拉黑卡牌：三选一里命中的变体不选，即使它排在闪光优先级前面。"""
+        config = dict(闪光优先级=["极强", "断奏"], 拉黑卡牌=["音乐开始:极强"])
+        self.assertEqual([(0.4, 0.3)], self.pick_version(self.THREE, **config))  # 极强被拉黑，改选断奏
+
+    def test_blacklisted_versions_skipped_when_no_priority_hits(self):
+        config = dict(闪光优先级=[], 拉黑卡牌=["极强", "断奏"])
+        self.assertEqual([(0.6, 0.3)], self.pick_version(self.THREE, **config))
+
+    def test_all_versions_blacklisted_picks_normally(self):
+        config = dict(闪光优先级=["极强"], 拉黑卡牌=["极强", "断奏", "AP3"])
+        self.assertEqual([(0.2, 0.3)], self.pick_version(self.THREE, **config))
+
+    def test_blacklist_rule_for_other_card_does_not_apply(self):
+        config = dict(闪光优先级=["极强"], 拉黑卡牌=["剑雨:极强"])
+        self.assertEqual([(0.2, 0.3)], self.pick_version(self.THREE, **config))
+
     def test_view_original_unlocks_when_the_page_changes(self):
         """加速模式下页面已经变了就解除 4 秒锁定，把这一帧交给后面的处理函数。"""
         clicks = []

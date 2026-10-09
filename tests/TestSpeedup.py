@@ -992,36 +992,6 @@ class TestSpeedup(unittest.TestCase):
         self.assertEqual(["卡牌", "跳过"], disabled.clicked)
         self.assertEqual(0, disabled._pending_removed_card_count)
 
-    def flash_page(self, blacklist):
-        task = self.select_page("请选择1张欲赋予灵光一闪的卡牌", ["拍照时间"])
-        task.config.update({"闪光卡牌列表": ["声音测试", "拍照时间"], "拉黑卡牌": blacklist})
-        return task
-
-    def test_flash_picks_first_listed_card_without_blacklist(self):
-        self.use_real_removal_flow()
-        task = self.flash_page([])
-        utils.handle_select_card(task)
-        self.assertEqual({"声音测试"}, task.picked)
-
-    def test_flash_skips_blacklisted_cards(self):
-        self.use_real_removal_flow()
-        task = self.flash_page(["声音测试"])
-        utils.handle_select_card(task)
-        self.assertEqual({"拍照时间"}, task.picked)  # 列表里排前面的被拉黑，改选下一张
-
-    def test_flash_blacklist_ignored_when_whole_page_blocked(self):
-        self.use_real_removal_flow()
-        task = self.flash_page(["声音测试", "拍照时间", "安可"])
-        utils.handle_select_card(task)
-        self.assertEqual({"声音测试"}, task.picked)  # 整页都被拉黑：照常选
-
-    def test_blacklist_only_applies_to_flash(self):
-        self.use_real_removal_flow()
-        task = self.select_page("请选择1张要复制的卡牌", ["拍照时间"])
-        task.config.update({"复制卡牌列表": ["拍照时间"], "拉黑卡牌": ["拍照时间"]})
-        utils.handle_select_card(task)
-        self.assertEqual({"拍照时间"}, task.picked)
-
     def test_copy_flow_unchanged(self):
         self.use_real_removal_flow()
         task = self.select_page("请选择2张要复制的卡牌", ["拍照时间"])

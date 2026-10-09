@@ -440,5 +440,5 @@ msgstr "Survival cards (shields, heals). Names containing shield/block/wall/heal
 msgid "预计敌人这一轮打完后我方血量低于上限的百分之几，就先出保命牌；0 为只在会被打死时才出"
 msgstr "Play survival cards first when HP after the enemies' attacks is expected to drop below this percentage of max; 0 means only when it would be lethal."
 
-msgid "灵光一闪的选牌页不选这些牌（牌名互相包含就算，列表里的牌和兜底选牌都绕开；整页都被拉黑时照常选）"
-msgstr "Never pick these cards on the flash card-selection page (names match if either contains the other; both the flash list and the fallback skip them; if every card on the page is blocked, pick as usual)."
+msgid "闪光出来的 3 个版本里不选这些：写法同「闪光优先级」（牌名:关键词，或对所有牌生效的关键词）；3 个版本都被拉黑时照常选"
+msgstr "Never pick these among the 3 flash versions. Same format as the flash priority list (card name:keyword, or a keyword for every card); if all 3 versions are blocked, pick as usual."

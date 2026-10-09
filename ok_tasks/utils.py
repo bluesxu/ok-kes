@@ -42,11 +42,10 @@ def is_subsequence(first: str, second: str) -> bool:
     return all(char in second_iter for char in first)
 
 
-def _flash_rules(task: TriggerTask):
-    """「闪光优先级」规则，写成「牌名:关键词」的只对这张牌生效、排在前面，其余是对所有牌生效的关键词。
-    返回 [(规则原文, 牌名或 None, 关键词)]，保持各自在列表里的先后顺序。"""
+def _parse_flash_rules(rules):
+    """把「牌名:关键词」或「关键词」写法的规则列表解析成 [(规则原文, 牌名或 None, 关键词)]，带牌名的排在前面。"""
     per_card, common = [], []
-    for rule in _get_card_list(task, "闪光优先级"):
+    for rule in rules:
         if not isinstance(rule, str) or not re.sub(r"\s+", "", rule):
             continue
         rule = re.sub(r"\s+", "", rule)
@@ -56,6 +55,17 @@ def _flash_rules(task: TriggerTask):
         else:
             common.append((rule, None, rule))
     return per_card + common
+
+
+def _flash_rules(task: TriggerTask):
+    """「闪光优先级」规则，写成「牌名:关键词」的只对这张牌生效、排在前面，其余是对所有牌生效的关键词。
+    返回 [(规则原文, 牌名或 None, 关键词)]，保持各自在列表里的先后顺序。"""
+    return _parse_flash_rules(_get_card_list(task, "闪光优先级"))
+
+
+def _flash_blacklist_rules(task: TriggerTask):
+    """「拉黑卡牌」规则：闪光三选一页里命中这些规则的版本不选，写法和「闪光优先级」一样。"""
+    return _parse_flash_rules(_get_card_list(task, "拉黑卡牌"))
 
 
 def _flash_rule_matches(rule, card):
@@ -1447,16 +1457,6 @@ def _deck_scrolled(task: TriggerTask, before):
     return float(np.mean(np.abs(after.astype(np.int16) - before.astype(np.int16)))) > 2.0
 
 
-def _card_blacklist(task: TriggerTask):
-    """「拉黑卡牌」里填了的牌名（去掉空白和空项）。"""
-    return [name.strip() for name in _get_card_list(task, "拉黑卡牌") if isinstance(name, str) and name.strip()]
-
-
-def _card_blacklisted(card_name, blacklist):
-    """牌名和拉黑项互相包含就算命中（OCR 常多读或漏读一两个字）；没读到牌名的牌不算。"""
-    return any(_names_match(card_name, name) for name in blacklist)
-
-
 def select_card(task: TriggerTask, card_names, count=1, action=""):
     """使用卡组特征识别选择卡牌，支持滚动查找、基础牌移除和兜底选择。"""
     selected = 0
@@ -1487,7 +1487,6 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
     flash_rules = _flash_rules(task) if action in ("闪光", "灵光") else []
     # 出击模式闪光：选牌页里只列出还能闪光的牌，记下看到过的牌名，用来判断列表里的牌是否已经闪完
     sortie_flash = action in ("闪光", "灵光") and task.name == "自动出击模式"
-    blacklist = _card_blacklist(task) if action in ("闪光", "灵光") else []
     seen_cards = {}
 
     def log_pick(card, reason):
@@ -1520,23 +1519,10 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
             filtered_cards.append(card)
         return filtered_cards
 
-    def filter_blacklisted_cards(cards):
-        """闪光选牌页不选「拉黑卡牌」里的牌：闪光卡牌列表和兜底选牌都绕开它们。整页都被拉黑时照常选。"""
-        if not blacklist:
-            return cards
-        kept = [card for card in cards if not _card_blacklisted(card["name"], blacklist)]
-        if cards and not kept:
-            task.log_info(f"{page}: 本页的牌都被拉黑了，照常选")
-            return cards
-        if len(kept) < len(cards):
-            task.log_info(f"{page}: 拉黑卡牌，排除{'、'.join(c['name'] for c in cards if c not in kept)}")
-        return kept
-
     def refresh_cards():
         task.all_texts = _simplify_texts(task.ocr())
         cards = recognize_cards_in_deck(task, page=page)
         cards = filter_flash_priority_cards(cards)
-        cards = filter_blacklisted_cards(cards)
         for card in cards:
             if card["name"].strip():
                 seen_cards.setdefault(card["name"].strip(), card)
@@ -1858,7 +1844,6 @@ def select_card(task: TriggerTask, card_names, count=1, action=""):
 
     cards = recognize_cards_in_deck(task, page=f"{page}-兜底")
     cards = filter_flash_priority_cards(cards)
-    cards = filter_blacklisted_cards(cards)
     fallback_cards = sorted(
         cards,
         key=lambda card: (card["y"], card["x"]),
@@ -4968,10 +4953,21 @@ def handle_view_original(task: TriggerTask):
                        if isinstance(k, str) and re.sub(r"\s+", "", k)), None)
     chosen_card, choose_reason = None, None
     for rule in flash_rules:
-        chosen_card = next((card for card in cards if _flash_rule_matches(rule, card)), None)
+        chosen_card = next((card for card in candidates if _flash_rule_matches(rule, card)), None)
         if chosen_card:
             choose_reason = f"闪光优先级「{rule[0]}」"
             task.log_info(f"优先选择「{chosen_card['name']}」({rule[0]})")
+    # 拉黑的版本不参与挑选；三个版本都被拉黑时照常选，免得卡在这一页
+    blacklist = _flash_blacklist_rules(task)
+    candidates = [card for card in cards if not any(_flash_rule_matches(rule, card) for rule in blacklist)]
+    if len(candidates) < len(cards):
+        names = "、".join(f"第{i + 1}个" for i, card in enumerate(cards) if card not in candidates)
+        if candidates:
+            task.log_info(f"卡牌闪光页面: 拉黑卡牌，排除{names}版本")
+        else:
+            task.log_info("卡牌闪光页面: 三个版本都被拉黑了，照常选")
+            candidates = cards
+
             if (
                 _get_config_value(task, "首层刷特定闪光", False) is True
                 and rule[0] == first_rule
@@ -5003,7 +4999,7 @@ def handle_view_original(task: TriggerTask):
         return True
 
     if not chosen_card:
-        chosen_card, choose_reason = choose_flash_version(cards)
+        chosen_card, choose_reason = choose_flash_version(candidates)
         task.log_info(f"闪光优先级都没命中，选择「{chosen_card['name']}」（{choose_reason}）")
 
     options = [{"type": c.get("type"), "description": c.get("description")} for c in cards]
