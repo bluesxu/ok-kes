@@ -79,6 +79,8 @@ _PROBE_LIMIT = 2            # AP 用完时试读不到费用的牌，连着几�
 _STUCK_LIMIT = 3            # 同一张牌连续这么多次还在手里（又没提示 AP不足），本回合不再出它
 _BUTTON_GONE_LIMIT = 30     # 「结束回合」按钮消失这么多秒还没回来，就不再当作敌人行动中干等
 _DRAG_FAIL_LIMIT = 2        # 拖动连续这么多次没打出去，本场改用按键 + 回车打默认目标
+_LOST_TARGET_WAITS = 2      # 记住的目标从画面上消失（血条也复查不到）时，最多再等这么多次才认定它死了
+_LOST_TARGET_WAIT = 0.6     # 每次等多久（秒）
 _TURN_FAIL_LIMIT = 3        # 同一张牌一回合里不论按键、拖动、拖动重试，总共这么多次没打出去就不再出它（兜底，防止换着法子一直试）
 _KEYS_DEAD_CARDS = 2        # 这么多张不同的牌按键没打出去、拖动打出去了，才算键盘失效（单张牌常是自身原因）
 _DRAG_STEPS = 8             # 后台拖动中途发几次鼠标移动（原 12）
@@ -1120,6 +1122,7 @@ def _check_last_play(task, state, hand_count, remaining):
         session = _session(task)
         if played:
             session["drag_ok"] += 1
+            state["drag_fail"].pop(last["name"], None)  # 要「连续」失败才改用按键：中间成功过就重新数
         else:
             session["drag_fail"] += 1
             drag_fail = state["drag_fail"]
@@ -1344,6 +1347,38 @@ def _keep_remembered_target(frame, state, target, target_reason):
     return dict(remembered), "上一只还在（这一帧没认出来），继续打它"
 
 
+def _boss_from_memory(frame, state):
+    """Boss 战里记住的 Boss 这一帧没被认出来、血条还在：照记住的位置继续打它，别转去打小怪。"""
+    head = state.get("head")
+    if not head or not _bar_still_there(frame, head[0], head[1]):
+        return None
+    return {"x": head[0], "y": head[1], "hp": state.get("head_hp", 0), "countdown": None, "intent": None,
+            "shield": 0, "infinite": True, "drop": (min(0.97, head[0] + 0.055), min(0.62, head[1] + 0.2))}
+
+
+def _wait_lost_target(task, frame, state, enemies, anchor):
+    """要打的目标（上一只，Boss 战是 Boss）从敌人列表里消失、血条也复查不到：先等一等再认定它死了。
+    点开怪物面板、出牌动画都会把血条遮住一两帧，立刻换人就成了「目标没死又换目标」
+    （实跑 10/09 15:55 左边那只 840 血的被遮了一帧，换去打别的，之后又换了两次）。
+    真死了的目标一直不会回来，等满次数后照原样重挑；目标回来、或重挑了新目标，计数清零。返回 True 表示本帧等了。"""
+    if anchor is None:
+        return False
+    if _sticky_match(enemies, anchor) is not None:
+        state["lost_waits"] = 0
+        return False
+    if _bar_still_there(frame, anchor[0], anchor[1]):
+        return False
+    waited = state.get("lost_waits", 0)
+    if waited >= _LOST_TARGET_WAITS:
+        return False
+    state["lost_waits"] = waited + 1
+    task.log_info(f"要打的目标不见了（{waited + 1}/{_LOST_TARGET_WAITS}），等一下再看是不是死了")
+    battle_log.record(task, "目标暂时看不到", position=list(anchor), waited=waited + 1,
+                      enemies=[(e["x"], e["y"], e["hp"]) for e in enemies])
+    task.sleep(_LOST_TARGET_WAIT)
+    return True
+
+
 def play_turn(task, hand_count, finish_turn_visible):
     """战斗页面一帧：看一眼、出一张牌或结束回合。返回 True 表示本帧已处理。"""
     state = _ensure_battle(task)
@@ -1479,14 +1514,23 @@ def play_turn(task, hand_count, finish_turn_visible):
             if not was_zero:
                 # 刚进入 0 血：不沿用之前的目标（可能是一直打不动的 Boss），重挑马上要动手的；之后沿用记忆
                 state["sticky"] = state["sticky_full"] = None
+            if _wait_lost_target(task, frame, state, enemies, state["sticky"]):
+                return True
             target, target_reason = choose_target(enemies, False, state["sticky"], urgent=True)
             target, target_reason = _keep_remembered_target(frame, state, target, target_reason)
             target_reason = target_reason and "血量为 0，" + target_reason
         else:
             if boss_battle:
                 update_head(state, enemies)
+            anchor = state.get("head") if boss_battle else state["sticky"]
+            if _wait_lost_target(task, frame, state, enemies, anchor):
+                return True
             target, target_reason = choose_target(enemies, boss_battle, state["sticky"], state.get("head"))
-            if not boss_battle:
+            if boss_battle:
+                boss = _boss_from_memory(frame, state) if _sticky_match(enemies, state.get("head")) is None else None
+                if boss is not None:
+                    target, target_reason = boss, "Boss 还在（这一帧没认出来），继续打它"
+            else:
                 target, target_reason = _keep_remembered_target(frame, state, target, target_reason)
         use_drag = target is not None
         if use_drag and untyped:

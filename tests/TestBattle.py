@@ -921,13 +921,57 @@ class TestPlayTurn(unittest.TestCase):
     def test_missing_target_switches_when_bar_gone(self):
         self._remembered_state()
         others = [dict(enemy(300, 1, "攻击", x=0.3), drop=(0.3, 0.5))]
-        targets = []
+        targets, sleeps = [], []
+        self.task.sleep = sleeps.append
         with mock.patch.object(battle, "read_enemies", lambda task, frame: others), \
                 mock.patch.object(battle, "_bar_still_there", lambda frame, x, y: False), \
                 mock.patch.object(battle, "_drag_card", lambda task, c, t: targets.append(t)):
+            for _ in range(battle._LOST_TARGET_WAITS):
+                battle.play_turn(self.task, 2, True)
+                self.assertEqual([], targets)  # 先等：可能只是被遮住了一帧
             battle.play_turn(self.task, 2, True)
-        self.assertEqual([300], [t["hp"] for t in targets])        # 真没了：按集火换目标
+        self.assertEqual([battle._LOST_TARGET_WAIT] * battle._LOST_TARGET_WAITS, sleeps)
+        self.assertEqual([300], [t["hp"] for t in targets])        # 等满了还没回来：真没了，按集火换目标
         self.assertEqual((0.3, 0.3), self.task._battle["sticky"])  # 记忆换到新目标
+
+    def test_target_hidden_for_a_frame_is_not_abandoned(self):
+        # 实跑 10/09 15:55：左边那只 840 血的血条被遮了一帧（它没死，后来又回来了），当场换去打别的
+        self._remembered_state()
+        hidden = [dict(enemy(300, 1, "攻击", x=0.3), drop=(0.3, 0.5))]
+        back = [dict(enemy(267, 7, "攻击", x=0.7, y=0.3), drop=(0.7, 0.5)), hidden[0]]
+        frames, targets = [hidden, back], []
+        with mock.patch.object(battle, "read_enemies", lambda task, frame: frames.pop(0)), \
+                mock.patch.object(battle, "_bar_still_there", lambda frame, x, y: False), \
+                mock.patch.object(battle, "_drag_card", lambda task, c, t: targets.append(t)):
+            battle.play_turn(self.task, 2, True)
+            self.assertEqual([], targets)
+            battle.play_turn(self.task, 2, True)
+        self.assertEqual([267], [t["hp"] for t in targets])        # 回来了：还是打它
+        self.assertEqual(0, self.task._battle["lost_waits"])
+
+    def test_boss_hidden_for_a_frame_is_not_abandoned(self):
+        battle.start_battle(self.task)
+        self.task.default_config["出牌优先级"] = ["破碎"]
+        self.task.node_status = {"node_type": "boss"}
+        self.task._battle.update(head=(0.6, 0.18), head_hp=5000, head_sure=True)
+        minion = dict(enemy(900, 8, "攻击", x=0.3), drop=(0.3, 0.5))
+        targets = []
+        with mock.patch.object(battle, "read_enemies", lambda task, frame: [minion]), \
+                mock.patch.object(battle, "_bar_still_there", lambda frame, x, y: (x, y) == (0.6, 0.18)), \
+                mock.patch.object(battle, "_drag_card", lambda task, c, t: targets.append(t)):
+            battle.play_turn(self.task, 2, True)
+        self.assertEqual([(0.6, 0.18)], [(t["x"], t["y"]) for t in targets])  # 血条还在：照记住的位置打 Boss，不转去打小怪
+
+    def test_drag_failures_must_be_consecutive(self):
+        # 0 费抽牌的牌打出后手牌数、AP 都不变，会被误当成没打出去；中间成功过就不该累计成「拖动无效」
+        battle.start_battle(self.task)
+        state = self.task._battle
+        state["drag_fail"]["节奏：琶音"] = 1
+        state["last"] = dict(name="节奏：琶音", slot=1, hand=4, method="拖动", remaining=3, cost=0, twin_ok=False,
+                             key_retry=False, once=False)
+        with mock.patch.object(battle, "_played_banner", lambda task, name: False):
+            battle._check_last_play(self.task, state, 3, 3)  # 手牌数变了：打出去了
+        self.assertNotIn("节奏：琶音", state["drag_fail"])
 
     def test_no_enemies_with_memory_drags_to_remembered(self):
         # 「没有识别到敌人」的那一帧：有记忆就拖到记住的落点，按键+回车打的默认目标可能不是它
