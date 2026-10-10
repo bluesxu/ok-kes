@@ -14,7 +14,6 @@
 
 注意：本文件不能定义顶层类，框架会把 ok_tasks 下含类的 .py 当作任务加载。
 """
-import collections
 import glob
 import os
 import re
@@ -896,12 +895,18 @@ def choose_play(cards, remaining, priority, defense, danger, unplayable, zero_hp
             return True
         return card["cost"] <= remaining
 
+    def rank(card):
+        """牌名只读出一半时（实跑 10/10 11:26 0 费琶音只读到「琶音」，对不上「节奏」，先出了 3 费那张），
+        手里同一种牌有对上出牌优先级的，按它算。"""
+        return min((_priority_rank(c, priority) for c in cards if c is card or _same_card(c["name"], card["name"])),
+                   key=lambda r: r[0])
+
     def pick(group, reason):
         """同一类牌里按出牌优先级、再按费用从低到高挑一张。"""
         if not group:
             return None
-        card = min(group, key=lambda c: (_priority_rank(c, priority)[0], 99 if c["cost"] is None else c["cost"]))
-        matched = _priority_rank(card, priority)[1]
+        card = min(group, key=lambda c: (rank(c)[0], 99 if c["cost"] is None else c["cost"]))
+        matched = rank(card)[1]
         return card, reason + (f"，出牌优先级「{matched}」" if matched else "")
 
     # 1. 崩溃牌不花 AP、不计入敌人的行动次数：手里有就最先出，打够张数才能觉醒（沉下去说明这帧打不出：0 血）
@@ -922,7 +927,7 @@ def choose_play(cards, remaining, priority, defense, danger, unplayable, zero_hp
         ([c for c in playable if is_defense(c, defense)] if danger and not zero_hp else [],
          "预计会被打死或血量过低，先出防御牌"),
         # 3. 用户在「出牌优先级」里指定的牌
-        ([c for c in playable if _priority_rank(c, priority)[1]], "指定优先出的牌"),
+        ([c for c in playable if rank(c)[1]], "指定优先出的牌"),
         # 4. 0 费牌白出，可能带增益或抽牌
         ([c for c in playable if c["cost"] == 0], "0 费牌"),
         # 5. 强化牌先上，后面的攻击才吃得到加成
@@ -1197,29 +1202,28 @@ def _use_drag(task, state, card):
     return not (card["name"] in failed or (not card["name"].startswith("未识别") and _matches(card["name"], failed)))
 
 
+def _same_card(a, b):
+    """两个读到的牌名是不是同一种牌：互相包含（「节奏：琶音」常只读出「节奏」或「琶音」）。"""
+    if a.startswith("未识别") or b.startswith("未识别") or min(len(a), len(b)) < 2:
+        return False
+    return a in b or b in a
+
+
 def _zero_cost_still_possible(card, cards):
     """同名牌里还有一张是 0 费、或费用没读到：这张的正费用不能把牌名从「可以是 0 费」里删掉。"""
-    name = card["name"]
-    for other in cards:
-        if other is card:
-            continue
-        other_name = other["name"]
-        if other_name.startswith("未识别") or len(other_name) < 2:
-            continue
-        if name in other_name or other_name in name:
-            if other.get("cost") in (0, None):
-                return True
-    return False
+    return any(other is not card and _same_card(card["name"], other["name"]) and other.get("cost") in (0, None)
+               for other in cards)
 
 
 def _read_costs(task, state, frame, cards, pending):
     """并行读还没读过费用的牌；牌名读到的按牌名缓存到本回合结束。
     手里有同名牌时每张都现读、不缓存：同名牌费用可能不同（实跑 11:44 两张暗黑之刃一张 1 费、一张 3 费，
-    3 费那张按缓存当成 1 费，AP 只剩 2 时反复去出它，卡了 3 分钟）。"""
-    counts = collections.Counter(c["name"] for c in cards)
-
+    3 费那张按缓存当成 1 费，AP 只剩 2 时反复去出它，卡了 3 分钟）。
+    手里有同一种牌的残缺牌名（「节奏」「琶音」都是「节奏：琶音」漏读一半）也一样：实跑 10/10 11:26
+    读成「节奏」的 0 费琶音出掉后，另一张 2 费琶音也读成「节奏」，套了缓存的 0 费，0 费那张反而留着。"""
     def by_name(card):
-        return not card["name"].startswith("未识别") and counts[card["name"]] == 1
+        return not card["name"].startswith("未识别") and not any(
+            other is not card and _same_card(card["name"], other["name"]) for other in cards)
 
     jobs = {}
     for card in cards:

@@ -17,7 +17,7 @@ from utils import (
     handle_card_assign, handle_non_battle_page,
     handle_remove, handle_three_choice_card_remove, handle_flash, handle_reflash, handle_grant_flash, handle_copy, handle_convert, handle_equipment_recast, handle_weakness_info, handle_minimizemap,
     handle_held_cards_page,
-    handle_stuck_log, is_button_active, _clean_match,
+    handle_stuck_log, is_button_active, _clean_match, has_pile_title,
     handle_shop, handle_expedition_result,
     handle_escape,
     _get_current_credit, _get_current_hp_percent, _get_region_text,
@@ -863,12 +863,15 @@ _PILE_CARD_TYPE = re.compile(r'(攻击|技能|强化|咒术)$')
 def handle_battle_pile_select(task: TriggerTask):
     """战斗中从所有牌堆选牌的页面（左上「所有牌堆」，标题下方计数 0/1，右下「选择」）：点一张牌，选满后交给 handle_select。
     实跑 10/08 15:42 打出「暗黑凝聚」后弹出「请选择1张欲赋予的卡牌」，没人选牌，handle_select 在 0/1 时点了「选择」没反应，
-    之后卡了 14 分钟。和手牌选择页同一个标题，区别是没有底部手牌数。优先攻击牌，点了计数没变就换下一张。"""
+    之后卡了 14 分钟。和手牌选择页同一个标题，区别是没有底部手牌数。优先攻击牌，点了计数没变就换下一张。
+    「请选择最多3张想要移动至抽牌堆上方的卡牌」（左上「抽牌堆或坟墓」）同一个版式：「最多」可以一张不选，
+    handle_select 看到「选择」亮着就点了，一张没选（用户 10/09 17:03 手动标记，现场包 20261009-170307，一局点了三次）。
+    所以「最多」页也选，直到选满或所有牌都点过（牌堆里不足 N 张）才交给 handle_select。"""
     prompt = find_box_at_point(task, 0.5, 0.111)
     m = re.search(r'请选择(?=.*卡牌).*?(\d+)张', prompt.name) if prompt else None
     counter = find_box_at_point(task, 0.5, 0.168)
     c = re.search(r'(\d+)\s*/\s*(\d+)', counter.name) if counter else None
-    if not (m and c and any("所有牌堆" in b.name for b in task.all_texts)):
+    if not (m and c and has_pile_title(task)):
         task._pile_select_tried, task._pile_select_pending = set(), None
         return False
     picked, need = int(c.group(1)), int(c.group(2))
@@ -893,6 +896,8 @@ def handle_battle_pile_select(task: TriggerTask):
     candidates.sort()
     fresh = [c for c in candidates if c[3] not in tried]
     if not fresh and candidates:
+        if "最多" in prompt.name and picked > 0:
+            return False  # 牌堆里的牌都点过了、还是没满（牌不足 N 张）：已选的这些就够了，交给 handle_select
         tried.clear()
         fresh = candidates
     task.log_info(f"检测到战斗中所有牌堆选牌页面（{picked}/{need}）: {prompt.name}")

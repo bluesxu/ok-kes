@@ -2198,12 +2198,21 @@ def log_credit(task: TriggerTask):
 #     return False
 
 
+_PILE_TITLE = re.compile(r"所有牌堆|抽牌堆|坟墓")
+
+
+def has_pile_title(task: TriggerTask):
+    """战斗中从牌堆选牌的页面，左上角是牌堆名（「所有牌堆」「抽牌堆或坟墓」）；这类页面没有手牌栏。"""
+    return any(_PILE_TITLE.search(b.name) and b.x < 0.3 * task.width and b.y < 0.2 * task.height
+               for b in task.all_texts)
+
+
 def log_node_status(task: TriggerTask):
     """记录当前胜率（仅记录, 不拦截后续处理）；顺带告诉详细日志这一帧是不是战斗画面（记战斗开始/结束）。"""
     hand = find_box_at_point(task, 0.512, 0.969)
     in_battle = bool(hand and re.search(r'\d+/10', hand.name))
-    if not in_battle and any("所有牌堆" in b.name for b in task.all_texts):
-        # 战斗中从所有牌堆选牌的页面没有手牌栏，卡久了会误记「战斗结束」（10/08 15:42 实况）
+    if not in_battle and has_pile_title(task):
+        # 战斗中从牌堆选牌的页面没有手牌栏，卡久了会误记「战斗结束」（10/08 15:42 实况）
         counter = find_box_at_point(task, 0.5, 0.168)
         in_battle = bool(counter and re.search(r'\d+\s*/\s*\d+', counter.name))
     battle_log.battle_frame(task, in_battle)
@@ -4948,6 +4957,27 @@ def handle_view_original(task: TriggerTask):
         return False
     task._flash_choice_empty_since = None
 
+    # 拉黑的版本不参与挑选；三个版本都被拉黑时点「跳过」（之后的确认框由 handle_center_confirm 点，
+    # 游戏会保留先前的闪光效果），找不到「跳过」才照常选，免得卡在这一页
+    blacklist = _flash_blacklist_rules(task)
+    candidates = [card for card in cards if not any(_flash_rule_matches(rule, card) for rule in blacklist)]
+    if len(candidates) < len(cards):
+        names = "、".join(f"第{i + 1}个" for i, card in enumerate(cards) if card not in candidates)
+        if candidates:
+            task.log_info(f"卡牌闪光页面: 拉黑卡牌，排除{names}版本")
+        else:
+            skip = find_box_at_point(task, 0.941, 0.917)
+            if skip and _clean_match(skip.name, "跳过"):
+                task.log_info("卡牌闪光页面: 三个版本都被拉黑了，点「跳过」")
+                battle_log.record(task, "闪光选择", card=cards[0]["name"], reason="三个版本都被拉黑，跳过",
+                                  chosen=None, options=[{"type": c.get("type"), "description": c.get("description")}
+                                                        for c in cards])
+                _remember_flash_click(task)
+                task.click_box(skip)
+                return True
+            task.log_info("卡牌闪光页面: 三个版本都被拉黑了，没找到「跳过」，照常选")
+            candidates = cards
+
     flash_rules = _flash_rules(task)
     first_rule = next((re.sub(r"\s+", "", k) for k in _get_card_list(task, '闪光优先级')
                        if isinstance(k, str) and re.sub(r"\s+", "", k)), None)
@@ -4957,17 +4987,6 @@ def handle_view_original(task: TriggerTask):
         if chosen_card:
             choose_reason = f"闪光优先级「{rule[0]}」"
             task.log_info(f"优先选择「{chosen_card['name']}」({rule[0]})")
-    # 拉黑的版本不参与挑选；三个版本都被拉黑时照常选，免得卡在这一页
-    blacklist = _flash_blacklist_rules(task)
-    candidates = [card for card in cards if not any(_flash_rule_matches(rule, card) for rule in blacklist)]
-    if len(candidates) < len(cards):
-        names = "、".join(f"第{i + 1}个" for i, card in enumerate(cards) if card not in candidates)
-        if candidates:
-            task.log_info(f"卡牌闪光页面: 拉黑卡牌，排除{names}版本")
-        else:
-            task.log_info("卡牌闪光页面: 三个版本都被拉黑了，照常选")
-            candidates = cards
-
             if (
                 _get_config_value(task, "首层刷特定闪光", False) is True
                 and rule[0] == first_rule

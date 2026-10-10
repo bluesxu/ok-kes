@@ -211,6 +211,14 @@ def card(name, cost, card_type="技能", key="1"):
 
 class TestChoosePlay(unittest.TestCase):
 
+    def test_half_read_name_shares_priority_of_same_card(self):
+        """实跑 10/10 11:26：0 费琶音只读出「琶音」，对不上出牌优先级的「节奏」，先出了 3 费的「节奏：琶音」。"""
+        cards = [card("安可", 3, "攻击", key="3"), card("节奏：琶音", 3, "攻击", key="4"),
+                 card("节奏：", None, "攻击", key="5"), card("琶音", 0, "攻击", key="6")]
+        chosen, reason = battle.choose_play(cards, 5, ["黑暗斩击", "节奏", "安可"], [], False, set())
+        self.assertEqual("6", chosen["key"])
+        self.assertIn("出牌优先级「节奏」", reason)
+
     def test_priority_first_among_affordable(self):
         cards = [card("破碎", 3, "攻击"), card("斗志", 1), card("水之根源", 1)]
         chosen, reason = battle.choose_play(cards, 2, ["破碎", "斗志"], [], False, set())
@@ -543,6 +551,18 @@ class TestReadCosts(unittest.TestCase):
             battle._read_costs(task, state, None, cards, {})
         self.assertEqual([3, 1, 1], [c["cost"] for c in cards])
         self.assertEqual({"暗黑之刃": 1, "磁场": 1}, state["costs"])  # 同名牌不写缓存
+
+    def test_partial_names_of_same_card_read_each_cost(self):
+        """实跑 10/10 11:26（用户标记：有零费节奏不用）：读成「节奏」的 0 费琶音出掉后，下一张 2 费琶音也读成「节奏」，
+        手里没有完全同名的牌，就套了缓存里的 0 费，0 费那张（读成「节奏：」）反而排在后面。"""
+        state = {"costs": {"节奏": 0, "安可": 3}}
+        cards = [{"name": "安可", "slot": "3/7"}, {"name": "节奏", "slot": "4/7"}, {"name": "节奏：琶音", "slot": "5/7"},
+                 {"name": "节奏：", "slot": "6/7"}, {"name": "节奏：", "slot": "7/7"}]
+        read = {"3/7": 3, "4/7": 2, "5/7": 2, "6/7": 1, "7/7": 0}
+        task = SimpleNamespace(_battle_session={"zero_cost": set()})
+        with mock.patch.object(battle, "_card_cost", lambda task, frame, card: read[card["slot"]]):
+            battle._read_costs(task, state, None, cards, {})
+        self.assertEqual([3, 2, 2, 1, 0], [c["cost"] for c in cards])
 
     def test_zero_cost_twin_survives_positive_sibling(self):
         # 实跑：泰尼同名牌一张 0 费（空心方框，经常读不到）、一张正费用。
@@ -1820,13 +1840,16 @@ class TestFlash(unittest.TestCase):
             self.assertTrue(utils.handle_view_original(task))
             self.assertEqual(2, len(clicks))       # 超过重试间隔才允许再点
 
-    def pick_version(self, cards, **config):
-        """在三选一页上跑一遍 handle_view_original，返回点击位置。"""
+    def pick_version(self, cards, skip_button=False, **config):
+        """在三选一页上跑一遍 handle_view_original，返回点击位置（点「跳过」记为 "跳过"）。"""
         clicks = []
         task = flash_task(**config)
+        task.click_box = lambda box: clicks.append(box.name)
         prompt = SimpleNamespace(name="查看之前的闪光")
+        skip = SimpleNamespace(name="跳过")
         cards = [dict(c, x=(0.2, 0.4, 0.6)[i], y=0.3) for i, c in enumerate(cards)]
-        with mock.patch.object(utils, "find_box_at_point", lambda task, x, y: prompt),                 mock.patch.object(utils, "_get_game_text", lambda task, text: text),                 mock.patch.object(utils, "recognize_cards", lambda task, page="": cards),                 mock.patch.object(utils, "find_target_card", lambda task: ([], [])),                 mock.patch.object(utils, "_matching_meditation_card_names", lambda task, cards: []),                 mock.patch.object(utils, "_move_and_click", lambda task, x, y: clicks.append((x, y))),                 mock.patch.object(battle_log, "record", lambda *a, **k: None),                 mock.patch.object(battle_log, "process_shot", lambda *a, **k: None):
+        with mock.patch.object(utils, "find_box_at_point",
+                               lambda task, x, y: skip if skip_button and y > 0.9 else prompt),                 mock.patch.object(utils, "_get_game_text", lambda task, text: text),                 mock.patch.object(utils, "recognize_cards", lambda task, page="": cards),                 mock.patch.object(utils, "find_target_card", lambda task: ([], [])),                 mock.patch.object(utils, "_matching_meditation_card_names", lambda task, cards: []),                 mock.patch.object(utils, "_move_and_click", lambda task, x, y: clicks.append((x, y))),                 mock.patch.object(battle_log, "record", lambda *a, **k: None),                 mock.patch.object(battle_log, "process_shot", lambda *a, **k: None):
             self.assertTrue(utils.handle_view_original(task))
         return clicks
 
@@ -1842,7 +1865,12 @@ class TestFlash(unittest.TestCase):
         config = dict(闪光优先级=[], 拉黑卡牌=["极强", "断奏"])
         self.assertEqual([(0.6, 0.3)], self.pick_version(self.THREE, **config))
 
-    def test_all_versions_blacklisted_picks_normally(self):
+    def test_all_versions_blacklisted_skips(self):
+        """三个版本都被拉黑：点「跳过」（用户 10/10 要求），确认框交给 handle_center_confirm。"""
+        config = dict(闪光优先级=["极强"], 拉黑卡牌=["极强", "断奏", "AP3"])
+        self.assertEqual(["跳过"], self.pick_version(self.THREE, skip_button=True, **config))
+
+    def test_all_versions_blacklisted_without_skip_button_picks_normally(self):
         config = dict(闪光优先级=["极强"], 拉黑卡牌=["极强", "断奏", "AP3"])
         self.assertEqual([(0.2, 0.3)], self.pick_version(self.THREE, **config))
 
@@ -2018,6 +2046,25 @@ class TestPileSelect(unittest.TestCase):
     def test_hand_select_page_not_claimed(self):
         page = [p for p in self.PAGE if p[0] != "所有牌堆"]
         self.assertFalse(utils_sortie.handle_battle_pile_select(self.make_task(page)))
+
+    # 现场包 20261009-170307 第 180 帧的实际 OCR（2538x1428，已转简体）：最多选 3 张，一张没选就点「选择」不算
+    UP_TO_PAGE = [("抽牌堆或坟墓", 42, 163, 352, 63), ("请选择最多3张想要移动至抽牌堆上方的卡牌。", 785, 134, 1037, 44),
+                  ("0/3", 1208, 207, 124, 66), ("基本攻击", 209, 407, 177, 37), ("基本攻击", 656, 407, 177, 37),
+                  ("基本攻击", 1102, 404, 178, 37), ("基本攻击", 1546, 402, 186, 39), ("选择", 2350, 1297, 109, 60)]
+
+    def test_up_to_page_picks_cards_before_select(self):
+        task = self.make_task(self.UP_TO_PAGE)
+        for _ in range(3):
+            self.assertTrue(utils_sortie.handle_battle_pile_select(task))
+        self.assertEqual([(0.12, 0.36), (0.29, 0.36), (0.47, 0.36)], self.clicks)  # 每张点的位置不同
+
+    def test_up_to_page_hands_over_when_cards_run_out(self):
+        page = [p for p in self.UP_TO_PAGE if p[1] not in (1102, 1546)]  # 牌堆里只有 2 张牌，永远选不到 3/3
+        task = self.make_task(page)
+        self.assertTrue(utils_sortie.handle_battle_pile_select(task))
+        self.assertTrue(utils_sortie.handle_battle_pile_select(task))
+        task.all_texts = [Box(x, y, w, h, name=("2/3" if name == "0/3" else name)) for name, x, y, w, h in page]
+        self.assertFalse(utils_sortie.handle_battle_pile_select(task))  # 牌都点过、已选 2 张：交给「选择」
 
     def test_counts_as_battle_screen(self):
         """这个页面没有手牌栏，也要算战斗画面，不然卡 8 秒就误记「战斗结束」。"""
