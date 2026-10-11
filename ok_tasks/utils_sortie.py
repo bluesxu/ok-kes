@@ -597,27 +597,55 @@ def _mark_sortie_boss_cleared(task: TriggerTask):
     task.log_info("只打第一层：已到本轮奖励结算页，补记通关层数 1")
 
 
+_FIRST_BOSS_RETREAT_TRIES = 4  # 第一层首领打完后最多开几次撤退菜单，都没出来就照旧领战利品
+
+
 def handle_first_boss_retreat(task: TriggerTask):
     """第一层首领打完后的战利品页（获得卡牌、信用点、装备…）: 开了「只打第一层」且没开「领取奖励」时，
     不再一样样领，直接从右上角菜单撤退，本轮记成功（用户 10/11 要求）。领了也带不走，白花时间。
-    开了「领取奖励」时照旧领完、走结算页领卡厄思战利品再撤退。"""
+    开了「领取奖励」时照旧领完、走结算页领卡厄思战利品再撤退。
+    实跑 10/11 20:12：战利品页刚出来那一帧点了菜单，1.2 秒后右下角还是「获得」，菜单没打开；而第一次就把
+    通关层数记成了 1，下一帧不再认这一页，「获得」被 handle_obtain_reward 点了，照旧领完才撤退。
+    所以决定撤退后用 first_boss_retreat_tries 记着：菜单没出来就每 2 秒再开一次（第一次点图标，之后轮流按 Q
+    和点图标，图标下标着 Q），开 _FIRST_BOSS_RETREAT_TRIES 次都不行才记异常、照旧领完再撤退。"""
     ns = getattr(task, 'node_status', None)
-    if not isinstance(ns, dict) or not (ns.get('reach_final_boss') and ns.get('final_boss_battle')):
+    if not isinstance(ns, dict) or ns.get('is_escaped', False):
         return False
-    if ns.get('pass_final_boss_count', 0) > 0 or ns.get('is_escaped', False):
+    tries = ns.get('first_boss_retreat_tries', 0)
+    if tries >= _FIRST_BOSS_RETREAT_TRIES:
         return False
-    if not _get_config_value(task, '只打第一层', False) or _get_config_value(task, "领取奖励", False):
-        return False
+    if not tries:
+        if not (ns.get('reach_final_boss') and ns.get('final_boss_battle')) or ns.get('pass_final_boss_count', 0) > 0:
+            return False
+        if not _get_config_value(task, '只打第一层', False) or _get_config_value(task, "领取奖励", False):
+            return False
     box = find_box_at_point(task, 0.924, 0.922)
     if not (box and _clean_match(box.name, "获得")):
         box = utils.find_button_by_text(task, ("获得",))
     if not (box and _clean_match(box.name, "获得")):
         return False
-    if time.time() - getattr(task, '_escape_requested_at', 0) < 3:
-        return True  # 刚点过菜单，等它出来，别让 handle_obtain_reward 点了「获得」
-    task.log_info("第一层首领已击败，只打第一层且没开领取奖励：不领战利品，直接撤退")
-    ns['pass_final_boss_count'] = 1
-    return _finish_only_first_layer(task)
+    if not tries:
+        task.log_info("第一层首领已击败，只打第一层且没开领取奖励：不领战利品，直接撤退")
+        ns['pass_final_boss_count'] = 1
+        ns['first_boss_retreat_tries'] = 1
+        return _finish_only_first_layer(task)
+    if time.time() - getattr(task, '_escape_requested_at', 0) < 2:
+        return True  # 刚开过菜单，等它出来，别让 handle_obtain_reward 点了「获得」
+    if tries + 1 >= _FIRST_BOSS_RETREAT_TRIES:
+        ns['first_boss_retreat_tries'] = _FIRST_BOSS_RETREAT_TRIES
+        battle_log.anomaly(task, "首领后撤退菜单打不开",
+                           f"开了 {tries} 次菜单，战利品页还在，照旧领完战利品、到结算页再撤退")
+        return False
+    ns['first_boss_retreat_tries'] = tries + 1
+    if tries % 2:
+        task.log_info(f"撤退菜单没打开（第 {tries} 次），按 Q 再开")
+        task._escape_requested_at = time.time()
+        task.send_key("q")
+    else:
+        task.log_info(f"撤退菜单没打开（第 {tries} 次），再点右上角菜单")
+        utils._open_escape_menu(task, 0.051)
+    task.sleep(1)
+    return True
 
 
 def handle_sortie_reward_claim(task: TriggerTask):

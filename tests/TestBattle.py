@@ -1860,6 +1860,35 @@ class TestRoundSuccessCount(unittest.TestCase):
         self.assertEqual(1, task.node_status["success_rounds"])
         task.click_box.assert_not_called()
 
+    def test_first_boss_retreat_retries_when_menu_not_open(self):
+        # 实跑 10/11 20:12：点了菜单 1.2 秒后战利品页还在，下一帧不再认这一页，「获得」被点了、照旧领完。
+        # 现在继续占着这一页：2 秒内等，之后轮流按 Q / 点图标再开，开满 4 次才放手并记异常
+        button = Box(2900, 1640, 100, 40, name="获得")
+        task = mock.MagicMock()
+        task.node_status = utils._initial_node_status()
+        task.node_status.update({"reach_final_boss": True, "final_boss_battle": True})
+        task.default_config = {"只打第一层": True, "领取奖励": False}
+        task.config = {}
+        task._escape_requested_at = 0
+        now = [1000.0]
+        opened, anomalies = [], []
+
+        def open_menu(t, y):
+            t._escape_requested_at = now[0]
+            opened.append("click")
+
+        task.send_key.side_effect = lambda key: opened.append(key)
+        results = []
+        with mock.patch.object(utils_sortie, "find_box_at_point", lambda t, x, y: button),                 mock.patch.object(utils, "_open_escape_menu", open_menu),                 mock.patch.object(utils_sortie.time, "time", lambda: now[0]),                 mock.patch.object(utils_sortie.battle_log, "anomaly", lambda t, kind, detail: anomalies.append(kind)):
+            for step in (0, 1, 1.5, 1.5, 1, 2, 2):  # 每帧之间过去的秒数
+                now[0] += step
+                results.append(utils_sortie.handle_first_boss_retreat(task))
+        # 0 秒点图标；1 秒等；2.5 秒按 Q；4 秒等；5 秒点图标；7 秒开满 4 次放手；之后都交给 handle_obtain_reward
+        self.assertEqual(["click", "q", "click"], opened)
+        self.assertEqual([True, True, True, True, True, False, False], results)
+        self.assertEqual(["首领后撤退菜单打不开"], anomalies)
+        self.assertEqual(1, task.node_status["success_rounds"])
+
     def test_first_boss_keeps_rewards_when_claiming(self):
         # 开了领取奖励：照旧领完战利品、走结算页
         handled, task, escaped = self.first_boss_reward_page({"领取奖励": True})
