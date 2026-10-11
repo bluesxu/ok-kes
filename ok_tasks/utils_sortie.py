@@ -651,9 +651,9 @@ def _survival_counts(task: TriggerTask):
 
 
 def _survival_order(task: TriggerTask):
-    """这一轮保护/治疗的选择顺序：本局已选的职能里少的优先，一样多优先保护。"""
+    """这一轮保护/治疗的选择顺序：本局已选的职能里少的优先，一样多优先治疗。"""
     protect, heal = _survival_counts(task)
-    return SURVIVAL_ROLES if protect <= heal else tuple(reversed(SURVIVAL_ROLES))
+    return ("保护", "治疗") if protect < heal else ("治疗", "保护")
 
 
 def _record_recruit_role(task: TriggerTask, slot):
@@ -675,8 +675,8 @@ def _record_recruit_role(task: TriggerTask, slot):
 
 def handle_member_selection(task: TriggerTask):
     """主战员选择页面: 优先选配置角色（跳过拉黑角色）；没有则点击名字下方按钮刷新一次，
-    刷新时保留本轮优先的职能（本局已选队友里保护少就留保护、治疗少就留治疗，一样多留保护），
-    刷新后仍没有配置角色就按同一顺序选保护/治疗，都没有才随机选（跳过拉黑角色）。"""
+    刷新时保留本轮优先的职能（本局已选队友里保护少就留保护、治疗少就留治疗，一样多留治疗），
+    刷新后仍没有配置角色就按同一顺序选治疗/保护，都没有才随机选（跳过拉黑角色）。"""
     prompt = find_box_at_point(task, 0.500, 0.931)
     if not (prompt and _get_game_text(task, '主战员') in prompt.name):
         return False

@@ -450,7 +450,7 @@ def member_page(*members):
 
 class TestMemberSelection(unittest.TestCase):
     """会合选主战员：优先级里的角色没有时，按本局已选队友的职能保持盾奶平衡
-    （保护少优先保护、治疗少优先治疗，一样多优先保护），刷新时保留本轮优先的职能。"""
+    （保护少优先保护、治疗少优先治疗，一样多优先治疗），刷新时保留本轮优先的职能。"""
 
     def run_page(self, before, after=None, config=None, recruited=None):
         task = PageTask(member_page(*before))
@@ -472,16 +472,16 @@ class TestMemberSelection(unittest.TestCase):
         self.assertEqual(3, len(clicks))  # 刷新 2 次 + 选人
         self.assertEqual(self.pick(2), clicks[-1])
 
-    def test_protector_before_healer(self):
+    def test_healer_before_protector(self):
         clicks = self.run_page([("菲", "核心"), ("凛", "核心"), ("九", "核心")],
                                [("米卡", "治療"), ("凛", "核心"), ("麥格納", "保護")])
         self.assertEqual(4, len(clicks))  # 没有治疗/保护：三个都刷新
-        self.assertEqual(self.pick(2), clicks[-1])
+        self.assertEqual(self.pick(0), clicks[-1])
 
     def test_blacklisted_survival_member_skipped(self):
         clicks = self.run_page([("菲", "核心"), ("凛", "核心"), ("麥格納", "保護")],
-                               [("米卡", "治療"), ("凛", "核心"), ("麥格納", "保護")], {"拉黑主战员": ["麦格纳"]})
-        self.assertEqual(self.pick(0), clicks[-1])  # 保护角色被拉黑：选治疗
+                               [("米卡", "治療"), ("凛", "核心"), ("麥格納", "保護")], {"拉黑主战员": ["米卡"]})
+        self.assertEqual(self.pick(2), clicks[-1])  # 治疗角色被拉黑：选保护
 
     def test_priority_still_first(self):
         clicks = self.run_page([("米卡", "治療"), ("蕾伊", "支援"), ("凛", "核心")])
@@ -495,13 +495,21 @@ class TestMemberSelection(unittest.TestCase):
         self.assertEqual(3, len(clicks))  # 刷新 2 次 + 选人
         self.assertEqual(self.pick(1), clicks[-1])
 
-    def test_third_pick_back_to_shield_when_even(self):
-        # 保护和治疗各一个：一样多优先保护，保留保护（玛莉贝尔）、刷掉治疗和核心
+    def test_second_pick_prefers_shield_after_healer(self):
+        # 本局已选到治疗（米卡）：这一轮保护优先，保留保护（玛莉贝尔）、刷掉治疗和核心
         clicks = self.run_page([("米卡", "治療"), ("凛", "核心"), ("瑪莉貝爾", "保護")],
                                [("凛", "核心"), ("海德瑪麗", "核心"), ("瑪莉貝爾", "保護")],
-                               recruited={"玛莉贝尔": "保护", "米卡": "治疗"})
+                               recruited={"米卡": "治疗"})
         self.assertEqual(3, len(clicks))  # 刷新 2 次 + 选人
         self.assertEqual(self.pick(2), clicks[-1])
+
+    def test_third_pick_back_to_healer_when_even(self):
+        # 保护和治疗各一个：一样多优先治疗，保留治疗（米卡）、刷掉核心和保护
+        clicks = self.run_page([("米卡", "治療"), ("凛", "核心"), ("瑪莉貝爾", "保護")],
+                               [("米卡", "治療"), ("凛", "核心"), ("海德瑪麗", "核心")],
+                               recruited={"玛莉贝尔": "保护", "米卡": "治疗"})
+        self.assertEqual(3, len(clicks))  # 刷新 2 次 + 选人
+        self.assertEqual(self.pick(0), clicks[-1])
 
     def test_blacklisted_preferred_role_falls_back(self):
         # 本轮偏好治疗但治疗（米卡）被拉黑：退回保留保护（玛莉贝尔）
