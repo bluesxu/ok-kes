@@ -730,16 +730,33 @@ class TestPlayTurn(unittest.TestCase):
             battle.play_turn(self.task, 2, True)
         self.assertEqual(["1", "enter"], self.keys)
 
-    def test_all_sunk_hand_ends_turn_with_sure(self):
-        # 手牌全沉下去 = 一张都出不了（游戏自己画的信号，不是 OCR 猜的）：直接结束回合，走确定通道
-        # （加速模式不必再等两轮确认）
+    def sunk_end_turn(self, ap, outline=False, costs=(2, 3)):
+        """整手牌都沉下去时结束回合；返回有没有走确定通道（加速模式 1 秒就按 E、不再确认第二轮）。"""
         self.task._speedup = {}
-        hand = [dict(card("斗志", 2, "技能", key="1"), x=0.4, y=None, lowered=True),
-                dict(card("破碎", 3, "攻击", key="2"), x=0.5, y=None, lowered=True)]
-        with mock.patch.object(battle, "read_hand", lambda task, count: [dict(c) for c in hand]):
+        self.task._battle = {}  # 每种情况都当新的一场，按 E 的次数不累计
+        self.keys.clear()
+        hand = [dict(card("斗志", costs[0], "技能", key="1"), x=0.4, y=None, lowered=True),
+                dict(card("破碎", costs[1], "攻击", key="2"), x=0.5, y=None, lowered=True)]
+        with mock.patch.object(battle, "read_hand", lambda task, count: [dict(c) for c in hand]), \
+                mock.patch.object(battle, "read_remaining_cost", lambda task, frame: ap), \
+                mock.patch.object(battle, "ap_zero_outline", lambda frame: outline), \
+                mock.patch.object(battle, "hand_lowered", lambda task: True):
             battle.play_turn(self.task, 2, True)
-        self.assertEqual(["e"], self.keys)
-        self.assertTrue(self.task._speedup["end_turn_sure"])
+        self.assertEqual(["e"], self.keys)  # 都要结束回合，区别只在确不确定
+        return self.task._speedup["end_turn_sure"]
+
+    def test_all_sunk_hand_ends_turn_with_sure(self):
+        # 手牌全沉下去、AP 亲眼看到是 0：一张都出不了，走确定通道
+        self.assertTrue(self.sunk_end_turn(ap=0))
+        self.assertTrue(self.sunk_end_turn(ap=None, outline=True))  # 灰色空心的「0」
+        self.assertTrue(self.sunk_end_turn(ap=0, costs=(0, 3)))     # 沉下去的牌读成 0 费：现场 13 次全是读错
+        self.assertTrue(self.sunk_end_turn(ap=2, costs=(3, 4)))     # 10/08 21:16：AP 2，手里都比它贵
+
+    def test_all_sunk_but_ap_not_confirmed_is_not_sure(self):
+        # 全沉了但 AP 印证不了：按 E 前按普通规则再看一轮（用户 10/11：可能有别的原因让手牌全沉）
+        self.assertFalse(self.sunk_end_turn(ap=3))                   # AP 3，手里有 2、3 费的牌
+        self.assertFalse(self.sunk_end_turn(ap=None))                # 只靠手牌沉下去推出 AP 是 0
+        self.assertFalse(self.sunk_end_turn(ap=2, costs=(None, None)))  # AP 2，费用一张都没读到
 
     def test_sunk_card_skipped_raised_card_played(self):
         # 混排：只出立着的牌，沉下去的（就算在出牌优先级里）连试都不试
@@ -968,6 +985,71 @@ class TestPlayTurn(unittest.TestCase):
             battle.play_turn(self.task, 2, True)
         self.assertEqual([267], [t["hp"] for t in targets])        # 回来了：还是打它
         self.assertEqual(0, self.task._battle["lost_waits"])
+
+    def watch(self, bar_seq, panel_closed_ago=None):
+        """有截图方法时：目标不见了就盯着它的血条连续截图。bar_seq 依次是每张截图里血条在不在（用完后保持最后一个）。
+        返回（这一帧拖到了谁、在截图上查了几次血条、记了哪些事件、用了多久）。"""
+        self._remembered_state()
+        others = [dict(enemy(300, 1, "攻击", x=0.3), drop=(0.3, 0.5))]
+        targets, records, checks = [], [], []
+        seq = list(bar_seq)
+        if panel_closed_ago is not None:
+            self.task._monster_panel_closed_at = time.time() - panel_closed_ago
+        self.task.next_frame = lambda: np.zeros((4, 4, 3), np.uint8)
+
+        def bar(frame, x, y):
+            if frame is self.task.frame:  # 出牌那一帧本身：血条不在
+                return False
+            checks.append(1)
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+
+        with mock.patch.object(battle, "read_enemies", lambda task, frame: others), \
+                mock.patch.object(battle, "_bar_still_there", bar), \
+                mock.patch.object(battle, "_LOST_WATCH", 0.1), mock.patch.object(battle, "_LOST_WATCH_AFTER_PANEL", 0.3), \
+                mock.patch.object(battle, "_LOST_WATCH_POLL", 0.005), \
+                mock.patch.object(battle, "_drag_card", lambda task, c, t: targets.append(t)), \
+                mock.patch.object(battle.battle_log, "record", lambda task, event, **f: records.append((event, f))):
+            start = time.time()
+            battle.play_turn(self.task, 2, True)
+            elapsed = time.time() - start
+        return [t["hp"] for t in targets], len(checks), [e for e, _ in records], elapsed
+
+    def test_dead_target_switched_in_same_frame(self):
+        # 实跑 10/11 11:20：血条 7.87 秒消失再没回来，以前要等到 11.48 秒（两次 0.6 秒 + 两轮整套识别）
+        targets, checks, events, _ = self.watch([False])
+        self.assertEqual([300], targets)  # 同一帧里就换到了新目标
+        self.assertIn("目标确认死亡", events)
+        self.assertGreaterEqual(checks, battle._LOST_WATCH_MIN_CHECKS)
+        self.assertEqual((0.7, 0.3), self.task._battle["lost_dead"])
+        self.assertEqual((0.3, 0.3), self.task._battle["sticky"])
+
+    def test_bar_back_keeps_target(self):
+        # 出牌特效遮一帧（同一场 6.12 秒）：血条一回来就继续打它，这一帧不出牌
+        targets, checks, events, _ = self.watch([False, False, True])
+        self.assertEqual([], targets)
+        self.assertEqual(3, checks)  # 第三张截图看到血条就停
+        self.assertNotIn("目标确认死亡", events)
+        self.assertEqual((0.7, 0.3), self.task._battle["sticky"])
+
+    def test_watch_longer_right_after_monster_panel(self):
+        # 10/09 15:55：意图采集刚开关过怪物面板，收起动画把血条遮得久，多看一会儿
+        _, _, _, normal = self.watch([False])
+        _, _, _, after_panel = self.watch([False], panel_closed_ago=0.5)
+        self.assertGreater(after_panel, normal + 0.1)
+        _, _, _, long_ago = self.watch([False], panel_closed_ago=5)
+        self.assertLess(long_ago, after_panel - 0.1)
+
+    def test_confirmed_dead_target_not_watched_again(self):
+        self.watch([False])
+        watched = []
+        self.task._battle["sticky"] = (0.7, 0.3)  # 新目标还没打出去，记忆里仍是死掉那只
+        others = [dict(enemy(300, 1, "攻击", x=0.3), drop=(0.3, 0.5))]
+        with mock.patch.object(battle, "read_enemies", lambda task, frame: others), \
+                mock.patch.object(battle, "_bar_still_there", lambda frame, x, y: False), \
+                mock.patch.object(battle, "_watch_lost_target", lambda *args: watched.append(1) or False), \
+                mock.patch.object(battle, "_drag_card", lambda task, c, t: None):
+            battle.play_turn(self.task, 2, True)
+        self.assertEqual([], watched)
 
     def test_boss_hidden_for_a_frame_is_not_abandoned(self):
         battle.start_battle(self.task)
@@ -1221,6 +1303,117 @@ class TestPlayTurnRecovery(TestPlayTurn):
         lines = [("光秃铁壳虫1", 0.06), ("弱点", 0.1), ("翻滚", 0.17), ("回合结束时触发", 0.21),
                  ("获得50%(35)护盾、士气2", 0.25)]
         self.assertEqual((battle.INTENT_DEFENSE, "翻滚", None, None), battle.classify_intent_panel(lines))
+
+
+class TestEgoWait(unittest.TestCase):
+    """放 Ego 后等动画：先看到结束回合按钮消失、再连续两次看到它回来才继续（预览卡期间按钮一直在）。"""
+
+    def run_wait(self, visible_seq):
+        seq = list(visible_seq)
+        task = SimpleNamespace(next_frame=lambda: np.zeros((4, 4, 3), np.uint8), log_info=lambda m: None,
+                               box_of_screen=lambda *a: None, _speedup={"owed_until": 9.0, "pay_hook": "x"})
+        task.find_feature = lambda **kw: [1] if (seq.pop(0) if len(seq) > 1 else seq[0]) else []
+        with mock.patch.object(battle, "_EGO_MIN", 0.05), mock.patch.object(battle, "_EGO_MAX", 0.5), \
+                mock.patch.object(battle, "_EGO_POLL", 0.01):
+            start = time.time()
+            battle._wait_ego_done(task, start)
+            elapsed = time.time() - start
+        self.assertEqual({"owed_until": 0.0, "pay_hook": None}, task._speedup)
+        return elapsed, len(visible_seq) - len(seq)
+
+    def test_continues_when_button_back_after_animation(self):
+        # 现场包 20261010-112644：按键后 1.2 秒按钮消失，2.6~3.0 秒回来（原来固定等到约 5 秒）
+        elapsed, _ = self.run_wait([True] * 5 + [False] * 10 + [True] * 10)
+        self.assertLess(elapsed, 0.4)
+
+    def test_preview_with_button_visible_does_not_count(self):
+        # 预览卡期间按钮一直在、画面不动：没看到按钮消失过就不算播完，等满原时长
+        elapsed, _ = self.run_wait([True])
+        self.assertGreaterEqual(elapsed, 0.5)
+
+    def test_needs_two_sightings_after_gone(self):
+        _, polls = self.run_wait([True, False, True, False, True, True, False])
+        self.assertEqual(6, polls)  # 第一次回来又闪没了，连续两次才算
+
+
+class TestBattleBoundary(unittest.TestCase):
+
+    def test_new_battle_by_log_resets_state_within_20s(self):
+        # 实跑 10/10 11:26：两场隔 11.6 秒，上一场的目标记忆带进了 Boss 战
+        task = SimpleNamespace()
+        state = battle._ensure_battle(task)
+        state.update(sticky=(0.643, 0.173), unplayable={"节奏"})
+        self.assertEqual((0.643, 0.173), battle._ensure_battle(task)["sticky"])  # 同一场：保留
+        battle_log.new_battle(task)  # 详细日志看到战斗画面重新出现，记了「战斗开始」
+        state = battle._ensure_battle(task)
+        self.assertIsNone(state["sticky"])
+        self.assertNotIn("节奏", state.get("unplayable", set()))
+        self.assertEqual(battle_log.battle_id(task), state["battle_id"])
+
+
+class TestBattleOcrLibs(unittest.TestCase):
+    """出牌识别的小块 OCR：专用引擎建好后并行用，没建好时排队用默认引擎。"""
+
+    def setUp(self):
+        self._saved = battle._ocr_libs, battle._ocr_libs_started
+        battle._ocr_libs, battle._ocr_libs_started = battle.queue.Queue(), battle.threading.Event()
+
+    def tearDown(self):
+        battle._ocr_libs, battle._ocr_libs_started = self._saved
+
+    def make_task(self, with_config=True):
+        import threading
+        task = SimpleNamespace(calls=[], created=[], logs=[], busy=set(), overlap=[])
+        lock = threading.Lock()
+
+        def ocr(frame=None, lib="default"):
+            with lock:
+                if lib in task.busy:
+                    task.overlap.append(lib)  # 同一个引擎被两个线程同时用
+                task.busy.add(lib)
+                task.calls.append(lib)
+            time.sleep(0.05)
+            with lock:
+                task.busy.discard(lib)
+            return [Box(0, 0, 10, 10, name=" 3 ")]
+
+        task.ocr = ocr
+        task.log_info = task.logs.append
+        if with_config:
+            config = {"ocr": {"lib": "onnxocr"}}
+            config["ocr"]["default"] = config["ocr"]
+            task.executor = SimpleNamespace(config=config, ocr_lib=task.created.append)
+        return task
+
+    def test_parallel_on_dedicated_libs(self):
+        task = self.make_task()
+        battle._ocr_texts(task, np.zeros((10, 10, 3), np.uint8))  # 第一次：后台开始建引擎
+        for _ in range(100):
+            if battle._ocr_libs.qsize() == len(battle._OCR_LIB_NAMES):
+                break
+            time.sleep(0.01)
+        self.assertEqual(list(battle._OCR_LIB_NAMES), task.created)
+        for name in battle._OCR_LIB_NAMES:  # 配置照抄默认引擎
+            self.assertIs(task.executor.config["ocr"]["default"], task.executor.config["ocr"][name])
+        start = time.time()
+        results = list(battle._POOL.map(lambda _: battle._ocr_texts(task, None), range(4)))
+        self.assertEqual([["3"]] * 4, results)
+        self.assertLess(time.time() - start, 0.15)  # 4 块并行，不是 4×0.05 秒排队
+        self.assertEqual([], task.overlap)
+        self.assertEqual(set(battle._OCR_LIB_NAMES) | {"default"}, set(task.calls[1:]))
+
+    def test_without_executor_config_uses_default(self):
+        task = self.make_task(with_config=False)
+        results = list(battle._POOL.map(lambda _: battle._ocr_texts(task, None), range(3)))
+        self.assertEqual([["3"]] * 3, results)
+        self.assertEqual({"default"}, set(task.calls))
+        self.assertEqual([], task.overlap)  # 默认引擎排队用
+
+    def test_recorder_key_ignores_lib(self):
+        import recorder
+        frame = np.zeros((5, 5, 3), np.uint8)
+        self.assertEqual(recorder.call_key("ocr", (), {"frame": frame}),
+                         recorder.call_key("ocr", (), {"frame": frame, "lib": "出牌识别2"}))
 
 
 class TestBattleLogCleanup(unittest.TestCase):

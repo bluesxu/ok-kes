@@ -5522,7 +5522,9 @@ def monster_panel_open(task: TriggerTask):
 
 def close_monster_panel(task: TriggerTask, tries=0):
     """关怪物信息面板：偶数次点面板外的 (0.502, 0.092)，奇数次按 ESC。
-    体型大的 Boss（如维亚迪乌斯）身体会伸到 (0.502, 0.092)，点下去反而又把面板点开，实跑中来回卡了两个小时。"""
+    体型大的 Boss（如维亚迪乌斯）身体会伸到 (0.502, 0.092)，点下去反而又把面板点开，实跑中来回卡了两个小时。
+    记下关面板的时刻：面板收起的动画会把敌人血条遮住一阵子，战斗里确认目标死没死时要多看一会儿。"""
+    task._monster_panel_closed_at = time.time()
     if tries % 2 == 0:
         _move_and_click(task, 0.502, 0.092)
     else:

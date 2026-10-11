@@ -16,6 +16,7 @@
 """
 import glob
 import os
+import queue
 import re
 import threading
 import time
@@ -79,7 +80,16 @@ _STUCK_LIMIT = 3            # 同一张牌连续这么多次还在手里（又�
 _BUTTON_GONE_LIMIT = 30     # 「结束回合」按钮消失这么多秒还没回来，就不再当作敌人行动中干等
 _DRAG_FAIL_LIMIT = 2        # 拖动连续这么多次没打出去，本场改用按键 + 回车打默认目标
 _LOST_TARGET_WAITS = 2      # 记住的目标从画面上消失（血条也复查不到）时，最多再等这么多次才认定它死了
-_LOST_TARGET_WAIT = 0.6     # 每次等多久（秒）
+_LOST_TARGET_WAIT = 0.6     # 每次等多久（秒）——只在没有截图方法时用，正常走 _watch_lost_target
+_LOST_WATCH = 0.6           # 目标不见了：盯着它的血条连续看这么久都不在才认定死了
+_LOST_WATCH_AFTER_PANEL = 1.2  # 刚关过怪物面板（_PANEL_RECENT 秒内）时多看一会儿：收起动画遮得久
+_PANEL_RECENT = 1.5
+_LOST_WATCH_POLL = 0.1
+_LOST_WATCH_MIN_CHECKS = 3  # 至少截到这么多张才下结论
+_EGO_MIN = 2.0              # 放 Ego 后至少等这么久（预览卡约 1.5 秒后才开始播动画）
+_EGO_MAX = 5.0              # 最多等这么久：原来是按键后 1 秒回车、回车后再等 4 秒
+_EGO_POLL = 0.15
+_FINISH_TURN_REGION = (0.844, 0.782, 0.998, 0.990)  # 结束回合按钮（与 utils_sortie 判断战斗页面用的区域相同）
 _TURN_FAIL_LIMIT = 3        # 同一张牌一回合里不论按键、拖动、拖动重试，总共这么多次没打出去就不再出它（兜底，防止换着法子一直试）
 _KEYS_DEAD_CARDS = 2        # 这么多张不同的牌按键没打出去、拖动打出去了，才算键盘失效（单张牌常是自身原因）
 _DRAG_STEPS = 8             # 后台拖动中途发几次鼠标移动（原 12）
@@ -116,6 +126,12 @@ _SETTLE_MISSING = 3         # 连续几次读不到手牌数：多半弹出了�
 _STALE_LIMIT = 2            # 出牌前发现手牌数变了，最多连续重读几次，之后照常出牌
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="出牌识别")  # 几块区域的裁剪识别并行跑
 _OCR_LOCK = threading.Lock()
+# 出牌识别专用的几个 OCR 引擎：一个 OpenVINO 引擎同一时间只能处理一个请求，小块 OCR 原来全排队用默认引擎。
+# 实测一次出牌的 35 次小块 OCR：单引擎串行 443ms，3 个引擎并行 202ms，4 个不再更快。
+# 后台建好之前（每个约 1 秒）照旧排队用默认引擎；默认引擎留给整屏 OCR 和别处没加锁的读取。
+_OCR_LIB_NAMES = ("出牌识别1", "出牌识别2", "出牌识别3")
+_ocr_libs = queue.Queue()
+_ocr_libs_started = threading.Event()
 
 
 def install(task):
@@ -160,13 +176,50 @@ def _variants(crop):
     yield cv2.resize(crop, None, fx=6, fy=6, interpolation=cv2.INTER_CUBIC)
 
 
+def _start_ocr_libs(task):
+    """第一次用到时在后台建出牌识别专用的 OCR 引擎（配置照抄默认引擎），建好一个就放进池子。"""
+    if _ocr_libs_started.is_set():
+        return
+    _ocr_libs_started.set()
+    executor = getattr(task, "executor", None)
+    ocr_config = getattr(executor, "config", None) or {}
+    ocr_config = ocr_config.get("ocr") if isinstance(ocr_config, dict) else None
+    if not isinstance(ocr_config, dict) or not isinstance(ocr_config.get("default"), dict):
+        return  # 测试替身或框架版本不同：只用默认引擎
+
+    def build():
+        for name in _OCR_LIB_NAMES:
+            try:
+                ocr_config.setdefault(name, ocr_config["default"])
+                executor.ocr_lib(name)
+            except Exception as e:  # 建不出来就少一个，照样能用默认引擎
+                task.log_info(f"出牌识别 OCR 引擎「{name}」创建失败：{e}")
+                continue
+            _ocr_libs.put(name)
+
+    threading.Thread(target=build, daemon=True, name="出牌识别OCR初始化").start()
+
+
+def _ocr(task, image):
+    """在一块裁出来的图上 OCR：有空闲的专用引擎就并行用，没有就排队用默认引擎。"""
+    _start_ocr_libs(task)
+    try:
+        name = _ocr_libs.get_nowait()
+    except queue.Empty:
+        name = None
+    if name is None:
+        # OpenVINO 的识别模型同一时间只能处理一个请求（并发会抛 Infer Request is busy）
+        with _OCR_LOCK:
+            return task.ocr(frame=image)
+    try:
+        return task.ocr(frame=image, lib=name)
+    finally:
+        _ocr_libs.put(name)
+
+
 def _ocr_texts(task, image):
     try:
-        # OpenVINO 的识别模型同一时间只能处理一个请求（并发会抛 Infer Request is busy），
-        # 所以裁剪、预处理在线程池里并行，调用 OCR 这一步排队
-        with _OCR_LOCK:
-            boxes = task.ocr(frame=image)
-        return [box.name.strip() for box in boxes]
+        return [box.name.strip() for box in _ocr(task, image)]
     except Exception as e:  # OCR 失败不影响出牌，按读不到处理
         task.log_info(f"战斗识别 OCR 失败：{e}")
         return []
@@ -416,8 +469,7 @@ def _hand_strip_boxes(task):
     image = cv2.resize(_crop(task.frame, _HAND_STRIP), None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
     sx, sy = task.width / task.frame.shape[1] / 2, task.height / task.frame.shape[0] / 2
     try:
-        with _OCR_LOCK:
-            found = task.ocr(frame=image)
+        found = _ocr(task, image)
     except Exception as e:  # OCR 失败不影响出牌，按读不到处理
         task.log_info(f"手牌区补读 OCR 失败：{e}")
         return []
@@ -1041,10 +1093,14 @@ def _start_turn_if_new(state):
 
 
 def _ensure_battle(task):
-    """超过 20 秒没看到战斗页面就当作新的一场战斗。"""
+    """新的一场战斗就重置本场状态：详细日志记了「战斗开始」（战斗编号变了），或超过 20 秒没看到战斗页面。
+    只看 20 秒不够：领完奖励、选完路线马上进下一场时两场只隔十来秒，上一场的目标记忆、出不起的牌、
+    费用缓存都被带进新的一场（实跑 10/10 11:26 两场隔 11.6 秒，Boss 战第一张攻击牌去找上一场的目标，白等一次）。"""
     state = _state(task)
-    if not state or time.time() - state.get("last_seen", 0) > 20:
+    current = battle_log.battle_id(task)
+    if not state or time.time() - state.get("last_seen", 0) > 20 or state.get("battle_id", current) != current:
         start_battle(task)
+        state["battle_id"] = current
     state["last_seen"] = time.time()
     return state
 
@@ -1372,6 +1428,12 @@ def _wait_lost_target(task, frame, state, enemies, anchor):
         return False
     if _bar_still_there(frame, anchor[0], anchor[1]):
         return False
+    if state.get("lost_dead") == anchor:
+        return False  # 这只已经确认死了，别每帧再盯一遍
+    capture = _raw_capture(task)
+    if capture is not None:
+        return _watch_lost_target(task, capture, state, enemies, anchor)
+    # 没有截图方法（测试替身）：退回老办法，睡一会儿、下一帧整套重新识别
     waited = state.get("lost_waits", 0)
     if waited >= _LOST_TARGET_WAITS:
         return False
@@ -1381,6 +1443,37 @@ def _wait_lost_target(task, frame, state, enemies, anchor):
                       enemies=[(e["x"], e["y"], e["hp"]) for e in enemies])
     task.sleep(_LOST_TARGET_WAIT)
     return True
+
+
+def _watch_lost_target(task, capture, state, enemies, anchor):
+    """只盯着目标血条那一小块连续截图，看它回不回来：回来了就接着打它，一直不在就认定死了、马上换人。
+    以前是睡 0.6 秒、下一帧整套重新识别，重复两次，每次击杀白等约 3 秒（实跑 10/11 11:20：7.87 秒血条消失、
+    之后再没出现，11.48 秒才换目标）。遮挡都很短：出牌特效遮一帧（同一场 6.12 秒）；
+    刚关过怪物面板时收起动画遮得久一些（10/09 15:55），这时多看一会儿。返回 True 表示目标还在、本帧不出牌。"""
+    closed_at = getattr(task, "_monster_panel_closed_at", 0)
+    window = _LOST_WATCH_AFTER_PANEL if time.time() - closed_at < _PANEL_RECENT else _LOST_WATCH
+    start = time.time()
+    checks = 0
+    while time.time() - start < window:
+        frame = capture()
+        if frame is None:
+            break
+        checks += 1
+        if _bar_still_there(frame, anchor[0], anchor[1]):
+            task.log_info(f"要打的目标血条又出现了（看了 {time.time() - start:.1f} 秒），继续打它")
+            battle_log.record(task, "目标暂时看不到", position=list(anchor), back=True,
+                              seconds=round(time.time() - start, 2), checks=checks,
+                              enemies=[(e["x"], e["y"], e["hp"]) for e in enemies])
+            return True
+        time.sleep(_LOST_WATCH_POLL)
+    seconds = round(time.time() - start, 2)
+    if checks < _LOST_WATCH_MIN_CHECKS:
+        return False  # 截不到图：照常重挑（与以前等满次数后相同）
+    state["lost_dead"] = anchor
+    task.log_info(f"要打的目标连看 {seconds} 秒血条都不在，认定死了，换下一个")
+    battle_log.record(task, "目标确认死亡", position=list(anchor), seconds=seconds, checks=checks,
+                      enemies=[(e["x"], e["y"], e["hp"]) for e in enemies])
+    return False
 
 
 def play_turn(task, hand_count, finish_turn_visible):
@@ -1418,11 +1511,17 @@ def play_turn(task, hand_count, finish_turn_visible):
     pending = {c["name"]: _POOL.submit(_card_cost, task, frame, c) for c in cards
                if not c["name"].startswith("未识别") and c["name"] not in state["costs"]}
     remaining = remaining_job.result()
-    if remaining is None and (ap_zero_outline(frame) or hand_lowered(task)):
+    # AP 是不是亲眼看到的：读出了数字，或认出灰色空心的「0」。只靠手牌沉下去推出来的 0 不算，
+    # 否则「全沉 → AP 是 0 → 全沉确实出不了」自己证明自己（见下面结束回合的判断）
+    ap_seen = remaining is not None
+    if remaining is None and ap_zero_outline(frame):
+        remaining, ap_seen = 0, True
+        task.log_info("AP 已用完（灰色的 0）")
+    elif remaining is None and hand_lowered(task):
         # 实跑中 AP 用完后读不到灰色的「0」，把每张牌都按一遍才结束回合。按键后手牌要过一会儿才沉下去，
         # 所以先看数字颜色，手牌沉下去作为第二个判断
         remaining = 0
-        task.log_info("AP 已用完（灰色的 0 或手牌沉下去）")
+        task.log_info("AP 已用完（手牌沉下去，没看到灰色的 0）")
     if remaining is not None and state["last_remaining"] is not None and remaining > state["last_remaining"]:
         # 读数比上一帧大：费用回满（新回合），也可能某张牌加了费用。单帧误读会清掉本回合状态，
         # 实跑 10/03 13:54 把「1」读成「7」触发假新回合，连锁让同一张牌被试 6 次：先重截一帧重读，
@@ -1489,8 +1588,13 @@ def play_turn(task, hand_count, finish_turn_visible):
     # 游戏把这一帧出不了的牌整排沉下去（费用不够、0 血时的崩溃牌）：整手都沉 = 一张都出不了，直接结束回合。
     # 读不到高度的牌不算数（回退旧的费用判断），免得 OCR 漏读反而提前结束回合
     all_lowered = bool(cards) and all(card.get("lowered") for card in cards)
+    lowered_sure = all_lowered and _lowered_matches_ap(cards, remaining, ap_seen)
     if all_lowered:
         card, reason = None, "手牌全沉下去了（都出不了）"
+        if not lowered_sure:
+            reason += "，但 AP 没确认用完，按普通规则再看一轮"
+            task.log_info(f"手牌全沉，但 AP 读数 {remaining}（{'看到了' if ap_seen else '没看到'}）"
+                          f"对不上，不急着结束回合")
     else:
         card, reason = choose_play(cards, remaining, priority, defense, danger, blocked, zero_hp=zero_hp)
     observed = {
@@ -1501,8 +1605,8 @@ def play_turn(task, hand_count, finish_turn_visible):
         "unplayable": sorted(state["unplayable"]),
     }
     if card is None:
-        # 全沉下去是游戏自己画出来的信号、AP 读到 0 同样确定：加速模式不必再等 3 秒、再确认一轮
-        return _end_turn(task, reason, sure=remaining == 0 or all_lowered, observed=observed)
+        # 全沉下去且 AP 对得上、或亲眼看到 AP 是 0：加速模式不必再等 3 秒、再确认一轮
+        return _end_turn(task, reason, sure=remaining == 0 and ap_seen or lowered_sure, observed=observed)
     if _hand_changed(task, state, hand_count):
         return True
 
@@ -1704,11 +1808,59 @@ def use_ego(task, finish_turn_visible):
     task.log_info(f"释放 Ego {chosen['key']}（费用 {chosen['cost'] if chosen['cost'] is not None else '?'}，{reason}）")
     battle_log.record(task, "释放Ego", key=chosen["key"], cost=chosen["cost"], reason=reason, ep_full=full,
                       ready=[s["key"] for s in ready], tries=tries[chosen["key"]])
+    pressed = time.time()
     task.send_key(chosen["key"])
     task.sleep(1)
     task.send_key("enter")
-    task.sleep(4)  # 与原逻辑相同：等 Ego 动画播完
+    _wait_ego_done(task, pressed)
     return True
+
+
+def _wait_ego_done(task, pressed):
+    """等 Ego 动画播完。原来回车后固定等 4 秒，实际从按键到界面恢复只要 2.8~3.8 秒，每次白等 1.2~2.3 秒
+    （现场包 20261010-112644 两次、20261011-125919 一次）。按键后先弹出预览卡（「使用卡牌 / 取消」），
+    这时结束回合按钮还在、画面也几乎不动，约 1.5 秒后动画开始、按钮消失，播完按钮再回来。
+    所以至少等 _EGO_MIN 秒，要先看到按钮消失过、再连续两次看到它回来才继续；一直没看到按钮消失
+    （回车没生效、或游戏卡住动画没开始）就等满原来的时长。"""
+    capture = _raw_capture(task)
+    if capture is None:
+        task.sleep(4)  # 没有截图方法（测试替身）：与原逻辑相同
+        return
+    box = task.box_of_screen(*_FINISH_TURN_REGION)
+    gone, back = False, 0
+    while time.time() - pressed < _EGO_MAX:
+        time.sleep(_EGO_POLL)
+        frame = capture()
+        if frame is None:
+            break
+        visible = bool(task.find_feature(feature_name="finishturn", box=box, frame=frame))
+        if not visible:
+            gone, back = True, 0
+            continue
+        back += 1
+        if gone and back >= 2 and time.time() - pressed >= _EGO_MIN:
+            task.log_info(f"Ego 动画播完（按键后 {time.time() - pressed:.1f} 秒）")
+            break
+    else:
+        task.log_info(f"Ego 等满 {_EGO_MAX:.0f} 秒" + ("" if gone else "（没看到结束回合按钮消失，动画可能没开始）"))
+    speed = getattr(task, "_speedup", None)
+    if speed is not None:
+        speed.update(owed_until=0.0, pay_hook=None)  # 已经等过了，加速模式记着的等待不用再补
+
+
+def _lowered_matches_ap(cards, remaining, ap_seen):
+    """整手牌都沉下去时，AP 读数能不能印证「确实一张都出不起」。
+    - 亲眼看到 AP 是 0（数字或灰色空心的「0」）：能。这时读到的 0 费不作数——现场包里沉下去的牌读成 0 费
+      13 次全是读错（4 费聚光灯、1 费节奏读成 0，诅咒牌「贫血」的禁止符号读成 0），沉下去的判断一次没错。
+    - AP 读到大于 0：每张读得到费用的牌都比 AP 贵才算（10/08 21:16：AP 2，手里一张 3 费）。
+    - AP 只是从手牌沉下去推出来的、或根本没读到：不能。
+    印证不了不等于要出牌，只是不走「1 秒就结束回合」的快速确认，按普通规则隔 3 秒、连续两轮再看。"""
+    if not ap_seen or remaining is None:
+        return False
+    if remaining == 0:
+        return True
+    known = [card["cost"] for card in cards if card.get("cost") is not None]
+    return bool(known) and all(cost > remaining for cost in known)
 
 
 def _end_turn(task, reason, sure=False, observed=None):

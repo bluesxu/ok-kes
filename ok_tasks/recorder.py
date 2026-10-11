@@ -423,7 +423,8 @@ def _plain(value):
 
 
 def call_key(name, args, kwargs):
-    """调用的「方法 + 参数」，转成可比较的 JSON 字符串。"""
+    """调用的「方法 + 参数」，转成可比较的 JSON 字符串。OCR 用哪个引擎（lib）不影响结果，不算进去。"""
+    kwargs = {k: v for k, v in kwargs.items() if k != "lib"}
     return json.dumps([name, _plain(list(args)), _plain(dict(sorted(kwargs.items())))], ensure_ascii=False)
 
 

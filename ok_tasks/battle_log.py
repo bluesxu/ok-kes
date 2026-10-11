@@ -85,6 +85,11 @@ def new_battle(task):
     return state["battle_id"]
 
 
+def battle_id(task):
+    """当前是本次运行的第几场战斗（battle_frame 看到战斗画面重新出现时 +1，不受详细日志开关影响）。"""
+    return _state(task)["battle_id"]
+
+
 def _node(task):
     status = getattr(task, "node_status", None) or {}
     return {
