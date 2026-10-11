@@ -4,6 +4,9 @@ import sys
 import unittest
 import unittest.mock
 
+import cv2
+import numpy as np
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "ok_tasks"))
 
@@ -180,20 +183,63 @@ class TestGetCardEnhance(unittest.TestCase):
         self.assertEqual([], utils.recognize_cards(task))
 
 
+class TreasureTask(PageTask):
+    """宝箱房：画面用现场包里的帧，next_frame 依次换下一帧（最后一帧之后保持不变）。"""
+
+    def __init__(self, *frames):
+        super().__init__([("傳送門的另一側是個堆滿寶物的華麗空間", 0.5, 0.23, 0.3), ("離開", 0.40, 0.80)])
+        self.frames = [cv2.imdecode(np.fromfile(os.path.join(ROOT, "tests", "images", "battle", f"treasure_{name}.jpg"),
+                                                dtype=np.uint8), cv2.IMREAD_COLOR) for name in frames]
+        self.frame = self.frames.pop(0)
+        self.height, self.width = self.frame.shape[:2]
+        self.node_status["node_count"] = 5
+
+    def next_frame(self):
+        if self.frames:
+            self.frame = self.frames.pop(0)
+
+    def box_of_screen(self, x, y, to_x=1.0, to_y=1.0, **kwargs):
+        return Box(x * self.width, y * self.height, to_x=to_x * self.width, to_y=to_y * self.height)
+
+
 class TestTreasureRoom(unittest.TestCase):
 
-    def test_clicks_labeled_chests_then_gives_up(self):
-        # 实跑 19:40：中间宝箱点开后，两边带 F1/F2 标记的宝箱没点就选了「离开」
-        task = PageTask([("F1", 0.523, 0.387, 0.02), ("F2", 0.797, 0.392, 0.02), ("F", 0.20, 0.40, 0.02)])
-        task.node_status["node_count"] = 5
+    def clicks(self, task, times):
         clicks = []
         with unittest.mock.patch.object(utils, "_move_and_click", lambda t, x, y: clicks.append((round(x, 3), round(y, 3)))):
-            results = [utils._click_labeled_treasure(task) for _ in range(5)]
+            results = [utils._click_labeled_treasure(task) for _ in range(times)]
+        return results, clicks
+
+    def test_opens_side_chests_after_middle(self):
+        # 实跑 10/11 11:20（现场包 20261011-112116）：中间宝箱开了以后整屏 OCR 读不到左右两个宝箱上的「F1」「F2」，直接选了「离开」
+        results, clicks = self.clicks(TreasureTask("middle_opened"), 5)
         self.assertEqual([True, True, True, True, False], results)
-        self.assertEqual([(0.523, 0.427), (0.523, 0.427), (0.797, 0.432), (0.797, 0.432)], clicks)
-        task.node_status["node_count"] = 6  # 换了节点重新计数
-        with unittest.mock.patch.object(utils, "_move_and_click", lambda t, x, y: None):
-            self.assertTrue(utils._click_labeled_treasure(task))
+        self.assertEqual([(0.523, 0.428)] * 2 + [(0.8, 0.433)] * 2, clicks)
+
+    def test_all_three_unopened_starts_from_left(self):
+        results, clicks = self.clicks(TreasureTask("three"), 1)
+        self.assertEqual([True], results)
+        self.assertEqual([(0.523, 0.428)], clicks)
+
+    def test_blink_frame_then_labels_back(self):
+        # 标记闪掉的那一帧三个都看不到：再看几帧，标记回来了就接着点
+        task = TreasureTask("labels_blink", "labels_blink", "middle_opened")
+        self.assertEqual(([True], [(0.523, 0.428)]), self.clicks(task, 1))
+
+    def test_labels_gone_for_several_frames(self):
+        task = TreasureTask("labels_blink")
+        self.assertEqual(([False], []), self.clicks(task, 1))
+
+    def test_not_treasure_room(self):
+        task = TreasureTask("three")
+        task.all_texts = []
+        self.assertEqual(([False], []), self.clicks(task, 1))
+
+    def test_new_node_resets_tries(self):
+        task = TreasureTask("middle_opened")
+        self.clicks(task, 5)
+        task.node_status["node_count"] = 6
+        self.assertEqual([True], self.clicks(task, 1)[0])
 
 
 class TestSortieRest(unittest.TestCase):

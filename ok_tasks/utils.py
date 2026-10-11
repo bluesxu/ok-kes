@@ -3978,36 +3978,46 @@ def handle_equipment_recast(task: TriggerTask):
     return False
 
 
-_TREASURE_LABEL_REGION = (0.45, 0.33, 0.95, 0.45)  # 宝箱房里宝箱上方「F1」「F2」按键标记所在区域
+# 宝箱房左、中、右三个宝箱上方「F1/F2/F3」标记的中心；没开的宝箱才有标记，开掉一个后剩下的重新编号，所以按位置认
+_TREASURE_SPOTS = (("左边", 0.523, 0.400), ("中间", 0.644, 0.448), ("右边", 0.800, 0.405))
 _TREASURE_LABEL_TRIES = 2
+_TREASURE_LOOKS = 4  # 标记会闪，连着几帧都看不到才算开完
+
+
+def _treasure_label_visible(task: TriggerTask, x, y):
+    """标记和下面的箭头图标是白色笔画：没开的宝箱这块白色约占 0.1，开过的或画面上没有约 0.01~0.02。"""
+    box = task.box_of_screen(x - 0.025, y - 0.035, x + 0.025, y + 0.035)
+    hsv = cv2.cvtColor(task.frame[box.y:box.y + box.height, box.x:box.x + box.width, :3], cv2.COLOR_BGR2HSV)
+    return ((hsv[..., 2] > 200) & (hsv[..., 1] < 50)).mean() > 0.05
 
 
 def _click_labeled_treasure(task: TriggerTask):
-    """宝箱房（「传送门的另一侧是个堆满宝物的华丽空间」）有三个宝箱：中间那个靠 treasure 模板点开，
-    两边的宝箱上方带「F1」「F2」按键标记，模板匹配不上，以前开完中间的就直接选「离开」。
-    这里在宝箱区域找这些标记，点标记下方的箭头图标。同一节点每个标记最多点 2 次，打不开就不再管。"""
-    x1, y1, x2, y2 = _TREASURE_LABEL_REGION
-    labels = [
-        b for b in task.all_texts
-        if re.fullmatch(r'F[1-3]', b.name.strip().upper())
-        and x1 <= (b.x + b.width / 2) / task.width <= x2
-        and y1 <= (b.y + b.height / 2) / task.height <= y2
-    ]
+    """宝箱房（「传送门的另一侧是个堆满宝物的华丽空间」）有三个宝箱，treasure 模板只认得出中间那个。
+    以前按 OCR 读宝箱上方的「F1」「F2」找另外两个，但整屏 OCR 读不到这么小的标记（实跑 10/11 11:20
+    开完中间那个就选了「离开」，左右两个没开），改成在三个固定位置看标记还在不在，点标记下方的箭头图标。
+    标记会一闪一闪，连看几帧都没有才算开完；同一节点每个位置最多点 2 次，打不开就不再管。"""
+    if not any("堆满宝物" in b.name for b in task.all_texts):
+        return False
     node = getattr(task, "node_status", {}).get("node_count", 0)
     tried = getattr(task, "_treasure_label_tries", None)
     if not tried or tried.get("node") != node:
         tried = task._treasure_label_tries = {"node": node}
-    for label in sorted(labels, key=lambda b: b.x):
-        key = label.name.strip().upper()
-        if tried.get(key, 0) >= _TREASURE_LABEL_TRIES:
-            continue
-        tried[key] = tried.get(key, 0) + 1
-        x = (label.x + label.width / 2) / task.width
-        y = (label.y + label.height / 2) / task.height + 0.04  # 标记正下方的箭头图标
-        task.log_info(f"宝箱房：点击带「{key}」标记的宝箱（第{tried[key]}次）")
-        _move_and_click(task, x, y)
-        task.sleep(2)
-        return True
+    for look in range(_TREASURE_LOOKS):
+        left = [s for s in _TREASURE_SPOTS if tried.get(s[0], 0) < _TREASURE_LABEL_TRIES]
+        if not left:
+            break
+        if look:
+            task.sleep(0.3)
+            task.next_frame()
+        for key, x, y in left:
+            if not _treasure_label_visible(task, x, y):
+                continue
+            tried[key] = tried.get(key, 0) + 1
+            task.log_info(f"宝箱房：点击{key}还没开的宝箱（第{tried[key]}次）")
+            battle_log.record(task, "事件选项", options=[], chosen=f"宝箱（{key}）", reason="宝箱上方还有按键标记")
+            _move_and_click(task, x, y + 0.028)  # 标记正下方的箭头图标
+            task.sleep(2)
+            return True
     return False
 
 
