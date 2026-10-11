@@ -1836,6 +1836,50 @@ class TestRoundSuccessCount(unittest.TestCase):
         self.assertEqual(0, task.node_status["pass_final_boss_count"])
         self.assertEqual(0, task.node_status["success_rounds"])
 
+    def first_boss_reward_page(self, config, **status):
+        # 第一层首领打完后的战利品页：右下角「获得」按钮
+        button = Box(2900, 1640, 100, 40, name="获得")
+        task = mock.MagicMock()
+        task.node_status = utils._initial_node_status()
+        task.node_status.update({"reach_final_boss": True, "final_boss_battle": True, **status})
+        task.default_config = {"只打第一层": True, "领取奖励": False}
+        task.config = dict(config)
+        task._escape_requested_at = 0
+        escaped = []
+        with mock.patch.object(utils_sortie, "find_box_at_point", lambda t, x, y: button), \
+                mock.patch.object(utils, "_open_escape_menu", lambda t, y: escaped.append(y)):
+            handled = utils_sortie.handle_first_boss_retreat(task)
+        return handled, task, escaped
+
+    def test_first_boss_retreats_without_rewards(self):
+        # 用户 10/11：只打第一层、没开领取奖励，首领打完不领卡牌装备，直接撤退并记成功
+        handled, task, escaped = self.first_boss_reward_page({})
+        self.assertTrue(handled)
+        self.assertEqual([0.051], escaped)
+        self.assertEqual(1, task.node_status["pass_final_boss_count"])
+        self.assertEqual(1, task.node_status["success_rounds"])
+        task.click_box.assert_not_called()
+
+    def test_first_boss_keeps_rewards_when_claiming(self):
+        # 开了领取奖励：照旧领完战利品、走结算页
+        handled, task, escaped = self.first_boss_reward_page({"领取奖励": True})
+        self.assertFalse(handled)
+        self.assertEqual([], escaped)
+        self.assertEqual(0, task.node_status["pass_final_boss_count"])
+
+    def test_first_boss_retreat_needs_only_first_layer(self):
+        # 连打多层：第一层首领的战利品照领
+        handled, _, escaped = self.first_boss_reward_page({"只打第一层": False})
+        self.assertFalse(handled)
+        self.assertEqual([], escaped)
+
+    def test_normal_battle_reward_not_retreat(self):
+        # 不是首领战（没进首领节点）、或已经过了第一层：照常领
+        for status in ({"reach_final_boss": False, "final_boss_battle": False}, {"pass_final_boss_count": 1}):
+            handled, _, escaped = self.first_boss_reward_page({}, **status)
+            self.assertFalse(handled, status)
+            self.assertEqual([], escaped)
+
     def test_escape_menu_only_clicked_after_deciding_to_retreat(self):
         # 实跑 22:05：关卡牌弹窗的 ESC 落到战斗里打开了菜单，看到「撤退」就点了，满血放弃一轮
         task = mock.MagicMock()

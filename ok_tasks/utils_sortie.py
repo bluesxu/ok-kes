@@ -597,6 +597,29 @@ def _mark_sortie_boss_cleared(task: TriggerTask):
     task.log_info("只打第一层：已到本轮奖励结算页，补记通关层数 1")
 
 
+def handle_first_boss_retreat(task: TriggerTask):
+    """第一层首领打完后的战利品页（获得卡牌、信用点、装备…）: 开了「只打第一层」且没开「领取奖励」时，
+    不再一样样领，直接从右上角菜单撤退，本轮记成功（用户 10/11 要求）。领了也带不走，白花时间。
+    开了「领取奖励」时照旧领完、走结算页领卡厄思战利品再撤退。"""
+    ns = getattr(task, 'node_status', None)
+    if not isinstance(ns, dict) or not (ns.get('reach_final_boss') and ns.get('final_boss_battle')):
+        return False
+    if ns.get('pass_final_boss_count', 0) > 0 or ns.get('is_escaped', False):
+        return False
+    if not _get_config_value(task, '只打第一层', False) or _get_config_value(task, "领取奖励", False):
+        return False
+    box = find_box_at_point(task, 0.924, 0.922)
+    if not (box and _clean_match(box.name, "获得")):
+        box = utils.find_button_by_text(task, ("获得",))
+    if not (box and _clean_match(box.name, "获得")):
+        return False
+    if time.time() - getattr(task, '_escape_requested_at', 0) < 3:
+        return True  # 刚点过菜单，等它出来，别让 handle_obtain_reward 点了「获得」
+    task.log_info("第一层首领已击败，只打第一层且没开领取奖励：不领战利品，直接撤退")
+    ns['pass_final_boss_count'] = 1
+    return _finish_only_first_layer(task)
+
+
 def handle_sortie_reward_claim(task: TriggerTask):
     """出击模式奖励领取页面: 按配置领取或放弃卡厄思战利品。"""
     title = find_box_at_point(task, 0.503, 0.335)
@@ -1266,6 +1289,7 @@ PAGE_HANDLERS = [
     handle_member_selection,
     handle_battle_member_config,
     handle_enter,
+    handle_first_boss_retreat, #第一层首领打完：不领战利品直接撤退，要排在 handle_obtain_reward 前
     handle_obtain_reward,
     handle_view_original,
     handle_skip,
