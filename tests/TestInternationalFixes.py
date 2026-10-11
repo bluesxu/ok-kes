@@ -163,6 +163,40 @@ class TestFlashButton(unittest.TestCase):
         self.assertEqual([], task.clicked)
 
 
+class TestGetCardTwoFrames(unittest.TestCase):
+    """获得卡牌页：加速时选牌、确认分两帧（同一帧连点两下时闸门用不上，下一帧在页面没变时又点一遍）。"""
+
+    PAGE = [("獲得卡牌", 0.502, 0.128), ("請選擇1張欲獲得的卡牌。", 0.883, 0.131, 0.15)]
+    CARDS = [{"name": "扭曲：好战性", "x": 0.25, "y": 0.307}, {"name": "聚光灯", "x": 0.8027, "y": 0.307}]
+
+    def run_frames(self, accelerate, times):
+        task = PageTask(self.PAGE)
+        task.config.update({"获得卡牌优先级": ["聚光灯"], "加速模式": accelerate})
+        clicks = []
+        with unittest.mock.patch.object(utils_sortie, "recognize_cards", lambda task, page=None: [dict(c) for c in self.CARDS]):
+            for _ in range(times):
+                before = len(task.clicked)
+                self.assertTrue(utils_sortie.handle_get_card(task))
+                clicks.append(task.clicked[before:])
+        return clicks
+
+    def test_accelerated_select_then_confirm(self):
+        # 实跑 10/11 11:20（现场包 20261011-112116）：同一帧点牌 + 确认，0.07 秒后又点了一遍
+        self.assertEqual([["(0.803, 0.307)"], ["(0.912, 0.931)"], ["(0.803, 0.307)"]], self.run_frames(True, 3))
+
+    def test_without_acceleration_keeps_one_frame(self):
+        self.assertEqual([["(0.803, 0.307)", "(0.912, 0.931)"]], self.run_frames(False, 1))
+
+    def test_pending_expires(self):
+        task = PageTask(self.PAGE)
+        task.config.update({"获得卡牌优先级": ["聚光灯"], "加速模式": True})
+        with unittest.mock.patch.object(utils_sortie, "recognize_cards", lambda task, page=None: [dict(c) for c in self.CARDS]):
+            utils_sortie.handle_get_card(task)
+            task._get_card_pending["time"] -= utils_sortie._GET_CARD_PENDING_KEEP + 1  # 牌没点上、记录过期
+            utils_sortie.handle_get_card(task)
+        self.assertEqual(["(0.803, 0.307)", "(0.803, 0.307)"], task.clicked)  # 重新点牌，不去点确认
+
+
 class TestGetCardEnhance(unittest.TestCase):
 
     def test_enhance_feature_on_name_row(self):
@@ -879,6 +913,16 @@ class TestEquipmentAssign(unittest.TestCase):
             self.now += 0.2
             self.assertTrue(utils.handle_equipment(task))
         self.assertEqual([1, "购买"], task.chosen())
+
+    def test_accelerated_install_confirms_on_the_next_frame(self):
+        # 非购买页也一样：加速时这一帧只点主战员并结束（返回 True），下一帧认出已选好、交给 handle_confirm 单独点确认
+        task = EquipmentTask("M85军用手榴弹", "攻击力", "稀有", [EMPTY, EMPTY, EMPTY])
+        task.config["加速模式"] = True
+        self.assertTrue(utils.handle_equipment(task))   # 只点了人，这一帧不再往下走到 handle_confirm
+        self.assertEqual([2], task.chosen())
+        self.now += 0.5
+        self.assertFalse(utils.handle_equipment(task))  # 已选好：交给确认按钮
+        self.assertEqual([2], task.chosen())             # 没重新选人
 
     def test_unknown_target_refetches_then_gives_up(self):
         # 实跑 10/01 11:02：开局头像没取准，购买页认不出刷存档主战员一直取消，商店又一直去点同一件

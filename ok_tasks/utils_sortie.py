@@ -1,7 +1,7 @@
 from ok import TriggerTask
 
 from utils import (
-    _move_and_click, _simplify_texts, _edit_distance, _get_config_value, _get_card_list, _get_route_priority, _get_game_text,
+    _acceleration_on, _move_and_click, _simplify_texts, _edit_distance, _get_config_value, _get_card_list, _get_route_priority, _get_game_text,
     find_box_at_point, find_text, find_text_in_region, recognize_cards,
     _card_has_type_below, select_card, calculate_dominant_hue,
     log_credit, log_node_status, handle_battle_crash, handle_close_page, handle_refine_equipment_credit,
@@ -467,6 +467,9 @@ def handle_battle_page(task: TriggerTask):
     return utils_battle.play_turn(task, hand_count, finish_turn_visible)
 
 
+_GET_CARD_PENDING_KEEP = 5  # 选好牌后这么久之内，同一页面上同一张牌只点确认
+
+
 def handle_get_card(task: TriggerTask):
     """获得卡牌页面: 按优先级选择卡牌。"""
     title = find_box_at_point(task, 0.502, 0.128)
@@ -491,11 +494,25 @@ def handle_get_card(task: TriggerTask):
         task.log_info(f"获得卡牌: 检查优先级「{name}」是否在卡牌列表中")
         chosen = next((card for card in cards if name in card["name"]), None)
         if chosen:
+            pending = getattr(task, "_get_card_pending", None)
+            if pending and pending["name"] == chosen["name"] and time.time() - pending["time"] < _GET_CARD_PENDING_KEEP:
+                # 上一帧已经点了这张牌：这一帧只点确认
+                task._get_card_pending = None
+                task.log_info(f"获得卡牌: 已选中「{chosen['name']}」，点击确认")
+                _move_and_click(task, 0.912, 0.931)
+                task.sleep(1)
+                return True
             task.log_info(f"获得卡牌: 优先选择「{chosen['name']}」(匹配优先级「{name}」)")
             battle_log.record(task, "卡牌奖励", cards=[c["name"] for c in cards], chosen=chosen["name"],
                               reason=f"获得卡牌优先级「{name}」")
             _move_and_click(task, chosen["x"], chosen["y"])
             task.sleep(0.5)
+            if _acceleration_on(task):
+                # 选牌、确认分两帧：同一帧连点两下时加速闸门用不上，点完确认没有等待，下一帧在页面还没变时
+                # 又选了一遍、点了一遍确认（实跑 10/11 11:20 点到了弹窗上）。不靠「确认」按钮颜色判断有没有选中：
+                # 判错了会再点一次牌把选中取消掉；按自己记的来，牌没点上的话确认点了没反应，记录过期后重新点牌
+                task._get_card_pending = {"name": chosen["name"], "time": time.time()}
+                return True
             _move_and_click(task, 0.912, 0.931)
             return True
     task.log_info("获得卡牌: 未命中任何优先级卡牌，跳过非优先级卡牌")

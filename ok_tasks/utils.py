@@ -3455,6 +3455,11 @@ def handle_equipment(task: TriggerTask):
             task.sleep(1)
             return True
         task._equipment_decision = {"key": decision_key, "member": chosen_index, "time": time.time()}
+        if _acceleration_on(task):
+            # 这一帧只选人；下一帧认出已选好（上面 _equipment_decision 那段），交给 handle_confirm 单独点确认。
+            # 同一帧连点两下时加速闸门用不上，确认后要按原时长等满约 2 秒；单独点确认，页面一换就继续。
+            # 确认没生效时也能更早看出来（10/09~10/11 共 333 次分配里有 25 次要点两三次确认）
+            return True
         return False
 
     task._equipment_purchase_pending = None
