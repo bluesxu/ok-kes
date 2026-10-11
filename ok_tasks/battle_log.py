@@ -5,7 +5,7 @@
   观测到的内容、做出的决策和理由）；主日志只写一行摘要，避免把大段观测数据刷进 ok-script.log。
 - 只在真正点下去的那一刻记一条决定，没点的帧不记。
 - 异常截图存到 battle_logs/截图/，JPG 质量 80；同一种异常每场战斗（卡厄思模式为每轮）最多截 1 张。
-- 清理：超过保留天数的文件删除；总大小超过上限时从最旧的删起。任务启动时清一次，运行中每小时清一次。
+- 清理：超过保留天数的文件删除；总大小超过上限时从最旧的删起；删空的目录（现场包）一并删掉。任务启动时清一次，运行中每小时清一次。
   手动标记的现场包（battle_logs/现场/*_手动标记/）不参与常规清理，只在清完其余文件仍超上限时从最旧的手动包删起。
 
 注意：本文件不能定义顶层类，框架会把 ok_tasks 下含类的 .py 当作任务加载。
@@ -434,7 +434,26 @@ def cleanup(folder, keep_days, max_mb, now=None):
             continue
         removed += 1
         total -= size
+    _remove_empty_dirs(folder, now)
     return removed
+
+
+_EMPTY_DIR_GRACE = 600  # 现场包写盘线程先建 frames/full 再写文件：刚建的空目录不动
+
+
+def _remove_empty_dirs(folder, now):
+    """文件删完后现场包剩下的空目录（包目录和里面的 frames/full）一起删掉，从最深的删起；
+    folder 下第一层（现场/截图/过程）保留。按建目录的时间算新旧：删文件会刷新目录的修改时间。"""
+    for root, _, _ in os.walk(folder, topdown=False):
+        if os.path.dirname(root) == folder or root == folder:
+            continue
+        try:
+            stat = os.stat(root)
+            created = getattr(stat, "st_birthtime", stat.st_ctime)  # Windows 上 st_ctime 也是建目录时间
+            if not os.listdir(root) and now - created > _EMPTY_DIR_GRACE:
+                os.rmdir(root)
+        except OSError:
+            continue
 
 
 def _manual_scene_dirs(folder):

@@ -1277,6 +1277,31 @@ class TestBattleLogCleanup(unittest.TestCase):
             self.assertFalse(os.path.exists(old))   # 仍超限：最旧的手动标记被新的顶掉
             self.assertTrue(os.path.exists(new))
 
+    def test_emptied_scene_dirs_removed(self):
+        # 现场包文件删完后包目录和 frames/full 空目录一起删；第一层「现场」「截图」保留（10/11 用户发现空目录攒了上千个）
+        with tempfile.TemporaryDirectory() as folder:
+            now = time.time() + 3600  # 目录都建于一小时前，过了宽限期
+            scene = os.path.join(folder, "现场", "20261002-105315_自动出击模式_按键无效")
+            self.make_file(folder, os.path.join(scene, "frames", "00001.jpg"), 30, 0.001, now)
+            os.makedirs(os.path.join(scene, "full"))
+            os.makedirs(os.path.join(folder, "截图"))
+            kept = self.make_file(folder, os.path.join("现场", "20261011-104744_自动出击模式_战斗输了", "frames", "00002.jpg"),
+                                  1, 0.001, now)
+            self.assertEqual(1, battle_log.cleanup(folder, keep_days=7, max_mb=10, now=now))
+            self.assertFalse(os.path.exists(scene))
+            self.assertTrue(os.path.exists(kept))
+            self.assertTrue(os.path.isdir(os.path.join(folder, "现场")))
+            self.assertTrue(os.path.isdir(os.path.join(folder, "截图")))
+
+    def test_just_created_scene_dirs_kept(self):
+        # 写盘线程刚建好 frames/full 还没写进文件：不能删
+        with tempfile.TemporaryDirectory() as folder:
+            scene = os.path.join(folder, "现场", "20261011-112116_自动出击模式_手动标记")
+            os.makedirs(os.path.join(scene, "frames"))
+            os.makedirs(os.path.join(scene, "full"))
+            battle_log.cleanup(folder, keep_days=7, max_mb=10, now=time.time())
+            self.assertTrue(os.path.isdir(os.path.join(scene, "frames")))
+
     def test_manual_mark_merged_into_auto_scene_is_kept(self):
         # 自动异常先触发录制时，手动标记并入那个包、目录名还是自动的：按 meta 里的触发同样豁免清理
         with tempfile.TemporaryDirectory() as folder:
