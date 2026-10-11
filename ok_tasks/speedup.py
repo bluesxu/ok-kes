@@ -35,6 +35,9 @@ _move_and_click 点击前还固定悬停 0.5 秒，实际界面通常不到 1 �
    结束回合（按 E）前再确认：出过牌 3 秒内不按（新抽的牌可能还没到手、网络卡顿），按过 E 后 5 秒内不再按
    （连按的 E 可能落到我方下一回合），并且要连续两轮都判断该结束回合才按。
    出牌逻辑确认 AP 已用完时（end_turn_sure）只要求出过牌 1 秒、不再确认第二轮：实跑中每回合最后一张牌到按 E 要等 4~5 秒。
+9. 缩小匹配：模板匹配原本在原图（如 3200×1800）上做，每帧非战斗页面 OCR 约 0.1 秒、模板匹配却要 0.1~0.5 秒。
+   改为把搜索区域和模板一起缩到 900 高再匹配，分数离阈值近的用原图复核（_small_find_feature）。
+   画面不到 1350 高、或调用带了自定义模板/灰度/边缘等参数时照原样匹配。
 
 另外修正一处与速度无关的问题：OCR 有时把一个按钮的文字切成两个框（实测国际服的「赋予灵光一闪」被切成
 「赋予灵光-」和「一闪」），而处理函数是拿固定的一个点去找按钮，这个点会落进两框之间的空隙，
@@ -84,6 +87,8 @@ _GRID = 10              # 文字中心按 10x10 网格量化后比较页面
 _SAME_PAGE = 0.6        # 与点击前文字布局相似度 >= 0.6 视为页面还没响应
 _STABLE = 0.75          # 相邻两次识别相似度 >= 0.75 视为文字已稳定
 _BUTTON_TOLERANCE = 0.02
+_NEAR_TEXT_X = 0.08       # 点击点旁边多近的文字可以拿来判断页面有没有响应（按画面宽、高的比例）
+_NEAR_TEXT_Y = 0.03
 _GATE_INTERVAL = 0.05   # 闸门等待期间尽快再识别
 _BATTLE_INTERVAL = 0.5  # 战斗中帧间隔：原版 1 秒；0.5 让回合边界（「结束回合」按钮回来/敌人行动完）发现更快，CPU 略升
 _STATS_EVERY = 30
@@ -124,8 +129,18 @@ _PREFETCH_MATCHES = (
 )
 _PREFETCH_OF = {name: (box, threshold) for name, box, threshold in _PREFETCH_MATCHES}
 _PREFETCH_KWARGS = {"feature_name", "box", "threshold"}
+# 缩小匹配：模板匹配原本在原图（如 3200×1800）上做，改为把搜索区域和模板一起缩到 900 高再匹配。
+# 分数落在「阈值 -0.10 ~ 阈值 +0.05」之间的再用原图复核，其余直接采信。
+# 10/10~10/11 三个现场包 316 次真实调用：耗时 7.55s → 2.36s，需复核 16 次，复核带外的判断与原图全部一致。
+_SMALL_HEIGHT = 900
+_SMALL_BELOW = 0.10
+_SMALL_ABOVE = 0.05
+_SMALL_KWARGS = {"feature_name", "box", "threshold", "frame", "limit", "horizontal_variance", "vertical_variance"}
+_FIND_DEFAULTS = {"use_gray_scale": False, "canny_lower": 0, "canny_higher": 0, "frame_processor": None,
+                  "template": None, "mask_function": None, "match_method": cv2.TM_CCOEFF_NORMED,
+                  "screenshot": False, "target_height": 0}
 _match_pool = None
-_ROUTE_TOLERANCE = 3        # 路线图标两次识别位置相差不超过 3 像素视为已停止入场动画
+_ROUTE_TOLERANCE = 3       # 路线图标两次识别位置相差不超过 3 像素视为已停止入场动画
 _ROUTE_MIN_SETTLE = 0.4     # 至少等 0.4 秒，防止图标依次出现时把“已出现的一部分”当成全部
 _ROUTE_POLL = 0.05
 _DECK_REGION = (0.274, 0.108, 0.929, 0.874)   # 与 recognize_cards_in_deck 的识别区域一致
@@ -226,6 +241,7 @@ def install(task):
         for name in ("sleep", "click", "click_box", "move", "scroll", "mouse_down", "mouse_up", "send_key", "run",
                      "find_feature")
     }
+    orig["find_feature"] = _small_find_feature(task, orig["find_feature"], lambda: st["active"])
     handlers = _handlers_module(task)
     _move_archive_before_stuck(handlers)
     st = {
@@ -321,9 +337,12 @@ def install(task):
 
     def find_feature(*args, **kwargs):
         name = kwargs.get("feature_name")
-        if not args and st["active"] and set(kwargs) <= _PREFETCH_KWARGS:
-            hit = _prefetch_hit(task, st, orig["find_feature"], name, kwargs)
+        plain = _prefetch_kwargs(kwargs) if not args and st["active"] else None
+        if plain is not None:
+            hit = _prefetch_hit(task, st, orig["find_feature"], name, plain)
             if hit is not None:
+                if kwargs.get("limit") == 1 and len(hit) > 1:
+                    hit = [max(hit, key=lambda b: b.confidence)]  # find_one 只要最好的那个，多了框架会报警告
                 return hit
         group = _GROUP_OF.get(name) if isinstance(name, str) else None
         if group is None or args or not st["active"] or not set(kwargs) <= _PREFETCH_KWARGS:
@@ -532,15 +551,33 @@ def _still_same_page(task, gate, texts, sig):
     box = gate["box"]
     if box is not None:
         # 点的是文字按钮：按钮文字还在原处，说明游戏还没响应这次点击
-        name, cx, cy = box
+        name, cx, cy = box[:3]
         dx, dy = _BUTTON_TOLERANCE * task.width, _BUTTON_TOLERANCE * task.height
-        return any(
+        in_place = any(
             b.name.strip() == name
             and abs(b.x + b.width / 2 - cx) <= dx
             and abs(b.y + b.height / 2 - cy) <= dy
             for b in texts
         )
+        if len(box) == 3 or not in_place:
+            return in_place
+        # 点在文字旁边（如事件选项卡片的空白处）：旁边的文字没动，还要整页也没变才算没响应
     return _similarity(sig, gate["sig"]) >= _SAME_PAGE
+
+
+def _nearest_text(task, texts, px, py):
+    """点击点没落在任何文字框里时，取它旁边最近的文字框（上下不超过 _NEAR_TEXT_Y、左右不超过 _NEAR_TEXT_X）。
+    事件选项是点在卡片中间、描述文字下方的空白处（文字左对齐，左右能差出 0.05）：选中后卡片上移约 0.06，
+    整页文字却几乎没变，只看整页相似度会一直等到原时长（实跑 10/11 11:20 两次各白等约 0.5 秒）。"""
+    best, best_d = None, None
+    for b in texts:
+        if not b.name.strip():
+            continue
+        dx = max(b.x - px, 0, px - (b.x + b.width)) / task.width
+        dy = max(b.y - py, 0, py - (b.y + b.height)) / task.height
+        if dx <= _NEAR_TEXT_X and dy <= _NEAR_TEXT_Y and (best_d is None or dx + dy < best_d):
+            best, best_d = b, dx + dy
+    return best
 
 
 def _note_action(task, st, point):
@@ -556,6 +593,10 @@ def _note_action(task, st, point):
         if hits:
             b = min(hits, key=lambda b: b.width * b.height)
             st["action_box"] = (b.name.strip(), b.x + b.width / 2, b.y + b.height / 2)
+        else:
+            near = _nearest_text(task, texts, px, py)
+            if near is not None:
+                st["action_box"] = (near.name.strip(), near.x + near.width / 2, near.y + near.height / 2, "near")
 
 
 def _pay_owed(st):
@@ -587,6 +628,39 @@ def _wrap_executor_next_frame(executor):
     executor._speedup_wrapped = True
 
 
+def _is_find_default(key, value):
+    if key not in _FIND_DEFAULTS:
+        return False
+    default = _FIND_DEFAULTS[key]
+    if default is None or value is None:
+        return value is default
+    return isinstance(value, (bool, int, float)) and value == default
+
+
+def _small_find_feature(task, find_feature, active):
+    """包一层 find_feature：加速生效、画面够大、调用只带区域/阈值这类普通参数时，先在缩小的画面上匹配，
+    分数离阈值近的再用原图复核（见 _SMALL_HEIGHT 处的说明）。返回框的位置和大小都已换算回原图。"""
+    def wrapped(*args, **kwargs):
+        if args or not active():
+            return find_feature(*args, **kwargs)
+        # find_one 会把所有参数按默认值显式传进来：取默认值的不算
+        kwargs = {k: v for k, v in kwargs.items() if not _is_find_default(k, v)}
+        if not set(kwargs) <= _SMALL_KWARGS or kwargs.get("limit", 0) not in (0, 1):
+            return find_feature(**kwargs)
+        frame = kwargs.get("frame")
+        if frame is None:
+            frame = task.executor.frame
+        if frame is None or frame.shape[0] < _SMALL_HEIGHT * 1.5:  # 框架只在原图高度 ≥1.5 倍时才缩
+            return find_feature(**kwargs)
+        threshold = kwargs.get("threshold") or getattr(task.executor.feature_set, "default_threshold", 0.8)
+        small = find_feature(**dict(kwargs, frame=frame, threshold=max(0.01, threshold - _SMALL_BELOW),
+                                    target_height=_SMALL_HEIGHT))
+        if any(box.confidence < threshold + _SMALL_ABOVE for box in small):
+            return find_feature(**dict(kwargs, frame=frame))
+        return small
+    return wrapped
+
+
 def _match_group(find_feature, group, frame, common):
     futures = {n: _pool().submit(find_feature, feature_name=n, frame=frame, **common) for n in group}
     return {n: f.result() for n, f in futures.items()}
@@ -613,6 +687,20 @@ def _prefetch_matches(task, find_feature, frame):
             kwargs["box"] = task.box_of_screen(*rel)
         futures[name] = _pool().submit(find_feature, **kwargs)
     return {name: f.result() for name, f in futures.items()}
+
+
+def _prefetch_kwargs(kwargs):
+    """调用能不能用预取结果回答：去掉取默认值的参数后只剩 feature_name/box/threshold 才行，否则返回 None。
+    find_one 会把所有参数按默认值显式传进来（frame=None、limit=1 …），以前因此一次都没用上预取，
+    预取算完的 memberinfo / 休息区闪光 / 休息区又被它串行重算一遍，每帧白花约 85ms（现场包 20261011-112116）。"""
+    plain = {}
+    for key, value in kwargs.items():
+        if _is_find_default(key, value) or key == "frame" and value is None \
+                or key in ("horizontal_variance", "vertical_variance") and value == 0 \
+                or key == "limit" and value in (0, 1):
+            continue
+        plain[key] = value
+    return plain if set(plain) <= _PREFETCH_KWARGS else None
 
 
 def _prefetch_hit(task, st, find_feature, name, kwargs):

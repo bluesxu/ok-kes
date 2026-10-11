@@ -1321,6 +1321,18 @@ class TestPrefetchMatches(unittest.TestCase):
         self.assertIn("memberinfo", task.calls)
         self.assertIn("memberinfo2", task.calls)
 
+    def test_find_one_style_kwargs_use_prefetch(self):
+        # find_one 把所有参数按默认值显式传进来：去掉默认值后同样能用预取（以前每帧白重算约 85ms）
+        find_one_kwargs = dict(feature_name="rest", horizontal_variance=0, vertical_variance=0, threshold=0,
+                               use_gray_scale=False, box="B", canny_lower=0, canny_higher=0, frame_processor=None,
+                               template=None, mask_function=None, frame=None, match_method=cv2.TM_CCOEFF_NORMED,
+                               screenshot=False, limit=1, target_height=0)
+        self.assertEqual({"feature_name": "rest", "threshold": 0, "box": "B"},
+                         speedup._prefetch_kwargs(find_one_kwargs))
+        for extra in ({"use_gray_scale": True}, {"limit": 3}, {"frame": np.zeros((2, 2, 3), np.uint8)},
+                      {"template": np.zeros((2, 2, 3), np.uint8)}):
+            self.assertIsNone(speedup._prefetch_kwargs(dict(find_one_kwargs, **extra)), list(extra))
+
     def test_new_frame_refreshes_prefetch(self):
         task = self._Task()
         st = {}
@@ -1330,6 +1342,114 @@ class TestPrefetchMatches(unittest.TestCase):
         speedup._prefetch_hit(task, st, task.find_feature, "rest",
                               {"box": task.box_of_screen(0.157, 0.503, 0.467, 0.863), "threshold": 0})
         self.assertEqual(len(task.calls), first * 2)  # 新帧要重新预取整批
+
+
+class TestGateNearText(unittest.TestCase):
+    """点在文字旁边的空白处（事件选项卡片）：旁边的文字移走就算页面响应了，不用等整页变化。
+    文字取自现场包 20261011-112116 54.05s 那一帧（3200×1800），点击点 (0.5018, 0.8547)。"""
+
+    PAGE = [("1155/1592", 540, 46, 277, 47), ("124", 2287, 53, 116, 73), ("CTRL", 2747, 119, 133, 46),
+            ("传送门的另一侧是个堆满宝物的华丽空间", 1117, 381, 933, 56), ("①", 1563, 1320, 70, 53),
+            ("ENTER", 2943, 1641, 164, 43)]
+
+    def texts(self, option_y):
+        rows = self.PAGE + [("离开", 1247, option_y, 106, 60), ("事件结束", 1253, option_y + 63, 210, 66)]
+        return [SimpleNamespace(name=n, x=x, y=y, width=w, height=h) for n, x, y, w, h in rows]
+
+    def gate_after_click(self, point):
+        task = SimpleNamespace(width=3200, height=1800, all_texts=self.texts(1406),
+                               log_info=lambda message: None, info_set=lambda *args: None)
+        st = {"actions": 0, "moved": False, "planned": 0.0, "actual": 0.0, "count": 0, "saved_total": 0.0}
+        speedup._note_action(task, st, point)
+        st.update(gate={"sig": st["action_sig"], "box": st["action_box"], "start": 0, "until": 1e12,
+                        "changed": False}, prev_sig=None)
+        return task, st
+
+    def test_option_moved_up_counts_as_response(self):
+        task, st = self.gate_after_click((0.5018 * 3200, 0.8547 * 1800))
+        self.assertEqual("事件结束", st["action_box"][0])
+        self.assertTrue(speedup._gate_blocks(task, st, self.texts(1406)))   # 还没动
+        self.assertTrue(speedup._gate_blocks(task, st, self.texts(1294)))   # 选中后卡片上移：刚变化，再看一次
+        st["gate"]["until"] = 1e12
+        self.assertFalse(speedup._gate_blocks(task, st, self.texts(1294)))  # 稳定了就放行
+
+    def test_far_click_keeps_whole_page_rule(self):
+        task, st = self.gate_after_click((0.20 * 3200, 0.60 * 1800))
+        self.assertIsNone(st["action_box"])
+
+    def test_static_near_text_does_not_hold_after_page_change(self):
+        # 旁边的文字没动，但整页都换了：照样算响应
+        task, st = self.gate_after_click((0.5018 * 3200, 0.8547 * 1800))
+        new_page = [SimpleNamespace(name=n, x=x, y=y, width=w, height=h) for n, x, y, w, h in
+                    [("事件结束", 1253, 1469, 210, 66), ("装备", 1900, 150, 120, 60), ("请选择战斗员。", 2700, 150, 300, 50),
+                     ("确认", 2880, 1635, 133, 76), ("提炼", 1900, 1635, 120, 76)]]
+        self.assertTrue(speedup._gate_blocks(task, st, new_page))
+        self.assertFalse(speedup._gate_blocks(task, st, new_page))
+
+
+class TestSmallMatch(unittest.TestCase):
+    """缩小匹配：先在 900 高的画面上匹配，分数离阈值近的用原图复核；不满足条件的调用原样转给 find_feature。"""
+
+    def make(self, small_conf, full_conf=0.9, height=1800, active=True):
+        calls = []
+
+        def find_feature(**kwargs):
+            calls.append(kwargs)
+            conf = small_conf if kwargs.get("target_height") else full_conf
+            threshold = kwargs.get("threshold") or 0.8
+            return [SimpleNamespace(confidence=conf, name=kwargs.get("feature_name"))] if conf >= threshold else []
+
+        task = SimpleNamespace(executor=SimpleNamespace(frame=np.zeros((height, height * 16 // 9, 3), np.uint8),
+                                                        feature_set=SimpleNamespace(default_threshold=0.8)))
+        return speedup._small_find_feature(task, find_feature, lambda: active), calls
+
+    def test_clear_hit_uses_small_result_only(self):
+        wrapped, calls = self.make(small_conf=0.95)
+        self.assertEqual([0.95], [b.confidence for b in wrapped(feature_name="rest", threshold=0.8)])
+        self.assertEqual(1, len(calls))
+        self.assertEqual(900, calls[0]["target_height"])
+        self.assertAlmostEqual(0.7, calls[0]["threshold"])  # 放低阈值，看得到复核带里的分数
+
+    def test_clear_miss_returns_empty_without_full_match(self):
+        wrapped, calls = self.make(small_conf=0.5)
+        self.assertEqual([], wrapped(feature_name="rest", threshold=0.8))
+        self.assertEqual(1, len(calls))
+
+    def test_near_threshold_rechecks_on_full_frame(self):
+        # 实测 event4 原图 0.703、缩小后低于 0.70：落在复核带里就以原图为准
+        for small in (0.62, 0.68, 0.74):  # 阈值 0.7 的复核带是 [0.60, 0.75)
+            wrapped, calls = self.make(small_conf=small, full_conf=0.703)
+            self.assertEqual([0.703], [b.confidence for b in wrapped(feature_name="event4", threshold=0.7)])
+            self.assertEqual(2, len(calls))
+            self.assertNotIn("target_height", calls[1])
+
+    def test_default_threshold_from_feature_set(self):
+        wrapped, calls = self.make(small_conf=0.82, full_conf=0.81)
+        self.assertEqual([0.81], [b.confidence for b in wrapped(feature_name="rest", threshold=0)])
+        self.assertEqual(2, len(calls))  # 默认阈值 0.8：0.82 在复核带里
+
+    def test_find_one_style_defaults_still_downscale(self):
+        wrapped, calls = self.make(small_conf=0.95)
+        wrapped(feature_name="rest", horizontal_variance=0, vertical_variance=0, threshold=0.8, use_gray_scale=False,
+                box=None, canny_lower=0, canny_higher=0, frame_processor=None, template=None, mask_function=None,
+                frame=None, match_method=cv2.TM_CCOEFF_NORMED, screenshot=False, limit=1, target_height=0)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(900, calls[0]["target_height"])
+
+    def test_passthrough_cases(self):
+        cases = [
+            ({"active": False}, {}),
+            ({"height": 1080}, {}),  # 画面不到 1350 高：框架本来就不缩
+            ({}, {"template": np.zeros((5, 5, 3), np.uint8)}),
+            ({}, {"use_gray_scale": True}),
+            ({}, {"canny_lower": 50, "canny_higher": 150}),
+            ({}, {"limit": 3}),
+        ]
+        for make_kwargs, extra in cases:
+            wrapped, calls = self.make(small_conf=0.95, **make_kwargs)
+            wrapped(feature_name="rest", threshold=0.8, **extra)
+            self.assertEqual(1, len(calls), (make_kwargs, list(extra)))
+            self.assertNotIn("target_height", calls[0], (make_kwargs, list(extra)))
 
 
 if __name__ == '__main__':
