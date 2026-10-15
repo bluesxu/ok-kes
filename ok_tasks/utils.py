@@ -4655,6 +4655,11 @@ def handle_rest(task: TriggerTask):
     else:
         meditation_cost = None
 
+    if not rest_feature and not meditate_feature:
+        # 不是休息区：不读信用点、生命值，只看德朗商店入口。休息区判断时读不到信用点会重新截图识别几次
+        # （speedup._credit_reader_wrapper，约 1.7 秒），战斗画面没有信用点，原来卡厄思每个战斗帧都白等这么久
+        return _enter_shop_from_rest(task)
+
     meditation_state = _member_deck_state(task).get("冥想", {})
     has_pending_meditation = (
         isinstance(meditation_state, dict)
@@ -4724,8 +4729,11 @@ def handle_rest(task: TriggerTask):
 
     if rest_feature and "免费" not in free_text:
         task.log_info("检测到rest特征，但休息区域未找到「免费」，跳过点击休息")
+    return _enter_shop_from_rest(task)
 
-    # 检测是否需要进入德朗商店
+
+def _enter_shop_from_rest(task: TriggerTask):
+    """休息区上方的「德朗商店」入口：配置要进商店时点进去。"""
     shop_box = find_box_at_point(task, 0.360, 0.138)
     if shop_box and "德朗商店" in shop_box.name and hasattr(task, 'node_status') and task.node_status.get('shop', False):
         task.log_info("检测到德朗商店，且 node_status['shop']=True，进入商店")

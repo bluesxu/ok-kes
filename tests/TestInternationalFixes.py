@@ -355,6 +355,22 @@ class TestChaosRest(unittest.TestCase):
         self.assertTrue(utils.handle_rest(task))
         self.assertEqual(["meditate"], task.clicked)
 
+    def test_other_pages_skip_reading_credit(self):
+        # 战斗画面没有信用点：原来每帧都在这里重新截图识别约 1.7 秒（实跑 10/15 卡厄思战斗帧约 2 秒一帧）
+        task = PageTask([hp(1100)])
+        with unittest.mock.patch.object(utils, "_get_current_credit") as credit, \
+                unittest.mock.patch.object(utils, "_get_current_hp") as current_hp:
+            self.assertFalse(utils.handle_rest(task))
+        credit.assert_not_called()
+        current_hp.assert_not_called()
+        self.assertEqual([], task.clicked)
+
+    def test_shop_entry_still_works_off_rest_features(self):
+        task = PageTask([("德朗商店", 0.360, 0.138)])
+        task.node_status["shop"] = True
+        self.assertTrue(utils.handle_rest(task))
+        self.assertEqual(["德朗商店"], task.clicked)
+
 
 # 零式系统初始页面（2026-09-30 更新后的法典卡片：不再显示存储数据价值层级，改为存档储存上限）
 ZERO_SYSTEM = [("零號系統", 0.120, 0.046), ("進入", 0.930, 0.910)]
