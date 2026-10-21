@@ -1276,33 +1276,25 @@ class TestMemoryCarving(unittest.TestCase):
 
 
 class TestChaosFunctionSelect(unittest.TestCase):
-    """卡厄思模式战斗中「請選擇功能。」页：自动战斗 3 秒没选就随机点一张，离开页面计时清零。"""
+    """卡厄思模式战斗中「請選擇功能。」页：自动战斗不会选，检测到就随机点一张。"""
 
     PAGE = [("請選擇功能。", 0.507, 0.131, 0.15), ("創造：○", 0.231, 0.289), ("創造：△", 0.482, 0.289)]
 
-    def run_page(self, cards):
-        task = PageTask(self.PAGE)
+    def run_page(self, cards, page=PAGE):
+        task = PageTask(page)
         with unittest.mock.patch.object(utils_chaos, "recognize_cards", lambda task, page=None: [dict(c) for c in cards]),                 unittest.mock.patch.object(utils_chaos.random, "choice", lambda seq: seq[-1]):
-            self.assertTrue(utils_chaos.handle_card_function_select(task))
-            self.assertTrue(utils_chaos.handle_card_function_select(task))
-            self.assertEqual([], task.clicked)  # 刚出现，先等自动战斗
-            task.function_select_seen -= utils_chaos._FUNCTION_SELECT_WAIT + 1
-            self.assertTrue(utils_chaos.handle_card_function_select(task))
-            clicked = list(task.clicked)
-            self.assertTrue(utils_chaos.handle_card_function_select(task))
-            self.assertEqual(clicked, task.clicked)  # 点完再等一轮，不连点
-            task.show([])
-            self.assertFalse(utils_chaos.handle_card_function_select(task))
-            self.assertIsNone(task.function_select_seen)
-        return clicked
+            handled = utils_chaos.handle_card_function_select(task)
+        return handled, task.clicked
 
     def test_clicks_recognized_card(self):
         cards = [{"name": "创造：○", "x": 0.249, "y": 0.4}, {"name": "创造：□", "x": 0.751, "y": 0.4}]
-        self.assertEqual(["(0.751, 0.400)"], self.run_page(cards))
+        self.assertEqual((True, ["(0.751, 0.400)"]), self.run_page(cards))
 
     def test_falls_back_to_fixed_points(self):
-        self.assertEqual(["(0.751, 0.530)"], self.run_page([]))
+        self.assertEqual((True, ["(0.751, 0.530)"]), self.run_page([]))
 
+    def test_other_page_ignored(self):
+        self.assertEqual((False, []), self.run_page([], page=[("獲得卡牌", 0.502, 0.128)]))
 
 if __name__ == '__main__':
     unittest.main()
