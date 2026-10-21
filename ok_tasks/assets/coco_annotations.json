@@ -287,6 +287,12 @@
             "file_name": "images/0.png",
             "width": 1920,
             "height": 1080
+        },
+        {
+            "id": 173,
+            "file_name": "images/3.png",
+            "width": 1920,
+            "height": 1080
         }
     ],
     "annotations": [
@@ -1316,6 +1322,19 @@
             ],
             "area": 5427,
             "iscrowd": 0
+        },
+        {
+            "id": 80,
+            "image_id": 173,
+            "category_id": 80,
+            "bbox": [
+                625,
+                498,
+                57,
+                74
+            ],
+            "area": 4218,
+            "iscrowd": 0
         }
     ],
     "categories": [
@@ -1712,6 +1731,11 @@
         {
             "id": 79,
             "name": "meditate",
+            "supercategory": ""
+        },
+        {
+            "id": 80,
+            "name": "rest_bubble",
             "supercategory": ""
         }
     ]

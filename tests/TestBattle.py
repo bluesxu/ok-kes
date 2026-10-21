@@ -2196,25 +2196,62 @@ class TestFlash(unittest.TestCase):
             self.assertFalse(utils.handle_view_original(task))  # 锁定还在，不会改点
             self.assertEqual(1, len(clicks))
 
-    def test_view_original_waits_when_cards_not_visible(self):
-        """效果页白闪时牌还没出来：占住这一帧，不能把「跳过」交给后面的处理函数。"""
-        clicks = []
+    def empty_flash_page(self, skip_button=False):
+        """看不到牌的三选一页：只剩标题和右上「查看内容」（10/18 19:39 现场包，战斗中的灵光一闪白光散了牌没出来）。"""
         task = flash_task(闪光优先级=["音乐开始:琶音"])
         task.width, task.height = 2560, 1440
         task.all_texts = [
             Box(1021, 154, 515, 68, name="请选择灵光一闪效果。"),
             Box(2224, 161, 168, 56, name="查看内容"),
-            Box(2381, 1308, 107, 61, name="跳过"),
-        ]
+        ] + ([Box(2381, 1308, 107, 61, name="跳过")] if skip_button else [])
+        task.keys, task.clicks, task.anomalies = [], [], []
+        task.send_key = task.keys.append
+        task.sleep = lambda s: None
+        return task
+
+    def view_empty(self, task):
         with mock.patch.object(utils, "_get_game_text", lambda task, text: {
                 "查看原件": "查看内容", "查看之前的闪光": "查看先前的灵光一闪"}.get(text, text)), \
                 mock.patch.object(utils, "recognize_cards", lambda task, page="": []), \
-                mock.patch.object(utils, "_move_and_click", lambda task, x, y: clicks.append((x, y))):
-            self.assertTrue(utils.handle_view_original(task))
-            self.assertEqual([], clicks)
-            task._flash_choice_empty_since -= 5
-            self.assertFalse(utils.handle_view_original(task))  # 等不及了才放手
-            self.assertEqual([], clicks)
+                mock.patch.object(utils, "_move_and_click", lambda task, x, y: task.clicks.append((x, y))), \
+                mock.patch.object(battle_log, "anomaly", lambda task, kind, detail, **k: task.anomalies.append(kind)), \
+                mock.patch.object(battle_log, "record", lambda *a, **k: None):
+            return utils.handle_view_original(task)
+
+    def test_view_original_waits_when_cards_not_visible(self):
+        """效果页白闪时牌还没出来：占住这一帧，不能把「跳过」交给后面的处理函数；等满 4 秒还看不到牌才按 1。"""
+        task = self.empty_flash_page(skip_button=True)
+        self.assertTrue(self.view_empty(task))
+        self.assertEqual(([], []), (task.keys, task.clicks))
+        task._flash_choice_empty_since -= 5
+        self.assertTrue(self.view_empty(task))  # 等满了也不点「跳过」，按 1 选第一个版本
+        self.assertEqual((["1"], []), (task.keys, task.clicks))
+
+    def test_cards_never_show_presses_1_then_waits_for_the_page(self):
+        """牌一直不出来（原来交给后面的处理函数，没人接，10/18 19:41 卡了 18 分钟）：按 1，按完等页面响应再说。"""
+        task = self.empty_flash_page()
+        self.assertTrue(self.view_empty(task))
+        task._flash_choice_empty_since -= 5
+        self.assertTrue(self.view_empty(task))
+        self.assertEqual(["1"], task.keys)
+        self.assertEqual(["闪光页看不到牌"], task.anomalies)
+        self.assertTrue(self.view_empty(task))  # 刚按过：不重复按
+        self.assertEqual(["1"], task.keys)
+        task._flash_choice_clicked_at -= 5      # 页面一直没反应：重新等满再按
+        self.assertTrue(self.view_empty(task))
+        self.assertEqual(["1"], task.keys)
+        task._flash_choice_empty_since -= 5
+        self.assertTrue(self.view_empty(task))
+        self.assertEqual(["1", "1"], task.keys)
+
+    def test_wait_left_over_from_an_earlier_page_restarts(self):
+        """上一页没等完就离开留下的计时不算（10/15 15:43 新的一页一出来就判超时，白闪中点了「跳过」）。"""
+        task = self.empty_flash_page()
+        task._flash_choice_empty_since = time.time() - 30
+        task._flash_choice_empty_seen = time.time() - 26
+        self.assertTrue(self.view_empty(task))
+        self.assertEqual([], task.keys)
+        self.assertLess(time.time() - task._flash_choice_empty_since, 1)
 
 
 def read_frame(name):

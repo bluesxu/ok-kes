@@ -190,10 +190,11 @@ _STORAGE_READ_RETRIES = 3       # 零式系统页连续几帧读不到存档价�
 # 「选择刻印的记忆」页（零式系统「雪上凝结的约定」）：标题区域，三张记忆卡的区域（牌名 + 描述）
 _MEMORY_TITLE = (0.35, 0.03, 0.65, 0.20)
 _MEMORY_CARDS = ((0.138, 0.20, 0.360, 0.76), (0.389, 0.20, 0.611, 0.76), (0.640, 0.20, 0.862, 0.76))
+_MEMORY_NAME_BOTTOM = 0.35   # 牌名「记忆：贪婪」在卡顶部（实跑纵坐标约 0.24），以下是描述（约 0.60）
 _MEMORY_CARD_Y = 0.48
 _MEMORY_CONFIRM = (0.80, 0.86, 0.99, 0.99)
 _MEMORY_REFRESH_Y = (0.79, 0.86)   # 每张记忆卡下方的「重新搜索 3/3」，只换掉这一张
-_MEMORY_DEFAULT_PRIORITY = ["触发韧性伤害"]
+_MEMORY_DEFAULT_KEYWORD = "触发韧性伤害"
 
 
 def install(task):
@@ -223,17 +224,17 @@ def install(task):
         if isinstance(config_type, dict):
             config_type.setdefault(STORAGE_CAPACITY_KEY, {"min": 0, "max": 999})
             config_type.setdefault(MEMORY_DEFAULT_KEY, {"type": "drop_down", "options": ["1", "2", "3", "随机"]})
-        task.default_config.setdefault(MEMORY_PRIORITY_KEY, list(_MEMORY_DEFAULT_PRIORITY))
+        task.default_config.setdefault(MEMORY_PRIORITY_KEY, _MEMORY_DEFAULT_KEYWORD)
         task.default_config.setdefault(MEMORY_DEFAULT_KEY, "1")
         task.config_description[MEMORY_PRIORITY_KEY] = (
-            "「选择刻印的记忆」页按列表顺序选第一张包含该关键词的记忆卡（牌名或描述，如「贪婪」「全体攻击」），"
-            "三张都不含时先用卡下方的「重新搜索」刷新"
+            "「选择刻印的记忆」页选包含这个关键词的记忆卡（只填一个，如「贪婪」「全体攻击」）：先对三张的牌名，都不含再对描述；"
+            "三张都不含时先用卡下方的「重新搜索」刷新，留空按默认选择"
         )
         task.config_description[MEMORY_DEFAULT_KEY] = "记忆卡牌优先级都没匹配上时选第几张"
         task.default_config.setdefault(MEMORY_PROCESS_KEY, [])
         task.config_description[MEMORY_PROCESS_KEY] = (
             "记忆雕琢完成后的「记忆加工」页按列表顺序选第一张描述包含该关键词的卡（如「攻击力」「伤害量」），"
-            "几张都包含时选百分比大的；都不包含时选百分比最大的"
+            "几张都包含时选百分比大的；都不包含时选百分比最大的；不填则不做记忆加工，雕琢完成直接离开"
         )
 
     orig = {
@@ -1551,28 +1552,31 @@ def _patch_memory_imprint():
     handlers.insert(index, handle_memory_imprint)
 
 
-def match_memory(texts, priority):
-    """texts 为三张记忆卡的文字。按优先级顺序找第一个有卡包含的关键词，返回 (第几张 0~2, 理由)，都没有返回 None。"""
-    cleaned = [_PUNCTUATION.sub("", t) for t in texts]
+def match_memory(names, descriptions, priority):
+    """names / descriptions 为三张记忆卡的牌名和描述。按优先级顺序找第一个有卡包含的关键词，
+    同一个关键词先对三张的牌名，牌名都不含再对描述；返回 (第几张 0~2, 理由)，都没有返回 None。"""
+    cleaned_names = [_PUNCTUATION.sub("", t) for t in names]
+    cleaned_descriptions = [_PUNCTUATION.sub("", t) for t in descriptions]
     for word in priority:
         key = _PUNCTUATION.sub("", str(word))
         if not key:
             continue
-        for index, text in enumerate(cleaned):
-            if key in text:
-                return index, f"记忆卡牌优先级「{word}」"
+        for part, cleaned in (("牌名", cleaned_names), ("描述", cleaned_descriptions)):
+            for index, text in enumerate(cleaned):
+                if key in text:
+                    return index, f"记忆卡牌优先级「{word}」，{part}"
     return None
 
 
-def choose_memory(texts, priority, default):
+def choose_memory(names, descriptions, priority, default):
     """返回 (第几张 0~2, 理由)。按优先级匹配；都没有时按默认选择（「1」~「3」或「随机」）。"""
-    matched = match_memory(texts, priority)
+    matched = match_memory(names, descriptions, priority)
     if matched is not None:
         return matched
     if default == "随机":
-        return random.randrange(len(texts)), "没有匹配的记忆卡，随机选"
+        return random.randrange(len(names)), "没有匹配的记忆卡，随机选"
     try:
-        index = min(max(int(default), 1), len(texts)) - 1
+        index = min(max(int(default), 1), len(names)) - 1
     except (TypeError, ValueError):
         index = 0
     return index, f"没有匹配的记忆卡，按默认选第{index + 1}张"
@@ -1589,12 +1593,15 @@ def handle_memory_imprint(task):
                     and y1 <= (b.y + b.height / 2) / task.height <= y2), None)
     if confirm is not None and utils.is_button_active(task, confirm):
         return False  # 已经选好：交给 handle_confirm 点确认
-    texts = [utils._get_region_text(task, region) for region in _MEMORY_CARDS]
-    priority = utils._get_config_value(task, MEMORY_PRIORITY_KEY, [])
-    if isinstance(priority, str):
-        priority = [priority]
+    names = [utils._get_region_text(task, (x1, y1, x2, _MEMORY_NAME_BOTTOM)) for x1, y1, x2, _ in _MEMORY_CARDS]
+    descriptions = [utils._get_region_text(task, (x1, _MEMORY_NAME_BOTTOM, x2, y2)) for x1, _, x2, y2 in _MEMORY_CARDS]
+    texts = [name + description for name, description in zip(names, descriptions)]
+    keyword = utils._get_config_value(task, MEMORY_PRIORITY_KEY, "")
+    if isinstance(keyword, list):  # 旧版是列表，导入旧配置码时只取第一个
+        keyword = keyword[0] if keyword else ""
+    priority = [keyword] if str(keyword).strip() else []
     default = utils._get_config_value(task, MEMORY_DEFAULT_KEY, "1")
-    if priority and any(texts) and match_memory(texts, priority) is None:
+    if priority and any(texts) and match_memory(names, descriptions, priority) is None:
         for slot, region in enumerate(_MEMORY_CARDS, 1):
             refresh = utils._get_region_text(task, (region[0], _MEMORY_REFRESH_Y[0], region[2], _MEMORY_REFRESH_Y[1]))
             count = re.search(r"(\d+)\s*/\s*\d+", refresh)
@@ -1605,7 +1612,7 @@ def handle_memory_imprint(task):
                 utils._move_and_click(task, (region[0] + region[2]) / 2, sum(_MEMORY_REFRESH_Y) / 2)
                 task.sleep(1)
                 return True
-    index, reason = choose_memory(texts, priority, default)
+    index, reason = choose_memory(names, descriptions, priority, default)
     task.log_info(f"选择刻印的记忆：选第{index + 1}张（{reason}），三张=「{'」「'.join(texts)}」")
     if not any(texts):
         battle_log.anomaly(task, "记忆卡读不到文字", "三张记忆卡区域都没有文字，按默认选择")

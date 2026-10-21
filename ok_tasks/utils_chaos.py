@@ -22,7 +22,7 @@ from utils import (
     handle_equipment_recast,
     handle_stuck_log, handle_expedition_result,
     is_button_active, is_subsequence, _clean_match,
-    handle_shop,
+    handle_shop, handle_rest_bubble,
     handle_escape,
     # handle_stage_clear,
     handle_auto_stop,
@@ -30,6 +30,7 @@ from utils import (
 
 import re
 import random
+import time
 
 
 # ------------------------- 卡厄思模式独有页面处理函数 -------------------------
@@ -524,9 +525,15 @@ def _carve_button_active(task: TriggerTask, point=_CARVE_BUTTON_COLOR):
     return red > blue + 60
 
 
+def _memory_process_wanted(task: TriggerTask):
+    """「记忆加工优先级」没填（空列表或只有空白项）时不做记忆加工，雕琢完成就直接离开。"""
+    priority = _get_config_value(task, "记忆加工优先级", [])
+    return isinstance(priority, list) and any(str(word).strip() for word in priority)
+
+
 def handle_memory_carving(task: TriggerTask):
     """「记忆雕琢」页（零式系统 boss 后选「雕琢记忆」进来）：一直点右边的「记忆雕琢」；变成「雕琢完成」后
-    左边的「记忆加工」可点（只能 1 次），点进去选一张（见 handle_memory_processing）；都做完或按钮变灰（水晶不够）
+    左边的「记忆加工」可点（只能 1 次），「记忆加工优先级」填了才点进去选一张（见 handle_memory_processing）；都做完或按钮变灰（水晶不够）
     后点「离开」，并记下本节点已雕琢过，回到事件页改选离开（否则事件页又选雕琢，来回进出）。"""
     title = find_box_at_point(task, 0.501, 0.128)
     if not (title and "记忆雕琢" in title.name):
@@ -547,7 +554,7 @@ def handle_memory_carving(task: TriggerTask):
     process = next((box for box in task.all_texts if "记忆加工" in box.name
                     and (box.x + box.width / 2) / task.width < 0.4 and (box.y + box.height / 2) / task.height > 0.7), None)
     node_status = getattr(task, "node_status", {})
-    if (finished and process and not node_status.get("memory_processed", False)
+    if (finished and process and not node_status.get("memory_processed", False) and _memory_process_wanted(task)
             and _carve_button_active(task, _PROCESS_BUTTON_COLOR)):
         task.log_info("记忆雕琢：雕琢已完成，点击「记忆加工」")
         battle_log.record(task, "记忆雕琢", choice="加工", rate=rate)
@@ -609,6 +616,38 @@ def handle_event_dialog(task: TriggerTask):
     （utils_sortie 在模块开头就导入本模块，这里放到调用时再导入，避免循环导入）。"""
     from utils_sortie import handle_event_dialog as handle
     return handle(task)
+
+
+_FUNCTION_SELECT_WAIT = 3  # 「请选择功能」页停这么久自动战斗还没选，才替它随机选
+_FUNCTION_SELECT_POINTS = [(0.249, 0.53), (0.500, 0.53), (0.751, 0.53)]  # 三张牌的中心
+
+
+def handle_card_function_select(task: TriggerTask):
+    """战斗中打出的牌弹出「请选择功能」（如量子晶种预测的三张创造牌），自动战斗有时不选、卡在这页。
+    页面停留超过 _FUNCTION_SELECT_WAIT 秒就随机点一张；识别不到牌时按三张牌的固定位置随机点。"""
+    title = find_box_at_point(task, 0.499, 0.131)
+    if not (title and "请选择功能" in title.name):
+        task.function_select_seen = None
+        return False
+    now = time.time()
+    seen = getattr(task, "function_select_seen", None)
+    if seen is None:
+        task.function_select_seen = now
+        return True
+    if now - seen < _FUNCTION_SELECT_WAIT:
+        return True
+    cards = recognize_cards(task, page="卡牌功能选择页面")
+    if cards:
+        chosen = random.choice(cards)
+        task.log_info(f"「请选择功能」页停了 {now - seen:.0f} 秒没选，随机点击卡牌「{chosen['name']}」")
+        _move_and_click(task, chosen["x"], chosen["y"])
+    else:
+        x, y = random.choice(_FUNCTION_SELECT_POINTS)
+        task.log_info(f"「请选择功能」页停了 {now - seen:.0f} 秒没选，没识别到牌，随机点击 ({x:.3f}, {y:.3f})")
+        _move_and_click(task, x, y)
+    task.function_select_seen = now  # 点了没反应的话再等一轮才重点
+    task.sleep(1)
+    return True
 
 
 def handle_chaos_craft(task: TriggerTask):
@@ -1141,6 +1180,7 @@ PAGE_HANDLERS = [
     handle_close_page, #点击屏幕关闭页面，优先于其他普通页面处理
     handle_threat_detection, #威胁侦测过场页，按 ESC 关闭
     handle_event_dialog, #剧情对话停住时按空格翻页（实跑 10/01 11:47 停了 2 分半，ESC 没用）
+    handle_card_function_select, #战斗中「请选择功能」页，自动战斗 3 秒没选就随机选一张
 
     handle_refine_equipment_credit, #提炼装备信用点页面，优先于确认按钮
     handle_dont_show_again, #带「今天不再显示 / 下次登入前不再显示」的确认框：先勾上再确认
@@ -1154,6 +1194,7 @@ PAGE_HANDLERS = [
     handle_mask_card, #面具卡牌获得页面
     handle_convert, #转换按钮
     handle_shop, #德朗商店
+    handle_rest_bubble, #休息区人物头顶的气泡，遇到就点，排在休息/冥想前面
     handle_rest, #休息/商店入口
     handle_close_button, #关闭按钮
     handle_remove, #移除按钮

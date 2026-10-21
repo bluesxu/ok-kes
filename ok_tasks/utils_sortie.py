@@ -18,7 +18,7 @@ from utils import (
     handle_remove, handle_three_choice_card_remove, handle_flash, handle_reflash, handle_grant_flash, handle_copy, handle_convert, handle_equipment_recast, handle_weakness_info, handle_minimizemap,
     handle_held_cards_page,
     handle_stuck_log, is_button_active, _clean_match, has_pile_title,
-    handle_shop, handle_expedition_result,
+    handle_shop, handle_expedition_result, handle_rest_bubble,
     handle_escape,
     _get_current_credit, _get_current_hp_percent, _get_region_text,
     _find_rest_feature, _wait_for_rest_confirm, _retry_rest_reading,
@@ -1270,6 +1270,7 @@ PAGE_HANDLERS = [
     handle_confirm, #确认按钮
     handle_convert, #转换按钮
     handle_shop, #德朗商店
+    handle_rest_bubble, #休息区人物头顶的气泡，遇到就点，排在休息/闪光前面
     handle_rest_sortie, #休息/商店入口
     handle_close_button, #关闭按钮
     handle_remove, #移除按钮

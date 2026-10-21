@@ -1,5 +1,6 @@
 from ok import Box, TriggerTask
 
+import difflib
 import re
 import random
 import time
@@ -2444,14 +2445,27 @@ def handle_dont_show_again(task: TriggerTask):
     return True
 
 
+def _is_inline_text(task: TriggerTask, box):
+    """同一行右边紧挨着还有别的文字（间距不到一个字高）：box 是一句话被 OCR 切出来的开头，不是单独的按钮。
+    实跑 10/18：「確認【盜獵者的樂趣】資訊」被切成「確認」和「【盜獵者的樂趣】資訊」，间距 3~23 像素、字高 50。"""
+    return any(
+        other is not box
+        and abs((other.y + other.height / 2) - (box.y + box.height / 2)) < box.height / 2
+        and -box.height < other.x - (box.x + box.width) < box.height
+        for other in task.all_texts
+    )
+
+
 def handle_center_confirm(task: TriggerTask):
-    """页面中央的"确认"按钮。"""
+    """页面中央的"确认"按钮。事件选项说明里切出来的「确认」不算（实跑 10/18 一个事件卡了 7~19 分钟：
+    点它等于选中选项 1，把刚选的选项 3 顶掉，两边来回点）。"""
     confirm_region = (0.009, 0.168, 0.977, 0.875)
     box = next(
         (
             text_box
             for text_box in task.all_texts
             if _is_confirm_text(text_box.name)
+            and not _is_inline_text(task, text_box)
             and confirm_region[0]
             <= (text_box.x + text_box.width / 2) / task.width
             <= confirm_region[2]
@@ -4031,6 +4045,25 @@ def _is_info_option(description):
     return re.search(r"确认.{0,2}【.*资讯", description) is not None
 
 
+_EVENT_CHECK_ONCE_SECONDS = 300  # 同一事件页的放大镜多久内只点一次
+_EVENT_F1_ICON_BELOW = 0.045  # 事件页 F1 图标中心在「F1」标签下方多远（按画面高的比例）
+
+
+def _find_event_f1_icon(task: TriggerTask, region):
+    """新版本事件页中间顶着「F1」标签的图标（用户 10/21 要求遇到就点，常开）：图案每个事件不一样
+    （紫色徽记、黑底菱形旗），按标签文字找，返回标签下方图标的框。休息区右下角「跳过」上的 F1 不在这个区域里。"""
+    label = next((box for box in task.all_texts if box.name.strip().upper() == "F1"
+                  and region[0] <= (box.x + box.width / 2) / task.width <= region[2]
+                  and region[1] <= (box.y + box.height / 2) / task.height <= region[3]), None)
+    if not label:
+        return None
+    size = label.width
+    cx = label.x + label.width / 2
+    cy = label.y + label.height / 2 + _EVENT_F1_ICON_BELOW * task.height
+    return Box(round(cx - size / 2), round(cy - size / 2), round(size), round(size),
+               confidence=label.confidence, name="F1图标")
+
+
 def handle_event_task(task: TriggerTask):
     """事件任务页面: 识别事件选项特征和描述，按任务优先级选择推进。"""
     bottom_box = find_box_at_point(task, 0.516, 0.971)
@@ -4094,11 +4127,24 @@ def handle_event_task(task: TriggerTask):
         check_features,
         key=lambda feature: feature.confidence,
         default=None,
-    )
+    ) or _find_event_f1_icon(task, (0.396, 0.286, 0.960, 0.718))
+    # check2 是事件页中间的放大镜（调查），平时点了弹出说明；有的事件（实跑 10/18「盗猎者」）点了没反应，
+    # 放大镜一直在，每帧都优先点它、选项永远选不上：同一事件页只点一次。
+    # 选项描述每帧 OCR 会差一两个字（「確認「【」「80 增加」），按相似度认是不是同一页；
+    # 节点序号每层重新数，加上时限，免得下一层同一位置碰到同一个事件时不点
+    page_key = (task.node_status.get("node_count") if hasattr(task, "node_status") else None,
+                "".join(re.sub(r"\W", "", t["description"]) for t in all_options), time.time())
+    clicked_key = getattr(task, "_event_check_clicked", None)
+    if (check_feature and clicked_key and clicked_key[0] == page_key[0]
+            and page_key[2] - clicked_key[2] < _EVENT_CHECK_ONCE_SECONDS
+            and difflib.SequenceMatcher(None, clicked_key[1], page_key[1]).ratio() >= 0.8):
+        task.log_info("事件任务页面的放大镜已点过一次，页面没变，不再点")
+        check_feature = None
     if check_feature:
         task.log_info(
-            f"事件任务页面检测到check特征，相似度={check_feature.confidence:.4f}，优先点击"
+            f"事件任务页面检测到{check_feature.name}，相似度={check_feature.confidence:.4f}，优先点击"
         )
+        task._event_check_clicked = page_key
         task.click_box(check_feature)
         task.sleep(1)
         return True
@@ -4618,6 +4664,36 @@ def _retry_rest_reading(task: TriggerTask, what):
     return True
 
 
+_REST_BUBBLE_REGION = (0.15, 0.25, 0.85, 0.80)  # 篝火边人物头顶
+_REST_BUBBLE_TRIES = 2         # 同一个休息区最多点几次（第一次可能点在入场动画里没反应）
+_REST_BUBBLE_GAP = 3.0         # 两次点击至少隔这么久
+_REST_BUBBLE_ONCE_SECONDS = 300  # 节点序号每层重新数，超过这么久当作另一个休息区
+
+
+def handle_rest_bubble(task: TriggerTask):
+    """休息区人物头顶的金色卡片气泡（新版本加的，用户 10/21 要求遇到就点，常开不设开关）：排在休息/冥想前面，
+    先点它再做休息区的选择。点过还在就隔几秒再点一次，同一个休息区最多点 _REST_BUBBLE_TRIES 次。"""
+    shop_box = find_box_at_point(task, 0.360, 0.138)
+    if not (shop_box and "德朗商店" in shop_box.name):
+        return False
+    now = time.time()
+    node = task.node_status.get("node_count") if hasattr(task, "node_status") else None
+    record = getattr(task, "_rest_bubble_clicks", None)
+    if not record or record[0] != node or now - record[2] > _REST_BUBBLE_ONCE_SECONDS:
+        record = (node, 0, 0.0)
+    if record[1] >= _REST_BUBBLE_TRIES or now - record[2] < _REST_BUBBLE_GAP:
+        return False
+    bubble = task.find_one(feature_name="rest_bubble", box=task.box_of_screen(*_REST_BUBBLE_REGION), threshold=0.75)
+    if not bubble:
+        return False
+    task.log_info(f"休息区检测到人物头顶的气泡，相似度={bubble.confidence:.4f}，点击")
+    battle_log.record(task, "休息区", choice="气泡", tries=record[1] + 1)
+    task._rest_bubble_clicks = (node, record[1] + 1, now)
+    task.click_box(bubble)
+    task.sleep(1)
+    return True
+
+
 def handle_rest(task: TriggerTask):
     """休息界面: 根据血量、信用点和冥想状态选择休息或冥想。"""
     rest_feature = _find_rest_feature(task)
@@ -4910,8 +4986,9 @@ def handle_shop(task: TriggerTask):
     return False
 
 
-_FLASH_CHOICE_RETRY_SECONDS = 4.0  # 点了灵光选项后这么久内不再换着点，等页面响应
+_FLASH_CHOICE_RETRY_SECONDS = 4.0  # 点了灵光选项后这么久内不再换着点，等页面响应；牌面出不来时也最多等这么久
 _FLASH_CHOICE_TITLE_REGION = (0.30, 0.08, 0.70, 0.18)  # 「请选择灵光一闪效果」标题带
+_FLASH_EMPTY_GAP_SECONDS = 5.0  # 这么久没再看到空白的闪光页，说明是新的一页，等牌重新计时
 
 
 def _flash_page_signature(task):
@@ -4947,6 +5024,30 @@ def _is_flash_choice_page(task: TriggerTask):
     return "请选择" in title and "效果" in title and ("灵光" in title or "闪光" in title)
 
 
+def _wait_flash_cards(task: TriggerTask):
+    """闪光页上认不出牌。入场白闪时牌还没出来，先占住这一帧（交出去 handle_skip 会点「跳过」，把闪光优先级跳掉）；
+    等满 _FLASH_CHOICE_RETRY_SECONDS 还是看不到牌就按键盘 1 选第一个版本：战斗中的灵光一闪偶尔白光散了牌也不出来
+    （用户说是开了加速导致的），页面上没有「跳过」，原来放手后没有处理函数接，一直卡着（10/18 19:41 卡了 18 分钟），
+    手动按 1 就能继续（用户 10/18 要求）。"""
+    now = time.time()
+    since = getattr(task, "_flash_choice_empty_since", None)
+    if since is None or now - getattr(task, "_flash_choice_empty_seen", 0.0) > _FLASH_EMPTY_GAP_SECONDS:
+        # 上一页没等完就离开时留下的计时不算（10/15 15:43 新的一页一出来就判超时，白闪中点了「跳过」）
+        since = task._flash_choice_empty_since = now
+    task._flash_choice_empty_seen = now
+    waited = now - since
+    if waited < _FLASH_CHOICE_RETRY_SECONDS:
+        task.log_info(f"卡牌闪光页面: 牌面还没出来，等下一帧（已 {waited:.1f} 秒）")
+        return True
+    task._flash_choice_empty_since = None
+    battle_log.anomaly(task, "闪光页看不到牌", f"等了 {waited:.1f} 秒牌面还没出来，按 1 选第一个版本")
+    battle_log.record(task, "闪光选择", card=None, reason="看不到牌，按 1", chosen=1, options=[])
+    _remember_flash_click(task)  # 和点选项一样，4 秒内等页面响应，不重复按
+    task.send_key("1")
+    task.sleep(1)
+    return True
+
+
 def handle_view_original(task: TriggerTask):
     """卡牌闪光（查看原件）事件: 按类型特征识别卡牌，并按闪光优先级选择。"""
     if not _is_flash_choice_page(task):
@@ -4965,19 +5066,7 @@ def handle_view_original(task: TriggerTask):
 
     cards = recognize_cards(task, page="卡牌闪光页面")
     if not cards:
-        since = getattr(task, "_flash_choice_empty_since", None)
-        now = time.time()
-        if since is None:
-            task._flash_choice_empty_since = now
-            since = now
-        waited = now - since
-        if waited < _FLASH_CHOICE_RETRY_SECONDS:
-            # 效果页入场白闪：牌还没出来时点「跳过」会把闪光优先级（如琶音）直接跳掉
-            task.log_info(f"卡牌闪光页面: 牌面还没出来，等下一帧（已 {waited:.1f} 秒）")
-            return True
-        task._flash_choice_empty_since = None
-        task.log_info("卡牌闪光页面: 等牌面超时，交给后面的处理函数")
-        return False
+        return _wait_flash_cards(task)
     task._flash_choice_empty_since = None
 
     # 拉黑的版本不参与挑选；三个版本都被拉黑时点「跳过」（之后的确认框由 handle_center_confirm 点，

@@ -380,14 +380,14 @@ msgstr "On the mask card page, pick the card whose description contains this tex
 msgid "面具卡牌刻印页要的刻印描述，不是就刷新或跳过"
 msgstr "Wanted engraving description on the mask card engraving page; refresh or skip otherwise."
 
-msgid "「选择刻印的记忆」页按列表顺序选第一张包含该关键词的记忆卡（牌名或描述，如「贪婪」「全体攻击」），三张都不含时先用卡下方的「重新搜索」刷新"
-msgstr "On the memory engraving page, pick the first memory card containing an entry (name or description); if none match, refresh with Search Again first."
+msgid "「选择刻印的记忆」页选包含这个关键词的记忆卡（只填一个，如「贪婪」「全体攻击」）：先对三张的牌名，都不含再对描述；三张都不含时先用卡下方的「重新搜索」刷新，留空按默认选择"
+msgstr "On the memory engraving page, pick the card containing this keyword (one keyword only): card names first, then descriptions; if none match, refresh with Search Again first. Leave empty to use the default pick."
 
 msgid "记忆卡牌优先级都没匹配上时选第几张"
 msgstr "Which memory card to pick when nothing in the memory priority matches."
 
-msgid "记忆雕琢完成后的「记忆加工」页按列表顺序选第一张描述包含该关键词的卡（如「攻击力」「伤害量」），几张都包含时选百分比大的；都不包含时选百分比最大的"
-msgstr "On the Memory Processing page after carving, pick the first card whose description contains an entry (e.g. ATK, damage); if several match, take the higher percentage; if none match, take the highest percentage."
+msgid "记忆雕琢完成后的「记忆加工」页按列表顺序选第一张描述包含该关键词的卡（如「攻击力」「伤害量」），几张都包含时选百分比大的；都不包含时选百分比最大的；不填则不做记忆加工，雕琢完成直接离开"
+msgstr "On the Memory Processing page after carving, pick the first card whose description contains an entry (e.g. ATK, damage); if several match, take the higher percentage; if none match, take the highest percentage. Leave empty to skip processing and leave right after carving."
 
 msgid "攻击力（1 号位）装备的优先顺序，写在这里的装备优先给刷存档主战员，独特装备的名额也只留给这里写的"
 msgstr "Priority of attack (slot 1) equipment. Listed items go to the archive member first, and that member's single unique slot is reserved for them."

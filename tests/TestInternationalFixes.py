@@ -1,6 +1,7 @@
 # 繁中服（国际服）页面修正：BOSS 选择页标题、休息区读不到生命值/信用点、休息后等「確認」
 import os
 import sys
+import time
 import unittest
 import unittest.mock
 
@@ -372,6 +373,40 @@ class TestChaosRest(unittest.TestCase):
         self.assertEqual(["德朗商店"], task.clicked)
 
 
+class TestRestBubble(unittest.TestCase):
+    """新版本（10/21）休息区人物头顶的金色气泡：遇到就点，同一个休息区最多点两次。"""
+
+    def page(self, bubble=True):
+        return PageTask(CHAOS_REST + [("德朗商店", 0.360, 0.138)],
+                        CHAOS_FEATURES + ([("rest_bubble", 0.34, 0.50)] if bubble else []))
+
+    def test_bubble_clicked_before_rest(self):
+        task = self.page()
+        task.node_status["node_count"] = 3
+        self.assertTrue(utils.handle_rest_bubble(task))
+        self.assertEqual(["rest_bubble"], task.clicked)
+        self.assertFalse(utils.handle_rest_bubble(task))  # 3 秒内不重复点
+        with unittest.mock.patch.object(utils.time, "time", return_value=time.time() + 4):
+            self.assertTrue(utils.handle_rest_bubble(task))  # 还在：再点一次
+        with unittest.mock.patch.object(utils.time, "time", return_value=time.time() + 8):
+            self.assertFalse(utils.handle_rest_bubble(task))  # 最多两次
+        task.node_status["node_count"] = 7
+        self.assertTrue(utils.handle_rest_bubble(task))  # 下一个休息区照常点
+        self.assertEqual(3, task.clicked.count("rest_bubble"))
+
+    def test_no_bubble_or_not_rest_page(self):
+        self.assertFalse(utils.handle_rest_bubble(self.page(bubble=False)))
+        task = PageTask(CHAOS_REST, CHAOS_FEATURES + [("rest_bubble", 0.34, 0.50)])
+        self.assertFalse(utils.handle_rest_bubble(task))  # 没有「德朗商店」不是休息区
+        self.assertEqual([], task.clicked)
+
+    def test_in_both_modes_before_rest(self):
+        for handlers, rest in ((utils_chaos.PAGE_HANDLERS, utils.handle_rest),
+                               (utils_sortie.PAGE_HANDLERS, utils_sortie.handle_rest_sortie)):
+            names = [h.__name__ for h in handlers]
+            self.assertLess(names.index("handle_rest_bubble"), names.index(rest.__name__))
+
+
 # 零式系统初始页面（2026-09-30 更新后的法典卡片：不再显示存储数据价值层级，改为存档储存上限）
 ZERO_SYSTEM = [("零號系統", 0.120, 0.046), ("進入", 0.930, 0.910)]
 REROLL = "(0.968, 0.153)"
@@ -644,9 +679,9 @@ MEMORY_PAGE_2 = [("選擇刻印的記", 0.50, 0.09, 0.14), ("憶", 0.50, 0.14, 0
 
 class TestMemoryImprint(unittest.TestCase):
 
-    def run_page(self, priority=(), default="1", active=False, page=MEMORY_PAGE):
+    def run_page(self, keyword="", default="1", active=False, page=MEMORY_PAGE):
         task = PageTask(page)
-        task.config.update({speedup.MEMORY_PRIORITY_KEY: list(priority), speedup.MEMORY_DEFAULT_KEY: default})
+        task.config.update({speedup.MEMORY_PRIORITY_KEY: keyword, speedup.MEMORY_DEFAULT_KEY: default})
         with unittest.mock.patch.object(utils, "is_button_active", lambda t, b: active), \
                 unittest.mock.patch.object(utils, "_move_and_click", lambda t, x, y: task.clicked.append(
                     round(x, 2) if y == speedup._MEMORY_CARD_Y else ("重新搜索", round(x, 2)))):
@@ -654,31 +689,41 @@ class TestMemoryImprint(unittest.TestCase):
         return handled, task.clicked
 
     def test_priority_keyword_in_description(self):
-        self.assertEqual((True, [0.5]), self.run_page(["全体攻击", "打击次数"]))
+        self.assertEqual((True, [0.5]), self.run_page("全体攻击"))
 
     def test_priority_by_name(self):
-        self.assertEqual((True, [0.75]), self.run_page(["女子"]))
+        self.assertEqual((True, [0.75]), self.run_page("女子"))
+
+    def test_name_before_description(self):
+        page = [("記憶：壓抑", 0.25, 0.24, 0.10), ("觸發快速攻擊卡牌時", 0.25, 0.60, 0.16),
+                ("記憶：快速攻擊", 0.75, 0.24, 0.10), ("持續1回合觸發3次全體攻擊卡牌時", 0.75, 0.62, 0.16)]
+        page = MEMORY_PAGE[:2] + page + MEMORY_PAGE[-1:]
+        self.assertEqual((True, [0.75]), self.run_page("快速攻击", page=page))
+        self.assertEqual((True, [0.75]), self.run_page("全体攻击", page=page))   # 牌名都不含才看描述
+
+    def test_old_list_config_uses_first(self):
+        self.assertEqual((True, [0.75]), self.run_page(["女子", "贪婪"]))
 
     def test_default_when_nothing_matches(self):
-        self.assertEqual((True, [0.25]), self.run_page(["不存在"]))
-        self.assertEqual((True, [0.75]), self.run_page([], default="3"))
+        self.assertEqual((True, [0.25]), self.run_page("不存在"))
+        self.assertEqual((True, [0.75]), self.run_page("", default="3"))
 
     def test_default_priority_is_toughness_damage(self):
-        speedup_default = list(speedup._MEMORY_DEFAULT_PRIORITY)
-        self.assertEqual(["触发韧性伤害"], speedup_default)
+        speedup_default = speedup._MEMORY_DEFAULT_KEYWORD
+        self.assertEqual("触发韧性伤害", speedup_default)
         self.assertEqual((True, [0.5]), self.run_page(speedup_default, page=MEMORY_PAGE_2))
 
     def test_refresh_when_nothing_matches(self):
-        self.assertEqual((True, [("重新搜索", 0.25)]), self.run_page(["贪婪"], page=MEMORY_PAGE_2))
+        self.assertEqual((True, [("重新搜索", 0.25)]), self.run_page("贪婪", page=MEMORY_PAGE_2))
         used_up = [t if t[0] != "3/3" or t[1] != 0.333 else ("0/3", 0.333, 0.824) for t in MEMORY_PAGE_2]
-        self.assertEqual((True, [("重新搜索", 0.5)]), self.run_page(["贪婪"], page=used_up))
+        self.assertEqual((True, [("重新搜索", 0.5)]), self.run_page("贪婪", page=used_up))
 
     def test_default_after_refreshes_used_up(self):
         used_up = [("0/3",) + t[1:] if t[0] == "3/3" else t for t in MEMORY_PAGE_2]
-        self.assertEqual((True, [0.75]), self.run_page(["贪婪"], default="3", page=used_up))
+        self.assertEqual((True, [0.75]), self.run_page("贪婪", default="3", page=used_up))
 
     def test_selected_leaves_confirm_to_handle_confirm(self):
-        self.assertEqual((False, []), self.run_page(["女子"], active=True))
+        self.assertEqual((False, []), self.run_page("女子", active=True))
 
     def test_other_page_ignored(self):
         self.assertFalse(speedup.handle_memory_imprint(PageTask([("裝備", 0.50, 0.13)])))
@@ -1022,6 +1067,50 @@ class TestInfoOption(unittest.TestCase):
         self.assertNotIn("(0.240, 0.820)", task.clicked)
         self.assertTrue(task.clicked)
 
+    def test_split_confirm_without_bracket_is_not_button(self):
+        # 实跑 10/18：切成「確認」和「【盜獵者的樂趣】資訊」，前一个不带括号，点了等于选中选项 1
+        task = PageTask([("詢問方法", 0.16, 0.80), ("確認", 0.15, 0.836, 0.045),
+                         ("【盜獵者的樂趣】資訊", 0.235, 0.836, 0.12), ("用謊言來警告", 0.68, 0.80)])
+        self.assertFalse(utils.handle_center_confirm(task))
+        self.assertTrue(utils.handle_center_confirm(PageTask([("確認", 0.50, 0.70), ("取消", 0.30, 0.70)])))
+
+    def run_magnifier(self, task, descriptions):
+        options = [{"x": x, "y": 0.947, "description": utils._normalize_text(d),
+                    "description_region": (x - 0.1, 0.78, x + 0.1, 0.86), "feature_name": "event3", "confidence": 0.9}
+                   for d, x in zip(descriptions, (0.24, 0.50, 0.76))]
+        task.clicked.clear()
+        with unittest.mock.patch.object(utils, "recognize_event_options", lambda *args, **kwargs: options):
+            self.assertTrue(utils.handle_event_task(task))
+        return task.clicked
+
+    def test_magnifier_clicked_once_per_event(self):
+        # 实跑 10/18：放大镜点了没反应，每帧都优先点它，选项一直选不上
+        task = PageTask([], features=[("check2", 0.60, 0.45)])
+        task.find_feature = lambda *args, **kwargs: []
+        page = ["詢問方法確認【盜獵者的樂趣】資訊", "參加打賭觸發【與盜獵者的打賭】事件", "用謊言來警告信用點數80增加"]
+        self.assertEqual(["check2"], self.run_magnifier(task, page))
+        # 下一帧 OCR 差了几个字，还是同一页：不再点放大镜，去选选项
+        same = ["詢問方法確認「【盜獵者的樂趣】資訊", "參加打賭觸發【與盜獵者的打賭】事件", "用謊言來警告信用點數80 增加"]
+        self.assertNotIn("check2", self.run_magnifier(task, same))
+        # 换了一个事件：照常先点放大镜
+        other = ["認同侵蝕的美學隨機命運", "緬懷過去的榮耀信用點數200增加", "在紀念碑上灑血HP20%減少"]
+        self.assertEqual(["check2"], self.run_magnifier(task, other))
+
+    def test_f1_icon_clicked_once_per_event(self):
+        # 新版本（10/21）事件页中间顶着「F1」标签的图标，图案每个事件不一样，按标签找，点标签下方的图标
+        task = PageTask([("F1", 0.561, 0.336, 0.03, 0.03)])
+        task.find_feature = lambda *args, **kwargs: []
+        page = ["站在席格身旁確認【未停止的記憶】資訊", "站在羅斯薇瑟身旁HP50%恢復"]
+        with unittest.mock.patch.object(task, "click_box", lambda box, *a, **k: task.clicked.append(
+                (box.name, round((box.x + box.width / 2) / WIDTH, 3), round((box.y + box.height / 2) / HEIGHT, 3)))):
+            self.assertEqual([("F1图标", 0.561, 0.381)], self.run_magnifier(task, page))
+            self.assertFalse(any(c[0] == "F1图标" for c in self.run_magnifier(task, page)))
+
+    def test_skip_button_f1_is_not_event_icon(self):
+        # 休息区右下角「跳過」上也标着 F1，不在事件页找图标的区域里
+        task = PageTask([("F1", 0.820, 0.876, 0.03, 0.03)])
+        self.assertIsNone(utils._find_event_f1_icon(task, (0.396, 0.286, 0.960, 0.718)))
+
 
 
 class TestDiceReroll(unittest.TestCase):
@@ -1113,11 +1202,12 @@ class TestMemoryCarving(unittest.TestCase):
     def test_leaves_when_button_gray(self):
         self.assertEqual(["离开"], self.run_page((200, 200, 200)))
 
-    def run_finished_page(self, processed=False):
+    def run_finished_page(self, processed=False, priority=("攻击力",)):
         """雕琢完成后：右边变成「雕琢完成」，左边「记忆加工」变橙色可点。"""
         import numpy as np
         page = [t for t in self.PAGE if t[0] != "記憶雕琢" or t[2] != 0.795] + [("雕琢完成", 0.85, 0.795)]
         task = PageTask(page)
+        task.config["记忆加工优先级"] = list(priority)
         task.node_status["memory_processed"] = processed
         task.frame = np.zeros((HEIGHT, WIDTH, 3), np.uint8)
         for px in (0.86, 0.16):
@@ -1130,6 +1220,12 @@ class TestMemoryCarving(unittest.TestCase):
         task = self.run_finished_page()
         self.assertEqual(["记忆加工"], task.clicked)
         self.assertTrue(task.node_status["memory_processed"])
+
+    def test_leaves_without_processing_when_priority_empty(self):
+        for priority in ([], [""]):
+            task = self.run_finished_page(priority=priority)
+            self.assertEqual(["离开"], task.clicked)
+            self.assertTrue(task.node_status["carve_done"])
 
     def test_leaves_after_processing(self):
         task = self.run_finished_page(processed=True)
@@ -1177,6 +1273,35 @@ class TestMemoryCarving(unittest.TestCase):
 
     def test_event_page_leaves_after_carving(self):
         self.assertEqual(["(0.630, 0.820)"], self.run_event(carve_done=True))
+
+
+class TestChaosFunctionSelect(unittest.TestCase):
+    """卡厄思模式战斗中「請選擇功能。」页：自动战斗 3 秒没选就随机点一张，离开页面计时清零。"""
+
+    PAGE = [("請選擇功能。", 0.507, 0.131, 0.15), ("創造：○", 0.231, 0.289), ("創造：△", 0.482, 0.289)]
+
+    def run_page(self, cards):
+        task = PageTask(self.PAGE)
+        with unittest.mock.patch.object(utils_chaos, "recognize_cards", lambda task, page=None: [dict(c) for c in cards]),                 unittest.mock.patch.object(utils_chaos.random, "choice", lambda seq: seq[-1]):
+            self.assertTrue(utils_chaos.handle_card_function_select(task))
+            self.assertTrue(utils_chaos.handle_card_function_select(task))
+            self.assertEqual([], task.clicked)  # 刚出现，先等自动战斗
+            task.function_select_seen -= utils_chaos._FUNCTION_SELECT_WAIT + 1
+            self.assertTrue(utils_chaos.handle_card_function_select(task))
+            clicked = list(task.clicked)
+            self.assertTrue(utils_chaos.handle_card_function_select(task))
+            self.assertEqual(clicked, task.clicked)  # 点完再等一轮，不连点
+            task.show([])
+            self.assertFalse(utils_chaos.handle_card_function_select(task))
+            self.assertIsNone(task.function_select_seen)
+        return clicked
+
+    def test_clicks_recognized_card(self):
+        cards = [{"name": "创造：○", "x": 0.249, "y": 0.4}, {"name": "创造：□", "x": 0.751, "y": 0.4}]
+        self.assertEqual(["(0.751, 0.400)"], self.run_page(cards))
+
+    def test_falls_back_to_fixed_points(self):
+        self.assertEqual(["(0.751, 0.530)"], self.run_page([]))
 
 
 if __name__ == '__main__':
