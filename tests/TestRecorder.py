@@ -90,6 +90,7 @@ class RecorderTestCase(unittest.TestCase):
         for patcher in (
                 mock.patch("time.time", lambda: self.now[0]),
                 mock.patch.object(battle_log, "LOG_DIR", self.folder),
+                mock.patch.dict(recorder._switch, {"on": True}),  # 侧边栏开关：测试里默认开着，不读写 configs
                 mock.patch.object(battle_log, "SHOT_DIR", os.path.join(self.folder, "截图")),
                 mock.patch.object(recorder, "SCENE_DIR", os.path.join(self.folder, "现场")),
                 mock.patch.object(scene, "SCENE_DIR", os.path.join(self.folder, "现场")),
@@ -308,6 +309,22 @@ class TestRecording(RecorderTestCase):
         self.frames(5)
         self.assertEqual(0, len(self.task._recorder["frames"]))
         self.assertIsNone(recorder.trigger(self.task, "疑似循环"))
+
+    def test_scene_switch_off_keeps_nothing(self):
+        recorder._switch["on"] = False
+        self.frames(5)
+        self.assertEqual(0, len(self.task._recorder["frames"]))
+        self.assertIsNone(recorder.trigger(self.task, "疑似循环"))
+        self.assertIn("现场记录", recorder.hold(self.task))
+
+    def test_switch_saved_to_file(self):
+        path = os.path.join(self.folder, "现场记录.json")
+        with mock.patch.object(recorder, "SWITCH_FILE", path):
+            recorder._switch["on"] = None
+            self.assertFalse(recorder.switch_on())  # 没有文件时默认关
+            recorder.set_switch(True)
+            recorder._switch["on"] = None
+            self.assertTrue(recorder.switch_on())
 
 
 class TestSampler(RecorderTestCase):

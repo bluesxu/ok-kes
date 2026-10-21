@@ -12,6 +12,9 @@ version = "dev"
 OCR_BACKEND_AUTO = "自动"
 OCR_BACKEND_ONNX = "ONNX Runtime"
 OCR_BACKEND_OPENVINO = "OpenVINO"
+# OCR 推理线程数。默认用满物理核，3200x1800 整屏识别在 7800X3D 上每帧 CPU 时间约 0.6 秒（OpenVINO）、
+# 1.7 秒（ONNX Runtime，线程空转等活），限 4 线程后约 0.43 / 0.6 秒，耗时只多 0~20ms，识别结果逐字相同。
+OCR_THREADS = max(1, min(4, (os.cpu_count() or 2) // 2))
 
 
 def _get_config_folder():
@@ -72,13 +75,38 @@ def _force_openvino_f32():
         if device_name in (None, "CPU"):
             config = dict(config or {})
             config.setdefault("INFERENCE_PRECISION_HINT", "f32")
+            config.setdefault("INFERENCE_NUM_THREADS", OCR_THREADS)
         return original(self, model, device_name, config, *args, **kwargs)
 
     compile_model._force_f32 = True
     openvino.Core.compile_model = compile_model
 
 
+def _limit_onnxruntime_threads():
+    """onnxocr 建会话时不传 SessionOptions，这里补上线程数并关掉线程空转。"""
+    try:
+        import onnxruntime
+    except (ImportError, OSError):
+        return
+    original = onnxruntime.InferenceSession
+    if getattr(original, "_limit_threads", False):
+        return
+
+    class InferenceSession(original):
+        _limit_threads = True
+
+        def __init__(self, path_or_bytes, sess_options=None, *args, **kwargs):
+            if sess_options is None:
+                sess_options = onnxruntime.SessionOptions()
+                sess_options.intra_op_num_threads = OCR_THREADS
+                sess_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            super().__init__(path_or_bytes, sess_options, *args, **kwargs)
+
+    onnxruntime.InferenceSession = InferenceSession
+
+
 def resolve_use_openvino():
+    _limit_onnxruntime_threads()
     backend = _read_ocr_backend()
     if backend == OCR_BACKEND_OPENVINO:
         if _openvino_is_available():

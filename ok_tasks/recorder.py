@@ -9,7 +9,8 @@
 - 触发：TRIGGER_KINDS 里的异常、战斗输了、处理函数出错、主窗口侧边栏的「标记现场」按钮（src/globals.py，要写说明）。
   录制中又触发就从新触发起再录（自动 30 秒、手动标记 10 秒）并入同一个包，单个包最长 3 分钟；同类异常每轮只完整保存一次，每轮最多 5 个包
   （手动标记不受这两条限制）。
-- 开关复用「详细战斗日志」+「异常截图」，与异常截图相同；清理复用 battle_logs 的保留天数和总大小上限，
+- 开关是主窗口侧边栏的「现场记录」（两个模式共用，默认关，后台采样占 CPU；存在 configs/现场记录.json），
+  还要同时开着「详细战斗日志」+「异常截图」；关着时异常照旧截单张图。清理复用 battle_logs 的保留天数和总大小上限，
   但手动标记的包不受自动清理（超天数/超大小都不删），只有先清完其余文件仍超限时，才从最旧的手动包删起
   ——手动标记只能被新的手动标记顶掉。
 
@@ -54,6 +55,8 @@ SAMPLE_DIFF_THRESHOLD = 2.0  # 粗灰度平均差小于这个就算画面没变�
 SCENE_DIR = os.path.join(battle_log.LOG_DIR, "现场")
 MARK_KEY = "标记现场"
 MANUAL = "手动标记"
+SWITCH_FILE = os.path.join("configs", "现场记录.json")  # 侧边栏开关（src/globals.py 写，这里读）
+SWITCH_KEY = "开启"
 RUNNING_GAP = 5       # 最近这么多秒内跑过一帧，才算任务在运行
 LOST_BATTLE = "战斗输了"
 HANDLER_ERROR = "处理函数出错"
@@ -156,7 +159,7 @@ def hold(task):
     if st is None:
         return "任务没装现场记录"
     if not enabled(task):
-        return "「详细战斗日志」或「异常截图」没开，标记无效"
+        return "侧边栏「现场记录」没开（还要开着「详细战斗日志」和「异常截图」），标记无效"
     if not running(task):
         return "任务没在运行，标记无效"
     st["hold"] = time.time()
@@ -187,8 +190,38 @@ def _notify(task, message, error=False):
         pass
 
 
+_switch = {"on": None}
+
+
+def switch_on():
+    """侧边栏「现场记录」开关。第一次用时读文件，之后由 set_switch 更新。"""
+    if _switch["on"] is None:
+        _switch["on"] = read_switch()
+    return _switch["on"]
+
+
+def read_switch():
+    try:
+        with open(SWITCH_FILE, "r", encoding="utf-8") as f:
+            return bool(json.load(f).get(SWITCH_KEY, False))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def set_switch(on):
+    """切换开关并存盘。关掉后下一帧 _run 会清掉内存里留着的帧和画面。"""
+    _switch["on"] = bool(on)
+    try:
+        os.makedirs(os.path.dirname(SWITCH_FILE), exist_ok=True)
+        with open(SWITCH_FILE, "w", encoding="utf-8") as f:
+            json.dump({SWITCH_KEY: bool(on)}, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
 def enabled(task):
-    return battle_log.enabled(task) and bool(battle_log._config(task, battle_log.SHOT_KEY))
+    return (switch_on() and battle_log.enabled(task)
+            and bool(battle_log._config(task, battle_log.SHOT_KEY)))
 
 
 # ---------------- 记录 ----------------
@@ -317,7 +350,9 @@ def _capture(task, st, full):
 def _encode(image, small):
     if small and image.shape[1] > IMAGE_WIDTH:
         height = round(image.shape[0] * IMAGE_WIDTH / image.shape[1])
-        image = cv2.resize(image, (IMAGE_WIDTH, height), interpolation=cv2.INTER_AREA)
+        # INTER_AREA 在 3200→1280 这种非整数倍上每张约 20~38ms CPU，采样每秒要编 8~10 张；
+        # INTER_LINEAR 约 4~9ms，小图看起来没差别（与 INTER_AREA 平均像素差 0.25）
+        image = cv2.resize(image, (IMAGE_WIDTH, height), interpolation=cv2.INTER_LINEAR)
     ok, data = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, _SMALL_QUALITY if small else _FULL_QUALITY])
     return data.tobytes() if ok else None
 

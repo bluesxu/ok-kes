@@ -49,7 +49,7 @@ def install(task):
     task.default_config[KEEP_DAYS_KEY] = 7
     task.default_config[MAX_MB_KEY] = 500
     task.config_description[LOG_KEY] = "把每个决定（出牌、装备、选卡、路线等）看到了什么、为什么这样做写进 battle_logs 目录，便于统计和排查"
-    task.config_description[SHOT_KEY] = "出现异常（识别失败、画面卡住、未识别页面等）时截图，同一种异常每场战斗最多 1 张；卡住、循环、输掉战斗等问题改存现场包（前后各 30 秒的画面和识别结果，在 battle_logs/现场）"
+    task.config_description[SHOT_KEY] = "出现异常（识别失败、画面卡住、未识别页面等）时截图，同一种异常每场战斗最多 1 张；开了侧边栏「现场记录」时，卡住、循环、输掉战斗等问题改存现场包（前后各 30 秒的画面和识别结果，在 battle_logs/现场）"
     task.config_description[KEEP_DAYS_KEY] = "battle_logs 里的记录和截图保留多少天"
     task.config_description[MAX_MB_KEY] = "battle_logs 总大小超过这个值时从最旧的文件删起"
     config_io.UI_ONLY_CONFIG_KEYS.update({LOG_KEY, SHOT_KEY, KEEP_DAYS_KEY, MAX_MB_KEY})

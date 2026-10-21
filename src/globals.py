@@ -1,3 +1,5 @@
+import json
+import os
 import sys
 
 from PySide6.QtCore import QObject
@@ -9,6 +11,10 @@ from ok import Logger, og
 logger = Logger.get_logger(__name__)
 
 MARK_TEXT = "标记现场"
+SCENE_TEXT = "现场记录"
+# 与 ok_tasks/recorder.py 的 SWITCH_FILE / SWITCH_KEY 一致；任务没加载时界面也要能读写
+SCENE_SWITCH_FILE = os.path.join("configs", "现场记录.json")
+SCENE_SWITCH_KEY = "开启"
 
 
 class Globals(QObject):
@@ -17,12 +23,32 @@ class Globals(QObject):
         super().__init__()
 
     def on_show_main_window(self, main_window):
-        """侧边栏加「标记现场」按钮（现场包见 ok_tasks/recorder.py）。"""
+        """侧边栏加「现场记录」开关和「标记现场」按钮（现场包见 ok_tasks/recorder.py）。"""
+        self._scene_item = main_window.navigationInterface.addItem(
+            routeKey="scene_switch", icon=FluentIcon.VIDEO, text=self._scene_text(_read_scene_switch()),
+            onClick=lambda: self._toggle_scene(main_window), selectable=False,
+            position=NavigationItemPosition.BOTTOM,
+            tooltip="开着时内存里一直留最近 50 秒的画面和识别结果，出问题或按「标记现场」时存成现场包；"
+                    "后台每秒抓十几张图，比较占 CPU，排查问题时再开")
         main_window.navigationInterface.addItem(
             routeKey="mark_scene", icon=FluentIcon.FLAG, text=og.app.tr(MARK_TEXT),
             onClick=lambda: self._mark_scene(main_window), selectable=False,
             position=NavigationItemPosition.BOTTOM,
             tooltip="把按下按钮前 50 秒、后 10 秒的画面、识别结果和动作存成现场包，供事后排查")
+
+    @staticmethod
+    def _scene_text(on):
+        return f"{SCENE_TEXT}：{'开' if on else '关'}"
+
+    def _toggle_scene(self, main_window):
+        on = not _read_scene_switch()
+        recorder = sys.modules.get("recorder")
+        if recorder is not None:
+            recorder.set_switch(on)
+        else:
+            _write_scene_switch(on)
+        self._scene_item.setText(self._scene_text(on))
+        self._tip(main_window, "已开启，出问题时会存现场包" if on else "已关闭", title=SCENE_TEXT)
 
     def _mark_scene(self, main_window):
         recorder = sys.modules.get("recorder")  # ok_tasks 下的模块，任务加载时已导入；热重载后取最新的
@@ -47,9 +73,26 @@ class Globals(QObject):
                 recorder.unhold(task)
 
     @staticmethod
-    def _tip(main_window, message, error=False):
+    def _tip(main_window, message, error=False, title=MARK_TEXT):
         (InfoBar.error if error else InfoBar.success)(
-            title=MARK_TEXT, content=message, parent=main_window, position=InfoBarPosition.TOP, duration=4000)
+            title=title, content=message, parent=main_window, position=InfoBarPosition.TOP, duration=4000)
+
+
+def _read_scene_switch():
+    try:
+        with open(SCENE_SWITCH_FILE, "r", encoding="utf-8") as f:
+            return bool(json.load(f).get(SCENE_SWITCH_KEY, False))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def _write_scene_switch(on):
+    try:
+        os.makedirs(os.path.dirname(SCENE_SWITCH_FILE), exist_ok=True)
+        with open(SCENE_SWITCH_FILE, "w", encoding="utf-8") as f:
+            json.dump({SCENE_SWITCH_KEY: bool(on)}, f, ensure_ascii=False)
+    except OSError:
+        logger.error("现场记录开关存盘失败")
 
 
 class _NoteDialog(MessageBoxBase):
