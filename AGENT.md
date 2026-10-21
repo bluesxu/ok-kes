@@ -43,15 +43,24 @@ python real_bugfix_check.py                           # 用官方安装目录里
 
 **配置**：配置键就是中文显示名，会持久化到 `configs/*.json`。`config_io.py` 负责配置码导入/导出、本地多套配置、旧配置迁移（在 `load_config` 里调用），`UI_ONLY_CONFIG_KEYS` 里的键不进配置码也不上传；`config_sync.py` 负责匿名上传配置/胜率和“热门配置”。界面顺序、隐藏项、子选项和缺省说明统一在 `config_layout.py`（两个模式 `__init__` 末尾调用 `apply`），新增配置项要排进 `CHAOS_ORDER` / `SORTIE_ORDER`，否则 `TestConfigLayout` 会失败。`config_description` 等界面文字要同步 `i18n/<locale>/LC_MESSAGES/ok.po`，并重新编译 `ok.mo`（`msgid` 必须与代码字符串完全一致）。
 
-**给某个角色写配置（查构筑资料 → 出配置码）**：产出是配置码（配置 JSON 的 base64，格式同 `config_io._export_config_to_text`），不改仓库文件。先确认用户打的是国服还是国际服。两套翻译不同，简繁互转对不上（国服「剑雨」对应国际服「剑之雨」，见 `docs/zh-CN/usage-guide.md`）。配置和 OCR 都会转成简体，国际服写该服译名的简体即可，繁体原文也能匹配。
+**给某个角色写配置（查构筑资料 → 出配置码）**：产出是配置码（配置 JSON 的 base64，格式同 `config_io._export_config_to_text`），不改仓库文件。先确认用户打的是国服还是国际服。两套翻译不同，简繁互转对不上（国服「剑雨」对应国际服「剑之雨」，见 `docs/zh-CN/usage-guide.md`）。配置和 OCR 都会转成简体，国际服写该服译名的简体即可，繁体原文也能匹配。转换先做 jp2t 再做 t2s，jp2t 会把「予」改成「豫」（「赋予」→「赋豫」）。配置里的词也走同样的转换，所以照写「赋予」就能匹配；只有自己比对转换结果时要注意这一点。
 
+- 用户给的是国服卡组推荐（截图或攻略），要换成国际服译名时，先上 GameKee（`gamekee.com/czn`，下面 2、3 条）。它的简体名就是国际服译名，例如国服「混沌之识」「堕落之冠」在这里是「混沌指控」「坠落的王冠」。今天才上线、GameKee 还没收的新角色，卡牌表看台服 STOVE 更新公告（`page.onstove.com/chaoszeronightmare/TW`）：当期公告会列出新角色全部卡牌和灵光一闪的繁中原文，用 jina 能读。
 - 资料来源，按用途排：
   1. 玩家上传的真实配置：用 `config_sync.py` 里的 `SUPABASE_URL` / `SUPABASE_ANON_KEY` 分页拉 `configs` 表（`mode` 为 `sortie`/`chaos`），解码 `config_b64` 后按 `first_member` 或卡名筛选。卡名、闪光描述、神闪词条原文（如「赋予敌人脆弱2」）以这里同一服的游戏原文为准。
   2. GameKee 角色页（`gamekee.com/czn/<id>`）：每张牌 ①~⑤ 号灵光一闪的全文。正文在页面引用的 `api-cdn.gamekee.com/.../content/<id>.json`；curl 和 jina 会被 EdgeOne 拦（567），在浏览器里打开页面后用页面内 `fetch` 取，请求头带 `game-alias: czn`。卡牌接口 `/v1/entryCard/query-list` 的 `name_cn` 才是界面牌名（`name` 常是英文）。
-  3. 装备名和掉落地图只用 GameKee 装备页 `https://www.gamekee.com/czn/tj/equipage`（卡片 class 为 `equipage-card`）。这里的简体名是国际服译名转简后的写法。用户指定装备来源地图时，只列来源文字包含该地图的装备。图鉴档位神话 / 传说 / 稀有对应游戏内独特 / 传说 / 稀有。每人只能装一件独特，名额只留给优先级列表里的名字（`_reserves_unique`），三个号位合计只写一件要穿的神话。
+  3. 装备名和掉落地图只用 GameKee 装备页 `https://www.gamekee.com/czn/tj/equipage`（卡片 class 为 `equipage-card`）。2026-10-21 用 `curl -s "https://r.jina.ai/https://www.gamekee.com/czn/tj/equipage"` 能直接抓成 markdown（约 3800 行），grep 名字就能看到效果和来源，新卡厄思的装备也有，来源写的是国际服地图名（国服「天幕」= 国际服「天上防护墙」）。这里的简体名是国际服译名转简后的写法。用户指定装备来源地图时，只列来源文字包含该地图的装备。图鉴档位神话 / 传说 / 稀有对应游戏内独特 / 传说 / 稀有。每人只能装一件独特，名额只留给优先级列表里的名字（`_reserves_unique`），三个号位合计只写一件要穿的神话。
   4. B站攻略视频：通常没有字幕，用 `bili audio <BV> --no-split` 下载后跑 `agent-reach transcribe`。转写出来的名字是同音字（曾把「定位雷射」听成「追踪雷射」），只取打法思路，名字拿 1～3 核对。
 - 「闪光优先级」写成 `牌名:关键词`，关键词按字依次出现比对（`_flash_rules` / `_flash_rule_matches`）。神闪是普通版本的描述末尾再加一行神词条，想要某个神闪就写 `牌名:普闪关键词+神词条关键词`，排在普闪规则前面。卡牌列表按「包含」匹配。
 - 导入配置码只覆盖码里写到的键，没写的键沿用用户原来的值（往往是别的角色的配置）。所以要把该模式会读到的键都写上（`grep _get_config_value` 查全）。出击最容易漏的是「卡牌奖励优先级」：出击模式的牌靠奖励页发放，而且可以一直刷新，只填核心牌（如只填「定位雷射」），其余都会被刷掉。
+- 步骤（以「国服卡组截图 → 国际服配置码」为例）：
+  1. 定模式：截图写着「参考PT」、讲存档的，是卡厄思模式；讲出击打法的，是出击模式。用户说「还有出击模式」就两份都出。
+  2. 认角色：截图上的牌名、专属词（如「明灭剑」「剑穗」）拿去 GameKee 或台服当期公告里找，拿到国际服角色名和整套卡牌表。
+  3. 对卡牌：截图里每张牌都按灵光一闪的描述找出对应版本，例如「生成3张剑穗…抽取1张自身的卡牌」对应「劍之共鳴」的「生成3張劍穗 抽取自身卡牌1」。每条闪光规则取这个版本独有的一小段做关键词；同一张牌要几个不同版本，就各写一条，按截图里的张数排先后。起始牌（基础攻击、护盾）卡组里没有的，放进移除列表。
+  4. 对装备：在 GameKee 装备页按国服名找；找不到就按效果和来源地图找。推荐表里排在后面的装备，对得上的也加进去当后备。
+  5. 验证：用仓库 `.venv` 里的 OpenCC，按 `utils._normalize_text` 的做法把繁中原文和配置里写的词都转一遍，确认关键词按顺序出现在转换后的原文里。
+  6. 出码：以用户当前的 `configs/ChaosMode.json` / `SortieMode.json` 为底，去掉 `_` 开头的键和 `配置操作`，只替换和角色有关的键，用户自己的设置（路线、任务、加速、队友等）保持原样。每个键的值要和原值同类型（`_import_config_from_text` 会丢掉类型对不上的键），生成后解码一次核对。
+  7. 回复：给出配置码、国服↔国际服对照表、改了哪些键，再列出没对上或没把握的项（如还查不到译名的装备、没实战验证过的出牌顺序）。只生成配置码，不改用户的配置文件。
 
 **出击模式出牌 `ok_tasks/utils_battle.py`**：`utils_sortie.handle_battle_page` 只保留 Ego 释放和「结束回合」按钮检测，出牌交给 `utils_battle.play_turn`（设计见 `CONTEXT.md` 术语表和 `docs/adr/0001`）。
 
