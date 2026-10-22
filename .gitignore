@@ -29,7 +29,7 @@ test_scripts/
 screenshots/
 thread_dumps.txt
 *.so
-*.bat
+
 *.exe
 *.manifest
 
