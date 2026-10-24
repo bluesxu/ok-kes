@@ -4047,12 +4047,15 @@ def _is_info_option(description):
 
 _EVENT_CHECK_ONCE_SECONDS = 300  # 同一事件页的放大镜多久内只点一次
 _EVENT_F1_ICON_BELOW = 0.045  # 事件页 F1 图标中心在「F1」标签下方多远（按画面高的比例）
+# 标签字小、底下是雪地，常被读成「E1」：实跑 10/23 16:53「半身已成机械的士兵」事件前 4 帧都没认出来，
+# 先点了选项；同一截图缩放 0.95/1.05 倍就读成 E1（0.82），所以 F/E 和 1/I/l/| 都算
+_EVENT_F1_LABEL = re.compile(r"[FE][1IL|]")
 
 
 def _find_event_f1_icon(task: TriggerTask, region):
     """新版本事件页中间顶着「F1」标签的图标（用户 10/21 要求遇到就点，常开）：图案每个事件不一样
     （紫色徽记、黑底菱形旗），按标签文字找，返回标签下方图标的框。休息区右下角「跳过」上的 F1 不在这个区域里。"""
-    label = next((box for box in task.all_texts if box.name.strip().upper() == "F1"
+    label = next((box for box in task.all_texts if _EVENT_F1_LABEL.fullmatch(box.name.replace(" ", "").upper())
                   and region[0] <= (box.x + box.width / 2) / task.width <= region[2]
                   and region[1] <= (box.y + box.height / 2) / task.height <= region[3]), None)
     if not label:
@@ -4668,6 +4671,29 @@ _REST_BUBBLE_REGION = (0.15, 0.25, 0.85, 0.80)  # 篝火边人物头顶
 _REST_BUBBLE_TRIES = 2         # 同一个休息区最多点几次（第一次可能点在入场动画里没反应）
 _REST_BUBBLE_GAP = 3.0         # 两次点击至少隔这么久
 _REST_BUBBLE_ONCE_SECONDS = 300  # 节点序号每层重新数，超过这么久当作另一个休息区
+# 气泡大小每次不一样：同样 3200x1800 窗口，10/23 10:22 那次比模板小约 10%，原尺寸相似度只有 0.54，缩到 0.9 倍是 0.99；
+# 相似度对尺寸很敏感（差 5% 就掉到 0.8 左右），原尺寸找不到时按这些比例再找
+_REST_BUBBLE_SCALES = (0.9, 1.1, 0.85, 0.95, 1.05, 1.15)
+# 搜索区域很大，3200x1800 原图匹配一次约 110ms；缩到 900 高再匹配约 30ms，相似度基本不变
+_REST_BUBBLE_MATCH_HEIGHT = 900
+
+
+def _find_rest_bubble(task: TriggerTask):
+    region = task.box_of_screen(*_REST_BUBBLE_REGION)
+    target_height = min(task.height, _REST_BUBBLE_MATCH_HEIGHT)
+    bubble = task.find_one(feature_name="rest_bubble", box=region, threshold=0.75, target_height=target_height)
+    if bubble:
+        return bubble
+    feature = task.get_feature_by_name("rest_bubble")
+    if feature is None:
+        return None
+    for scale in _REST_BUBBLE_SCALES:
+        template = cv2.resize(feature.mat, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        bubble = task.find_one(feature_name="rest_bubble", box=region, threshold=0.75, template=template,
+                               target_height=target_height)
+        if bubble:
+            return bubble
+    return None
 
 
 def handle_rest_bubble(task: TriggerTask):
@@ -4683,7 +4709,7 @@ def handle_rest_bubble(task: TriggerTask):
         record = (node, 0, 0.0)
     if record[1] >= _REST_BUBBLE_TRIES or now - record[2] < _REST_BUBBLE_GAP:
         return False
-    bubble = task.find_one(feature_name="rest_bubble", box=task.box_of_screen(*_REST_BUBBLE_REGION), threshold=0.75)
+    bubble = _find_rest_bubble(task)
     if not bubble:
         return False
     task.log_info(f"休息区检测到人物头顶的气泡，相似度={bubble.confidence:.4f}，点击")

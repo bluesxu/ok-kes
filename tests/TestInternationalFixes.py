@@ -2,6 +2,7 @@
 import os
 import sys
 import time
+import types
 import unittest
 import unittest.mock
 
@@ -52,6 +53,9 @@ class PageTask:
 
     def find_one(self, feature_name=None, box=None, threshold=0, **kwargs):
         return self.features.get(feature_name)
+
+    def get_feature_by_name(self, name):
+        return None
 
     def box_of_screen(self, x, y, to_x=1.0, to_y=1.0, **kwargs):
         return Box(x * WIDTH, y * HEIGHT, to_x=to_x * WIDTH, to_y=to_y * HEIGHT)
@@ -394,6 +398,24 @@ class TestRestBubble(unittest.TestCase):
         self.assertTrue(utils.handle_rest_bubble(task))  # 下一个休息区照常点
         self.assertEqual(3, task.clicked.count("rest_bubble"))
 
+    def test_bubble_smaller_than_template(self):
+        # 实跑 10/23 10:22：气泡比模板小约 10%，原尺寸相似度 0.54 找不到，一直没点
+        task = self.page()
+        bubble = task.features.pop("rest_bubble")
+        sizes = []
+
+        def find_one(feature_name=None, template=None, **kwargs):
+            if template is None:
+                return None
+            sizes.append(template.shape[0])
+            return bubble if template.shape[0] == 90 else None
+
+        task.find_one = find_one
+        task.get_feature_by_name = lambda name: types.SimpleNamespace(mat=np.zeros((100, 80, 3), np.uint8))
+        self.assertTrue(utils.handle_rest_bubble(task))
+        self.assertEqual(["rest_bubble"], task.clicked)
+        self.assertEqual([90], sizes)  # 先试 0.9 倍
+
     def test_no_bubble_or_not_rest_page(self):
         self.assertFalse(utils.handle_rest_bubble(self.page(bubble=False)))
         task = PageTask(CHAOS_REST, CHAOS_FEATURES + [("rest_bubble", 0.34, 0.50)])
@@ -705,8 +727,38 @@ class TestMemoryImprint(unittest.TestCase):
         self.assertEqual((True, [0.75]), self.run_page(["女子", "贪婪"]))
 
     def test_default_when_nothing_matches(self):
-        self.assertEqual((True, [0.25]), self.run_page("不存在"))
+        used_up = [("0/3",) + t[1:] if t[0] == "3/3" else t for t in MEMORY_PAGE_2]
+        self.assertEqual((True, [0.25]), self.run_page("不存在", page=used_up))
         self.assertEqual((True, [0.75]), self.run_page("", default="3"))
+
+    def test_refresh_count_with_misread_slash(self):
+        for count in ("3／3", "313", "3|3"):
+            page = [(count,) + t[1:] if t[0] == "3/3" else t for t in MEMORY_PAGE_2]
+            self.assertEqual((True, [("重新搜索", 0.25)]), self.run_page("贪婪", page=page), count)
+
+    def test_waits_when_refresh_count_unreadable(self):
+        """实跑 10/24 20:58：三张都读不出重新搜索次数，当帧就随机选了不含「金光」的牌。"""
+        page = [t for t in MEMORY_PAGE_2 if t[0] != "3/3"]
+        task = PageTask(page)
+        task.config.update({speedup.MEMORY_PRIORITY_KEY: "贪婪", speedup.MEMORY_DEFAULT_KEY: "3"})
+        now = [1000.0]
+        with unittest.mock.patch.object(utils, "is_button_active", lambda t, b: False), \
+                unittest.mock.patch.object(speedup.time, "time", lambda: now[0]), \
+                unittest.mock.patch.object(speedup.battle_log, "anomaly", lambda *a, **k: None), \
+                unittest.mock.patch.object(utils, "_move_and_click", lambda t, x, y: task.clicked.append(round(x, 2))):
+            self.assertTrue(speedup.handle_memory_imprint(task))
+            now[0] += 1
+            self.assertTrue(speedup.handle_memory_imprint(task))
+            self.assertEqual([], task.clicked)          # 还在等
+            task.show(MEMORY_PAGE_2)                   # 次数读出来了：刷新
+            self.assertTrue(speedup.handle_memory_imprint(task))
+            self.assertEqual([0.25], task.clicked)
+            task.show(page)                            # 又读不出：重新计时，等满再按默认
+            now[0] += 1
+            self.assertTrue(speedup.handle_memory_imprint(task))
+            now[0] += speedup._MEMORY_REFRESH_WAIT
+            self.assertTrue(speedup.handle_memory_imprint(task))
+            self.assertEqual([0.25, 0.75], task.clicked)
 
     def test_default_priority_is_toughness_damage(self):
         speedup_default = speedup._MEMORY_DEFAULT_KEYWORD
@@ -1109,6 +1161,14 @@ class TestInfoOption(unittest.TestCase):
     def test_skip_button_f1_is_not_event_icon(self):
         # 休息区右下角「跳過」上也标着 F1，不在事件页找图标的区域里
         task = PageTask([("F1", 0.820, 0.876, 0.03, 0.03)])
+        self.assertIsNone(utils._find_event_f1_icon(task, (0.396, 0.286, 0.960, 0.718)))
+
+    def test_f1_label_misread(self):
+        # 实跑 10/23 16:53：标签被读成「E1」，前 4 帧都没认出图标
+        for name in ("E1", "FI", "Fl", "F 1"):
+            task = PageTask([(name, 0.506, 0.518, 0.03, 0.03)])
+            self.assertIsNotNone(utils._find_event_f1_icon(task, (0.396, 0.286, 0.960, 0.718)), name)
+        task = PageTask([("E11", 0.506, 0.518, 0.03, 0.03)])
         self.assertIsNone(utils._find_event_f1_icon(task, (0.396, 0.286, 0.960, 0.718)))
 
 

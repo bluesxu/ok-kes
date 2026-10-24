@@ -194,6 +194,9 @@ _MEMORY_NAME_BOTTOM = 0.35   # 牌名「记忆：贪婪」在卡顶部（实跑�
 _MEMORY_CARD_Y = 0.48
 _MEMORY_CONFIRM = (0.80, 0.86, 0.99, 0.99)
 _MEMORY_REFRESH_Y = (0.79, 0.86)   # 每张记忆卡下方的「重新搜索 3/3」，只换掉这一张
+# 次数是个位数；OCR 偶尔把斜杠读成全角「／」、「|」或「1」（「4/4」→「414」）
+_MEMORY_REFRESH_COUNT = (re.compile(r"(\d+)\s*[/／]\s*\d+"), re.compile(r"(\d)\s*[|丨Il1]\s*\d"))
+_MEMORY_REFRESH_WAIT = 3.0   # 三张都不含关键词、又读不出剩余次数时，最多等几秒再按默认选择
 _MEMORY_DEFAULT_KEYWORD = "触发韧性伤害"
 
 
@@ -1582,6 +1585,15 @@ def choose_memory(names, descriptions, priority, default):
     return index, f"没有匹配的记忆卡，按默认选第{index + 1}张"
 
 
+def _memory_refresh_count(text):
+    """记忆卡下方「重新搜索 3/3」的剩余次数，读不出返回 None。"""
+    for pattern in _MEMORY_REFRESH_COUNT:
+        found = pattern.search(text)
+        if found:
+            return int(found.group(1))
+    return None
+
+
 def handle_memory_imprint(task):
     title = utils._get_region_text(task, _MEMORY_TITLE)
     if "刻印的记" not in title and "刻印的記" not in title:
@@ -1601,19 +1613,36 @@ def handle_memory_imprint(task):
         keyword = keyword[0] if keyword else ""
     priority = [keyword] if str(keyword).strip() else []
     default = utils._get_config_value(task, MEMORY_DEFAULT_KEY, "1")
+    refreshes = [utils._get_region_text(task, (x1, _MEMORY_REFRESH_Y[0], x2, _MEMORY_REFRESH_Y[1]))
+                 for x1, _, x2, _ in _MEMORY_CARDS]
     if priority and any(texts) and match_memory(names, descriptions, priority) is None:
-        for slot, region in enumerate(_MEMORY_CARDS, 1):
-            refresh = utils._get_region_text(task, (region[0], _MEMORY_REFRESH_Y[0], region[2], _MEMORY_REFRESH_Y[1]))
-            count = re.search(r"(\d+)\s*/\s*\d+", refresh)
-            if count and int(count.group(1)) > 0:
-                task.log_info(f"选择刻印的记忆：三张都不含优先级关键词，重新搜索第{slot}张（剩 {count.group(1)} 次），"
+        counts = [_memory_refresh_count(text) for text in refreshes]
+        for slot, (region, count) in enumerate(zip(_MEMORY_CARDS, counts), 1):
+            if count:
+                task._memory_wait_since = None
+                task.log_info(f"选择刻印的记忆：三张都不含优先级关键词，重新搜索第{slot}张（剩 {count} 次），"
                               f"三张=「{'」「'.join(texts)}」")
-                battle_log.record(task, "记忆卡刷新", options=texts, slot=slot, remaining=int(count.group(1)))
+                battle_log.record(task, "记忆卡刷新", options=texts, slot=slot, remaining=count)
                 utils._move_and_click(task, (region[0] + region[2]) / 2, sum(_MEMORY_REFRESH_Y) / 2)
                 task.sleep(1)
                 return True
+        if None in counts:
+            # 实跑 10/24 20:58：三张都读不出剩余次数（次数其实没用完），当帧就按默认随机选了不含关键词的牌
+            now = time.time()
+            since = getattr(task, "_memory_wait_since", None)
+            if since is None or now - since > _MEMORY_REFRESH_WAIT * 3:
+                task._memory_wait_since = since = now
+            if now - since < _MEMORY_REFRESH_WAIT:
+                task.log_info(f"选择刻印的记忆：三张都不含优先级关键词，重新搜索次数读不出来，再等一帧，"
+                              f"重新搜索区域=「{'」「'.join(refreshes)}」")
+                task.sleep(0.5)
+                return True
+            battle_log.anomaly(task, "记忆卡读不到重新搜索次数",
+                               f"等了 {_MEMORY_REFRESH_WAIT:.0f} 秒仍读不出，按默认选择，区域=「{'」「'.join(refreshes)}」")
+    task._memory_wait_since = None
     index, reason = choose_memory(names, descriptions, priority, default)
-    task.log_info(f"选择刻印的记忆：选第{index + 1}张（{reason}），三张=「{'」「'.join(texts)}」")
+    task.log_info(f"选择刻印的记忆：选第{index + 1}张（{reason}），三张=「{'」「'.join(texts)}」，"
+                  f"重新搜索区域=「{'」「'.join(refreshes)}」")
     if not any(texts):
         battle_log.anomaly(task, "记忆卡读不到文字", "三张记忆卡区域都没有文字，按默认选择")
     battle_log.record(task, "记忆卡选择", options=texts, chosen=index + 1, reason=reason)
