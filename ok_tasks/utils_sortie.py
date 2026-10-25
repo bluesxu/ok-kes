@@ -32,6 +32,8 @@ import re
 import random
 import time
 
+import numpy as np
+
 import battle_log
 import utils
 import utils_battle
@@ -446,8 +448,106 @@ def handle_secret_enemy(task: TriggerTask):
     return False
 
 
+_AUTO_BUTTON = (0.880, 0.056)    # 右上角游戏自带的自动战斗按钮（按键 R），卡厄思模式点的也是这里
+_AUTO_PROBE = (0.877, 0.050)     # 卡厄思模式判断「关着」的 4x4 取样点：关着时图标是白色，这里有纯白像素
+_AUTO_ICON = (0.8785, 0.051)     # 图标中心，开着时是金色，锁着时是灰色挂锁
+_AUTO_ICON_RADIUS = 0.004        # 图标中心取样框的半边长（按画面宽）
+_AUTO_BANNER_REGION = (0.83, 0.0, 0.98, 0.11)  # 选牌时右上角会盖一条橙色提示横幅（「選擇卡牌 SPACE」），盖住时认不出按钮
+_AUTO_CLICK_GAP = 3.0            # 点过按钮这么久之内不再点，等图标变过来
+_AUTO_UNKNOWN_WAIT = 5.0         # 要用游戏自动战斗但认不出按钮（被角色对话框挡住等）时最多等这么久，之后照常由脚本出牌
+_AUTO_NOTE_GAP = 60.0            # 「锁着 / 认不出改用脚本」的提示多久记一次
+
+
+def _auto_button_state(task):
+    """右上角自动战斗按钮的状态：'on' 金色图标（游戏在自动出牌）、'off' 白色图标、'locked' 灰色挂锁
+    （出击里默认锁着，加速补丁解锁后才能用）、None 认不出（被选牌提示横幅、角色头顶对话框挡住等）。
+    依据 10/24、10/25 卡厄思和 10/11 出击的现场截图（3200x1800）：开着时图标中心是淡金色（均值约 BGR 107/155/196，
+    R 比 B 大 35 以上且 B、G 不低的像素过 3 成），锁着时是中性浅灰（R≈G≈B 在 140~225 之间的像素约 4 成），
+    关着沿用卡厄思模式的判定（日志里关着 18.75%、开着 0%）。选牌横幅是橙色（约 BGR 14/98/163），右上角大半都是它。"""
+    frame = getattr(task, "frame", None)
+    if frame is None:
+        return None
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = _AUTO_BANNER_REGION
+    region = frame[int(y1 * height):int(y2 * height):4, int(x1 * width):int(x2 * width):4, :3].reshape(-1, 3).astype(int)
+    if region.size and np.mean((region[:, 2] >= 150) & (region[:, 2] - region[:, 0] >= 100)
+                               & (region[:, 1] <= region[:, 2] - 40)) >= 0.3:
+        return None
+    x, y = int(_AUTO_PROBE[0] * width), int(_AUTO_PROBE[1] * height)
+    probe = frame[y:y + 4, x:x + 4, :3].reshape(-1, 3)
+    cx, cy = int(_AUTO_ICON[0] * width), int(_AUTO_ICON[1] * height)
+    r = max(3, int(_AUTO_ICON_RADIUS * width))
+    icon = frame[max(0, cy - r):cy + r, max(0, cx - r):cx + r, :3].reshape(-1, 3).astype(int)
+    if probe.size == 0 or icon.size == 0:
+        return None
+    blue, green, red = icon[:, 0], icon[:, 1], icon[:, 2]
+    if np.mean((red >= 150) & (red - blue >= 35) & (blue >= 60) & (green >= 120)) >= 0.3:
+        return "on"
+    if np.mean(np.all(probe >= 255, axis=1)) > 0.02:
+        return "off"
+    brightest, spread = icon.max(axis=1), icon.max(axis=1) - icon.min(axis=1)
+    if np.mean((spread < 20) & (brightest >= 140) & (brightest <= 225)) >= 0.25:
+        return "locked"
+    return None
+
+
+def _click_auto_button(task, state, want, reason):
+    """点一下自动战斗按钮（开或关），_AUTO_CLICK_GAP 之内只点一次。"""
+    now = time.time()
+    if now - getattr(task, "_auto_btn_clicked_at", 0.0) < _AUTO_CLICK_GAP:
+        return
+    task._auto_btn_clicked_at = now
+    action = "开启" if state == "off" else "关闭"
+    task.log_info(f"游戏自动战斗：按钮{'关着' if state == 'off' else '开着'}，{reason}，点击{action}")
+    battle_log.record(task, "自动战斗按钮", action=action, state=state, want=want)
+    _move_and_click(task, *_AUTO_BUTTON)
+
+
+def _note_script_play(task, state, want, reason):
+    """「使用游戏自动战斗」开着却只能由脚本出牌时记一下原因（_AUTO_NOTE_GAP 之内只记一次）。"""
+    now = time.time()
+    if now - getattr(task, "_auto_btn_noted_at", 0.0) < _AUTO_NOTE_GAP:
+        return
+    task._auto_btn_noted_at = now
+    task.log_info(f"游戏自动战斗：{reason}，由脚本出牌")
+    battle_log.record(task, "自动战斗按钮", action=reason, state=state, want=want)
+
+
+def _game_auto_battle(task):
+    """「使用游戏自动战斗」：返回 True 表示这一帧交给游戏自带的自动战斗（等它出牌，或点按钮开关），脚本不出牌。
+    开着本项：按钮关着就点开、开着就等；锁着（没装或关了加速补丁的解锁）照常由脚本出牌；
+    认不出时等一会儿（可能只是被对话框挡住），超过 _AUTO_UNKNOWN_WAIT 秒还认不出才由脚本出牌。
+    关着本项：游戏的自动战斗如果开着（游戏会记住上次的开关），先点掉，免得和脚本一起出牌。"""
+    want = bool(_get_config_value(task, utils_battle.GAME_AUTO_KEY, False))
+    state = _auto_button_state(task)
+    if state is not None:
+        task._auto_btn_unknown_since = None
+    if not want:
+        if state == "on":
+            _click_auto_button(task, state, want, "没开「使用游戏自动战斗」")
+            return True
+        return False
+    if state == "on":
+        return True
+    if state == "off":
+        _click_auto_button(task, state, want, "开了「使用游戏自动战斗」")
+        return True
+    if state == "locked":
+        _note_script_play(task, state, want, "按钮锁着（加速补丁没解锁）")
+        return False
+    since = getattr(task, "_auto_btn_unknown_since", None)
+    now = time.time()
+    if since is None:
+        task._auto_btn_unknown_since = since = now
+    if now - since < _AUTO_UNKNOWN_WAIT:
+        return True
+    _note_script_play(task, state, want, f"按钮 {_AUTO_UNKNOWN_WAIT:.0f} 秒认不出")
+    return False
+
+
 def handle_battle_page(task: TriggerTask):
-    """战斗页面: 先按条件释放 Ego；否则交给 utils_battle 按费用、出牌优先级、预计扣血出一张牌或结束回合。"""
+    """战斗页面: 开了「使用游戏自动战斗」且按钮能用时交给游戏（_game_auto_battle）；
+    否则先按条件释放 Ego，再交给 utils_battle 按费用、出牌优先级、预计扣血出一张牌或结束回合。"""
 
     hand_count = _read_hand_count(task)
     if hand_count is None:
@@ -457,6 +557,9 @@ def handle_battle_page(task: TriggerTask):
     if hasattr(task, 'node_status') and task.node_status.get('reach_final_boss', False)             and not task.node_status.get('final_boss_battle', False):
         task.node_status['final_boss_battle'] = True
         task.log_info("检测到最终boss战斗开始，final_boss_battle=True")
+
+    if _game_auto_battle(task):
+        return True
 
     finishturn_box = task.box_of_screen(0.844, 0.782, 0.998, 0.990)
     finish_turn_visible = bool(task.find_feature(feature_name="finishturn", box=finishturn_box))

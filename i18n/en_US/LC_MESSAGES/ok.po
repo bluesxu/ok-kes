@@ -442,3 +442,6 @@ msgstr "Play survival cards first when HP after the enemies' attacks is expected
 
 msgid "闪光出来的 3 个版本里不选这些：写法同「闪光优先级」（牌名:关键词，或对所有牌生效的关键词）；3 个版本都被拉黑时点「跳过」"
 msgstr "Never pick these among the 3 flash versions. Same format as the flash priority list (card name:keyword, or a keyword for every card); if all 3 versions are blocked, skip."
+
+msgid "战斗交给游戏自带的自动战斗，脚本不出牌也不放 Ego。出击里游戏的自动战斗默认锁着，要用加速补丁解锁（游戏里按 F7 开关）；按钮锁着时照常由脚本出牌。关掉本项时，游戏的自动战斗如果开着会先把它关掉"
+msgstr "Let the game's built-in auto battle fight; the script stops playing cards and using Ego. In sortie the game's auto battle is locked by default and needs the speed patch to unlock it (press F7 in game to toggle); while the button is locked the script plays as usual. When this is off and the game's auto battle is on, it is turned off first."

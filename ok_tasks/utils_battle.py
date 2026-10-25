@@ -33,6 +33,7 @@ from utils import _get_config_value, _move_and_click, _normalize_text, _simplify
 DEFENSE_KEY = "防御卡牌列表"
 COLLECT_KEY = "意图采集"
 DANGER_KEY = "防御血量线(%)"
+GAME_AUTO_KEY = "使用游戏自动战斗"  # 交给游戏自带的自动战斗，见 utils_sortie._game_auto_battle
 
 ICON_DIR = os.path.join("configs", "battle_icons")
 INTENT_ATTACK, INTENT_DEFENSE, INTENT_BUFF = "攻击", "防御", "增益"
@@ -136,13 +137,19 @@ _ocr_libs_started = threading.Event()
 
 def install(task):
     """给出击模式加上出牌相关配置项。"""
+    task.default_config[GAME_AUTO_KEY] = False
     task.default_config[DEFENSE_KEY] = []
     task.default_config[COLLECT_KEY] = False
     task.default_config[DANGER_KEY] = 25
     task.config_description[DEFENSE_KEY] = "保命牌（加护盾、回血）：牌名带「盾」「格挡」「壁」「治」「疗」「恢复」等字的会自动认出，这里只需补充认不出的牌；预计这回合会被打死、或挨打后血量低于「防御血量线」时先出这些牌"
     task.config_description[DANGER_KEY] = "预计敌人这一轮打完后我方血量低于上限的百分之几，就先出保命牌；0 为只在会被打死时才出"
     task.config_description[COLLECT_KEY] = "前期收集数据用：遇到没见过的意图图标时点开怪物信息面板读出意图并记下图标，会变慢；图标收集够后关闭"
+    task.config_description[GAME_AUTO_KEY] = (
+        "战斗交给游戏自带的自动战斗，脚本不出牌也不放 Ego。出击里游戏的自动战斗默认锁着，要用加速补丁解锁"
+        "（游戏里按 F7 开关）；按钮锁着时照常由脚本出牌。关掉本项时，游戏的自动战斗如果开着会先把它关掉"
+    )
     config_io.UI_ONLY_CONFIG_KEYS.add(COLLECT_KEY)
+    config_io.UI_ONLY_CONFIG_KEYS.add(GAME_AUTO_KEY)  # 依赖本机的加速补丁，不进配置码
 
 
 # ======================================================================

@@ -2403,5 +2403,119 @@ class TestPileSelect(unittest.TestCase):
         self.assertEqual([True, False], seen)
 
 
+class TestGameAutoBattle(unittest.TestCase):
+    """出击「使用游戏自动战斗」：右上角自动战斗按钮的状态识别和开关逻辑。
+    测试图片是 3200x1800 画面里 x 0.83~0.98、y 0~0.11 的一块，贴回同尺寸画面的原位置：
+    auto_button_on（10/25 卡厄思，同一位置的 CTRL 自动进行按钮开着，和战斗里的 R 按钮同样是淡金色）、
+    auto_button_locked（10/11 出击战斗，灰色挂锁）、auto_button_banner（10/25 卡厄思战斗中选牌，橙色提示横幅盖住按钮）。"""
+    WIDTH, HEIGHT = 3200, 1800
+    CROP_X = int(0.83 * 3200)
+
+    def frame_with(self, name=None):
+        frame = np.zeros((self.HEIGHT, self.WIDTH, 3), dtype=np.uint8)
+        if name:
+            crop = cv2.imdecode(np.fromfile(os.path.join(IMAGES, name), dtype=np.uint8), cv2.IMREAD_COLOR)
+            frame[0:crop.shape[0], self.CROP_X:self.CROP_X + crop.shape[1]] = crop
+        return frame
+
+    def off_frame(self):
+        """关着是白色交叉剑，手上没有截图：按卡厄思日志的读数造（4x4 取样点里有纯白，日志里是 18.75%）。"""
+        frame = self.frame_with()
+        x, y = int(0.877 * self.WIDTH), int(0.050 * self.HEIGHT)
+        frame[y:y + 4, x:x + 1] = 255
+        return frame
+
+    def make_task(self, frame, want):
+        return SimpleNamespace(frame=frame, width=self.WIDTH, height=self.HEIGHT, config={battle.GAME_AUTO_KEY: want},
+                               log_info=lambda message: None)
+
+    def run_auto(self, task, frame, now):
+        task.frame = frame
+        clicks, records = [], []
+        with mock.patch.object(utils_sortie, "_move_and_click", lambda t, x, y: clicks.append((x, y))), \
+                mock.patch.object(utils_sortie.battle_log, "record", lambda t, event, **f: records.append((event, f))), \
+                mock.patch.object(utils_sortie.time, "time", return_value=now):
+            result = utils_sortie._game_auto_battle(task)
+        return result, clicks, records
+
+    def test_button_states_from_screenshots(self):
+        state = utils_sortie._auto_button_state
+        self.assertEqual("on", state(self.make_task(self.frame_with("auto_button_on.png"), True)))
+        self.assertEqual("locked", state(self.make_task(self.frame_with("auto_button_locked.png"), True)))
+        self.assertIsNone(state(self.make_task(self.frame_with("auto_button_banner.png"), True)))  # 橙色不是金色
+        self.assertEqual("off", state(self.make_task(self.off_frame(), True)))
+        self.assertIsNone(state(self.make_task(self.frame_with(), True)))
+
+    def test_want_turns_off_button_on_once_per_gap(self):
+        task = self.make_task(None, True)
+        result, clicks, records = self.run_auto(task, self.off_frame(), 1000.0)
+        self.assertTrue(result)
+        self.assertEqual([utils_sortie._AUTO_BUTTON], clicks)
+        self.assertEqual([("自动战斗按钮", {"action": "开启", "state": "off", "want": True})], records)
+        result, clicks, _ = self.run_auto(task, self.off_frame(), 1001.0)  # 图标还没变过来：不连点
+        self.assertTrue(result)
+        self.assertEqual([], clicks)
+        _, clicks, _ = self.run_auto(task, self.off_frame(), 1004.0)
+        self.assertEqual(1, len(clicks))
+
+    def test_want_waits_while_game_plays(self):
+        task = self.make_task(None, True)
+        result, clicks, records = self.run_auto(task, self.frame_with("auto_button_on.png"), 1000.0)
+        self.assertTrue(result)
+        self.assertEqual(([], []), (clicks, records))
+
+    def test_locked_falls_back_to_script_and_notes_once(self):
+        task = self.make_task(None, True)
+        frame = self.frame_with("auto_button_locked.png")
+        result, clicks, records = self.run_auto(task, frame, 1000.0)
+        self.assertFalse(result)
+        self.assertEqual([], clicks)
+        self.assertEqual("自动战斗按钮", records[0][0])
+        self.assertIn("锁着", records[0][1]["action"])
+        _, _, records = self.run_auto(task, frame, 1030.0)
+        self.assertEqual([], records)  # 60 秒内不重复记
+
+    def test_unknown_waits_then_falls_back(self):
+        task = self.make_task(None, True)
+        banner = self.frame_with("auto_button_banner.png")
+        self.assertTrue(self.run_auto(task, banner, 1000.0)[0])
+        self.assertTrue(self.run_auto(task, banner, 1004.0)[0])
+        result, clicks, records = self.run_auto(task, banner, 1006.0)
+        self.assertFalse(result)
+        self.assertEqual([], clicks)  # 盖着横幅时绝不点
+        self.assertIn("认不出", records[0][1]["action"])
+        # 认出来以后重新计时
+        self.run_auto(task, self.frame_with("auto_button_on.png"), 1007.0)
+        self.assertTrue(self.run_auto(task, banner, 1008.0)[0])
+
+    def test_not_wanted_turns_game_auto_off(self):
+        task = self.make_task(None, False)
+        result, clicks, records = self.run_auto(task, self.frame_with("auto_button_on.png"), 1000.0)
+        self.assertTrue(result)
+        self.assertEqual([utils_sortie._AUTO_BUTTON], clicks)
+        self.assertEqual("关闭", records[0][1]["action"])
+        for frame in (self.off_frame(), self.frame_with("auto_button_locked.png"), self.frame_with("auto_button_banner.png")):
+            result, clicks, records = self.run_auto(self.make_task(None, False), frame, 2000.0)
+            self.assertFalse(result)
+            self.assertEqual(([], []), (clicks, records))
+
+    def test_battle_page_hands_over_to_game(self):
+        def page(frame, want):
+            task = self.make_task(frame, want)
+            task.box_of_screen = lambda *args: None
+            task.find_feature = lambda **kwargs: []
+            with mock.patch.object(utils_sortie, "_read_hand_count", return_value=5), \
+                    mock.patch.object(utils_sortie.battle_log, "record", lambda *a, **k: None), \
+                    mock.patch.object(utils_sortie, "_move_and_click", lambda *a: None), \
+                    mock.patch.object(battle, "use_ego", return_value=False) as ego, \
+                    mock.patch.object(battle, "play_turn", return_value=True) as play:
+                result = utils_sortie.handle_battle_page(task)
+            return result, ego.called, play.called
+
+        self.assertEqual((True, False, False), page(self.frame_with("auto_button_on.png"), True))
+        self.assertEqual((True, True, True), page(self.frame_with("auto_button_locked.png"), True))
+        self.assertEqual((True, True, True), page(self.off_frame(), False))  # 没开本项：照常脚本出牌
+
+
 if __name__ == "__main__":
     unittest.main()
