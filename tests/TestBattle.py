@@ -21,6 +21,7 @@ import battle_log  # noqa: E402
 import utils  # noqa: E402
 import utils_battle as battle  # noqa: E402
 import utils_sortie  # noqa: E402
+import utils_chaos  # noqa: E402
 
 IMAGES = os.path.join(ROOT, "tests", "images", "battle")
 
@@ -2515,6 +2516,89 @@ class TestGameAutoBattle(unittest.TestCase):
         self.assertEqual((True, False, False), page(self.frame_with("auto_button_on.png"), True))
         self.assertEqual((True, True, True), page(self.frame_with("auto_button_locked.png"), True))
         self.assertEqual((True, True, True), page(self.off_frame(), False))  # 没开本项：照常脚本出牌
+
+
+class TestNectusEquipment(unittest.TestCase):
+    # 用户 10/25：赛内克图斯掉的六件装备每局只能拿一件，配置了其中几件、掉的又不是时直接撤退
+
+    def equipment_page(self, ocr_name, config, buy=False):
+        boxes = {(0.499, 0.126): Box(1400, 140, 80, 30, name="装备"),
+                 (0.921, 0.135): Box(2600, 150, 200, 30, name="请选择主战员")}
+        task = mock.MagicMock()
+        task.height, task.width = 1207, 2145
+        task.node_status = utils._initial_node_status()
+        task.default_config = {"装备1号位优先级": [], "装备2号位优先级": [], "装备3号位优先级": []}
+        task.config = dict(config)
+        task.all_texts = [Box(1600, 1120, 100, 40, name="购买")] if buy else []
+        with mock.patch.object(utils_chaos, "find_box_at_point", lambda t, x, y: boxes.get((x, y))),                 mock.patch.object(utils_chaos, "_get_region_text", lambda t, region: ocr_name),                 mock.patch.object(utils_chaos.battle_log, "record", lambda *a, **k: None):
+            handled = utils_chaos.handle_nectus_equipment(task)
+        return handled, task.node_status
+
+    def test_name_matching(self):
+        self.assertEqual("混沌指控", utils_chaos._nectus_equipment("混沌指控"))
+        self.assertEqual("乱数球体", utils_chaos._nectus_equipment("乱数球休"))  # 错一个字
+        self.assertEqual("混沌触手", utils_chaos._nectus_equipment("混沌触"))
+        self.assertIsNone(utils_chaos._nectus_equipment("符文图样之锤"))
+        self.assertIsNone(utils_chaos._nectus_equipment("混"))
+
+    def test_wrong_drop_marks_retreat(self):
+        # 10/24 实际配置：1 号位写了混沌触手，22:25 掉的是混沌指控
+        handled, ns = self.equipment_page("混沌指控", {"装备1号位优先级": ["混沌触手", "符文图样之锤"]})
+        self.assertFalse(handled)  # 这一页照常交给 handle_equipment
+        self.assertTrue(ns.get("nectus_retreat"))
+
+    def test_wanted_drop_keeps_going(self):
+        handled, ns = self.equipment_page("混沌触手", {"装备1号位优先级": ["混沌触手"], "装备3号位优先级": ["乱数球体"]})
+        self.assertFalse(handled)
+        self.assertFalse(ns.get("nectus_retreat", False))
+        _, ns = self.equipment_page("乱数球体", {"装备1号位优先级": ["混沌触手"], "装备3号位优先级": ["乱数球体"]})
+        self.assertFalse(ns.get("nectus_retreat", False))
+
+    def test_no_nectus_config_keeps_going(self):
+        _, ns = self.equipment_page("混沌指控", {"装备1号位优先级": ["符文图样之锤"]})
+        self.assertFalse(ns.get("nectus_retreat", False))
+
+    def test_other_equipment_and_shop_ignored(self):
+        _, ns = self.equipment_page("符文图样之锤", {"装备1号位优先级": ["混沌触手"]})
+        self.assertFalse(ns.get("nectus_checked", False))
+        _, ns = self.equipment_page("混沌指控", {"装备1号位优先级": ["混沌触手"]}, buy=True)
+        self.assertFalse(ns.get("nectus_retreat", False))
+
+    def test_retreat_on_reward_page_with_retries(self):
+        button = Box(2900, 1640, 100, 40, name="获得")
+        task = mock.MagicMock()
+        task.node_status = utils._initial_node_status()
+        task.node_status["nectus_retreat"] = True
+        task._escape_requested_at = 0
+        now = [1000.0]
+        opened, anomalies = [], []
+
+        def open_menu(t, y):
+            t._escape_requested_at = now[0]
+            opened.append(("click", y))
+
+        task.send_key.side_effect = lambda key: opened.append(key)
+        results = []
+        with mock.patch.object(utils_chaos, "find_box_at_point", lambda t, x, y: button),                 mock.patch.object(utils, "_open_escape_menu", open_menu),                 mock.patch.object(utils_chaos.time, "time", lambda: now[0]),                 mock.patch.object(utils_chaos.battle_log, "anomaly", lambda t, kind, detail: anomalies.append(kind)):
+            for _ in range(8):
+                results.append(utils_chaos.handle_nectus_retreat(task))
+                now[0] += 2.5
+        self.assertEqual([("click", 0.051), "q", ("click", 0.051), "q", ("click", 0.051)], opened)
+        self.assertEqual([True] * 5 + [False] * 3, results)
+        self.assertEqual(["赛内克图斯后撤退菜单打不开"], anomalies)
+
+    def test_retreat_needs_flag_and_not_escaped(self):
+        button = Box(2900, 1640, 100, 40, name="获得")
+        for status in ({}, {"nectus_retreat": True, "is_escaped": True}):
+            task = mock.MagicMock()
+            task.node_status = {**utils._initial_node_status(), **status}
+            with mock.patch.object(utils_chaos, "find_box_at_point", lambda t, x, y: button),                     mock.patch.object(utils, "_open_escape_menu", lambda t, y: self.fail("不该撤退")):
+                self.assertFalse(utils_chaos.handle_nectus_retreat(task))
+
+    def test_handlers_ordered(self):
+        handlers = utils_chaos.PAGE_HANDLERS
+        self.assertLess(handlers.index(utils_chaos.handle_nectus_retreat), handlers.index(utils_chaos.handle_route_selection))
+        self.assertLess(handlers.index(utils_chaos.handle_nectus_equipment), handlers.index(utils_chaos.handle_equipment))
 
 
 if __name__ == "__main__":

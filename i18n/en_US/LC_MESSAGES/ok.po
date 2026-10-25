@@ -389,8 +389,8 @@ msgstr "Which memory card to pick when nothing in the memory priority matches."
 msgid "记忆雕琢完成后的「记忆加工」页按列表顺序选第一张描述包含该关键词的卡（如「攻击力」「伤害量」），几张都包含时选百分比大的；都不包含时选百分比最大的；不填则不做记忆加工，雕琢完成直接离开"
 msgstr "On the Memory Processing page after carving, pick the first card whose description contains an entry (e.g. ATK, damage); if several match, take the higher percentage; if none match, take the highest percentage. Leave empty to skip processing and leave right after carving."
 
-msgid "攻击力（1 号位）装备的优先顺序，写在这里的装备优先给刷存档主战员，独特装备的名额也只留给这里写的"
-msgstr "Priority of attack (slot 1) equipment. Listed items go to the archive member first, and that member's single unique slot is reserved for them."
+msgid "攻击力（1 号位）装备的优先顺序，写在这里的装备优先给刷存档主战员，独特装备的名额也只留给这里写的。卡厄思模式里写了赛内克图斯掉的六件之一（混沌指控、乱数球体、混沌触手、错乱骰子、祸之圣袍、异常外壳，三个号位都算），掉的不是写了的就直接撤退"
+msgstr "Priority of attack (slot 1) equipment. Listed items go to the archive member first, and that member's single unique slot is reserved for them. In Chaos mode, if any slot list names one of the six drops of the elite 赛内克图斯 (混沌指控, 乱数球体, 混沌触手, 错乱骰子, 祸之圣袍, 异常外壳) and the run drops a different one, the run retreats immediately."
 
 msgid "防御力（2 号位）装备的优先顺序，写在这里的装备优先给刷存档主战员，独特装备的名额也只留给这里写的"
 msgstr "Priority of defense (slot 2) equipment. Listed items go to the archive member first, and that member's single unique slot is reserved for them."
