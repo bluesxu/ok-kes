@@ -1161,7 +1161,8 @@ def handle_chaos_reward_settlement(task: TriggerTask):
 
 # 精英「赛内克图斯」的掉落：六件里每局只给一件（梦境模式限定）
 NECTUS_EQUIPMENT = ("混沌指控", "乱数球体", "混沌触手", "错乱骰子", "祸之圣袍", "异常外壳")
-_NECTUS_RETREAT_TRIES = 6  # 撤退菜单最多开几次（轮流点图标和按 Q），都没出来就记异常、照常打下去
+_NECTUS_RETREAT_TRIES = 8  # 撤退菜单最多开几次（轮流点图标和按 Q），都没出来就记异常、照常打下去
+_NECTUS_PAGE_TRIES = 4     # 其中最多几次在装备页上开；还不行就让 handle_equipment 装完，到战利品页/路线页接着开
 
 
 def _nectus_equipment(name):
@@ -1185,21 +1186,24 @@ def _wanted_nectus_equipment(task: TriggerTask):
     return wanted
 
 
-def handle_nectus_equipment(task: TriggerTask):
-    """赛内克图斯掉落的安装装备页（用户 10/25）：六件每局只能拿一件，装备优先级里写了其中几件、
-    这次掉的又不是它们时，这局就不打了——记下 nectus_retreat，这一页照常交给 handle_equipment，
-    回到战利品页或路线页后由 handle_nectus_retreat 撤退。只看一次，商店购买页不算。总是返回 False。"""
-    ns = getattr(task, "node_status", None)
-    if not isinstance(ns, dict) or ns.get("nectus_checked"):
-        return False
+def _nectus_install_page(task: TriggerTask):
+    """安装装备页（标题「装备」、右上「请选择主战员」），商店购买页（底部有「购买」）不算。"""
     title = find_box_at_point(task, 0.499, 0.126)
     if not (title and title.name == "装备"):
         return False
     hint = find_box_at_point(task, 0.921, 0.135)
     if not (hint and _get_game_text(task, "请选择主战员") in hint.name):
         return False
-    if any("购买" in box.name for box in task.all_texts
-           if (box.y + box.height / 2) / task.height >= 0.881):
+    return not any("购买" in box.name for box in task.all_texts
+                   if (box.y + box.height / 2) / task.height >= 0.881)
+
+
+def handle_nectus_equipment(task: TriggerTask):
+    """赛内克图斯掉落的安装装备页（用户 10/25）：六件每局只能拿一件，装备优先级里写了其中几件、
+    这次掉的又不是它们时，这局就不打了——不装，直接在这一页开右上角菜单撤退（之后由 handle_nectus_retreat
+    接着开）。一件都没写或掉的正是写了的，返回 False 照常交给 handle_equipment。每局只看一次。"""
+    ns = getattr(task, "node_status", None)
+    if not isinstance(ns, dict) or ns.get("nectus_checked") or not _nectus_install_page(task):
         return False
     got = _nectus_equipment(_get_region_text(task, (0.217, 0.379, 0.469, 0.436)))
     if not got:
@@ -1210,10 +1214,10 @@ def handle_nectus_equipment(task: TriggerTask):
         task.log_info(f"赛内克图斯掉落「{got}」，" + ("是配置的装备" if wanted else "装备优先级里没写这六件，照常继续"))
         battle_log.record(task, "赛内克图斯装备", equipment=got, wanted=wanted, decision="继续")
         return False
-    task.log_info(f"赛内克图斯掉落「{got}」，不是配置的 {wanted}，这一页处理完就撤退")
+    task.log_info(f"赛内克图斯掉落「{got}」，不是配置的 {wanted}，不装了，直接撤退")
     battle_log.record(task, "赛内克图斯装备", equipment=got, wanted=wanted, decision="撤退")
     ns["nectus_retreat"] = True
-    return False
+    return _nectus_open_menu(task, ns)
 
 
 def _reward_or_route_page(task: TriggerTask):
@@ -1229,18 +1233,11 @@ def _reward_or_route_page(task: TriggerTask):
     return bool(task.find_feature(feature_name="position", box=task.box_of_screen(0.335, 0.568, 0.453, 0.751)))
 
 
-def handle_nectus_retreat(task: TriggerTask):
-    """赛内克图斯掉的不是配置的装备（见 handle_nectus_equipment）：在战利品页或路线页打开右上角菜单，
-    handle_escape 再点「逃脱」。菜单没出来就每 2 秒再开一次（轮流点图标和按 Q，同出击首领后撤退），
-    开满 _NECTUS_RETREAT_TRIES 次记异常，这局照常打下去。"""
-    ns = getattr(task, "node_status", None)
-    if not isinstance(ns, dict) or not ns.get("nectus_retreat") or ns.get("is_escaped", False):
-        return False
+def _nectus_open_menu(task: TriggerTask, ns):
+    """开一次右上角菜单（第一次和之后的偶数次点图标，奇数次按 Q）。刚开过 2 秒内只等着；开满次数记异常放手。"""
     tries = ns.get("nectus_retreat_tries", 0)
-    if tries >= _NECTUS_RETREAT_TRIES or not _reward_or_route_page(task):
-        return False
-    if time.time() - getattr(task, "_escape_requested_at", 0) < 2:
-        return True  # 刚开过菜单，等它出来，别让后面的处理函数点了「获得」或选了路线
+    if tries and time.time() - getattr(task, "_escape_requested_at", 0) < 2:
+        return True  # 刚开过菜单，等它出来，别让后面的处理函数装了装备、点了「获得」或选了路线
     ns["nectus_retreat_tries"] = tries + 1
     if tries + 1 >= _NECTUS_RETREAT_TRIES:
         battle_log.anomaly(task, "赛内克图斯后撤退菜单打不开", f"开了 {tries} 次菜单都没出来，这局照常打下去")
@@ -1257,11 +1254,33 @@ def handle_nectus_retreat(task: TriggerTask):
     return True
 
 
+def handle_nectus_retreat(task: TriggerTask):
+    """赛内克图斯掉的不是配置的装备（见 handle_nectus_equipment）：菜单没出来就每 2 秒再开一次，handle_escape
+    点「逃脱」。先在装备页上开 _NECTUS_PAGE_TRIES 次，还不行就让 handle_equipment 装完，回到战利品页或路线页
+    接着开，总共开满 _NECTUS_RETREAT_TRIES 次记异常，这局照常打下去。"""
+    ns = getattr(task, "node_status", None)
+    if not isinstance(ns, dict) or not ns.get("nectus_retreat") or ns.get("is_escaped", False):
+        return False
+    tries = ns.get("nectus_retreat_tries", 0)
+    if tries >= _NECTUS_RETREAT_TRIES:
+        return False
+    if _nectus_install_page(task):
+        if tries >= _NECTUS_PAGE_TRIES:
+            if not ns.get("nectus_page_given_up"):
+                ns["nectus_page_given_up"] = True
+                task.log_info(f"装备页上开了 {tries} 次菜单都没出来，先装完，到战利品页或路线页再撤退")
+            return False
+        return _nectus_open_menu(task, ns)
+    if not _reward_or_route_page(task):
+        return False
+    return _nectus_open_menu(task, ns)
+
+
 # 卡厄思模式 PAGE_HANDLERS
 PAGE_HANDLERS = [
     handle_auto_stop,
     handle_save_target_member,
-    handle_nectus_retreat, #赛内克图斯掉的装备不对：战利品页/路线页撤退，要排在路线选择和领取奖励前
+    handle_nectus_retreat, #赛内克图斯掉的装备不对：装备页/战利品页/路线页撤退，要排在路线选择、装备和领取奖励前
     handle_route_selection,
     # handle_stage_clear,
     log_credit,
@@ -1279,7 +1298,7 @@ PAGE_HANDLERS = [
     handle_chaos_mask_engraving, #面具卡牌刻印获取页面
     handle_memory_carving, #记忆雕琢页：一直雕琢到完成或按钮变灰，完成后做一次记忆加工，再离开，优先于离开按钮
     handle_memory_processing, #记忆加工页：选百分比最大的一张再确认
-    handle_nectus_equipment, #赛内克图斯掉落装备：不是配置的就记下要撤退，不认领页面
+    handle_nectus_equipment, #赛内克图斯掉落装备：不是配置的就不装、直接撤退
     handle_equipment, #装备选择
     handle_card_assign,
     handle_confirm, #确认按钮
