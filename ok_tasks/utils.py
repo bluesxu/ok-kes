@@ -4046,6 +4046,7 @@ def _is_info_option(description):
 
 
 _EVENT_CHECK_ONCE_SECONDS = 300  # 同一事件页的放大镜多久内只点一次
+_INITIAL_EVENT_WAIT_SECONDS = 5  # 出击开局事件认不全 3 个选项时最多等几秒
 _EVENT_F1_ICON_BELOW = 0.045  # 事件页 F1 图标中心在「F1」标签下方多远（按画面高的比例）
 # 标签字小、底下是雪地，常被读成「E1」：实跑 10/23 16:53「半身已成机械的士兵」事件前 4 帧都没认出来，
 # 先点了选项；同一截图缩放 0.95/1.05 倍就读成 E1（0.82），所以 F/E 和 1/I/l/| 都算
@@ -4236,6 +4237,30 @@ def handle_event_task(task: TriggerTask):
 
     if reroll_empty_deck is True and is_initial_node:
         return handle_initial_node_task("移除2张", "刷空档")
+
+    # 用户 10/25：出击模式开局事件，开了「只打第一层」选第 2 个选项，没开选第 3 个（选项按从左到右数）。
+    # 要认全 3 个选项才能按位置选，不够时最多等几秒，等满照常按优先级选；每轮只按位置选一次
+    if task.name == "自动出击模式" and is_initial_node and not node_status.get("initial_event_done", False):
+        first_layer_only = _get_config_value(task, "只打第一层", False)
+        index = 1 if first_layer_only else 2
+        if len(all_options) == 3:
+            chosen_task = all_options[index]
+            reason = f"出击开局事件，{'开了' if first_layer_only else '没开'}只打第一层，选第 {index + 1} 个选项"
+            task.log_info(f"{reason}: {chosen_task['description']}")
+            node_status["initial_event_done"] = True
+            task._initial_event_wait_since = None
+            click_event_option(chosen_task, reason)
+            task.sleep(1)
+            return True
+        wait_since = getattr(task, "_initial_event_wait_since", None)
+        if wait_since is None:
+            task._initial_event_wait_since = wait_since = time.time()
+        if time.time() - wait_since < _INITIAL_EVENT_WAIT_SECONDS:
+            task.log_info(f"出击开局事件只认出 {len(all_options)} 个选项，等认全 3 个再按位置选")
+            return False
+        task.log_info(f"出击开局事件等了 {_INITIAL_EVENT_WAIT_SECONDS} 秒仍只认出 {len(all_options)} 个选项，照常按优先级选")
+        node_status["initial_event_done"] = True
+        task._initial_event_wait_since = None
 
     # 检查任务区域中是否有 treasure 特征
     treasure_box = task.box_of_screen(0.477, 0.336, 0.841, 0.540)
@@ -5375,6 +5400,7 @@ def reset_mission_status(task: TriggerTask):
     task.member_status = _initial_member_status()
     _reset_meditation_state(task)
     task._pending_removed_card_count = 0
+    task._initial_event_wait_since = None
 
 
 def reset_layer_status(task: TriggerTask):

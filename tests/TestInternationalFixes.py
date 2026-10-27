@@ -1334,6 +1334,37 @@ class TestMemoryCarving(unittest.TestCase):
     def test_event_page_leaves_after_carving(self):
         self.assertEqual(["(0.630, 0.820)"], self.run_event(carve_done=True))
 
+    def run_sortie_initial_event(self, first_layer_only, xs=(0.24, 0.50, 0.76), node_count=0):
+        # 用户 10/25：出击开局事件，开了只打第一层选第 2 个，没开选第 3 个
+        options = [{"x": x, "y": 0.947, "description": f"选项{i}", "description_region": (x - 0.1, 0.78, x + 0.1, 0.86),
+                    "feature_name": "event3", "confidence": 0.9} for i, x in enumerate(xs, 1)]
+        task = PageTask([])
+        task.name = "自动出击模式"
+        task.node_status.update({"node_count": node_count, "pass_final_boss_count": 0})
+        task.config["只打第一层"] = first_layer_only
+        task.find_feature = lambda *args, **kwargs: []
+        with unittest.mock.patch.object(utils, "recognize_event_options", lambda *args, **kwargs: options):
+            handled = utils.handle_event_task(task)
+        return handled, task
+
+    def test_sortie_initial_event_first_layer_only_picks_second(self):
+        handled, task = self.run_sortie_initial_event(True)
+        self.assertTrue(handled)
+        self.assertEqual(["(0.500, 0.820)"], task.clicked)
+        self.assertTrue(task.node_status["initial_event_done"])
+
+    def test_sortie_initial_event_all_layers_picks_third(self):
+        self.assertEqual(["(0.760, 0.820)"], self.run_sortie_initial_event(False)[1].clicked)
+
+    def test_sortie_initial_event_waits_for_three_options(self):
+        handled, task = self.run_sortie_initial_event(True, xs=(0.24, 0.76))
+        self.assertFalse(handled)
+        self.assertEqual([], task.clicked)
+
+    def test_sortie_later_event_not_by_position(self):
+        _, task = self.run_sortie_initial_event(True, node_count=3)
+        self.assertNotIn("initial_event_done", task.node_status)
+
 
 class TestChaosFunctionSelect(unittest.TestCase):
     """卡厄思模式战斗中「請選擇功能。」页：自动战斗不会选，检测到就随机点一张。"""
